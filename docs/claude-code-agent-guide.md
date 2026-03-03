@@ -94,72 +94,149 @@ The `/phase-status` command queries `gh issue list --label phase-{X}` for each p
 
 ## 4. Crash Recovery Workflow (Unique to Kernel Dev)
 
-Host kernel panics are **expected** during Phase 0–1 development. The workflow is:
+Host kernel panics are **expected** during Phase 0–1 development. The workflow depends on which
+layer crashes: the QEMU guest (Phase 0–1) or the bare-metal server (Phase 2+).
+
+### Phase 0–1: QEMU Guest Crash
 
 ```
-1. Guest VMX code triggers host panic
+1. phantom.ko in QEMU guest triggers guest panic
         │
         ▼
-2. kdump captures crash dump to /var/crash/
+2. Guest serial output (panic dump) written to:
+   /root/phantom/logs/guest.log on phantom-bench
         │
         ▼
-3. Machine reboots automatically
+3. QEMU process dies; phantom-bench host is unaffected
         │
         ▼
-4. Developer connects serial console:
-   screen /dev/ttyUSB0 115200
+4. Check guest serial log from dev machine (WSL2):
+   ssh phantom-bench "tail -100 /root/phantom/logs/guest.log"
         │
         ▼
-5. Boot into recovery, examine dump:
-   crash /usr/lib/debug/vmlinux /var/crash/<dump>/vmcore
-   crash> mod -s phantom
-   crash> bt <phantom_vmx_exit_handler>
+5. Restart guest:
+   ssh phantom-bench "bash /root/phantom/src/scripts/launch-guest.sh"
         │
         ▼
 6. Start new Claude Code session, run:
    /continue-task 1.2
+```
+
+### Phase 2+: Bare-Metal Host Crash
+
+```
+1. phantom.ko on phantom-bench triggers host panic
         │
         ▼
-7. Claude reads open GitHub issue for the task,
-   checks git status on task branch,
-   reconciles planned vs actual state,
-   resumes from last checkpoint comment
+2. kdump captures crash dump to /var/crash/
+   (requires crashkernel=256M in cmdline — see scripts/server-setup.sh)
+        │
+        ▼
+3. Server reboots automatically (~2 minutes)
+        │
+        ▼
+4. Reconnect and check crash dump:
+   ssh phantom-bench "ls -lt /var/crash/ | head"
+        │
+        ▼
+5. Examine dump (no serial console needed):
+   ssh phantom-bench
+   crash /usr/lib/debug/vmlinux /var/crash/<dump>/vmcore
+   crash> mod -s phantom /root/phantom/src/kernel/phantom.ko
+   crash> bt <phantom_vmx_exit_handler>
+        │
+        ▼
+6. Netconsole as serial substitute (if configured):
+   Server: modprobe netconsole
+   Dev machine: nc -u -l -p 6666
+   (captures kernel log over UDP during panic)
+        │
+        ▼
+7. Start new Claude Code session, run:
+   /continue-task 2.1
 ```
 
 **GitHub issue comment** serves as the "commit" before a crash. Always post a checkpoint comment before triggering potentially dangerous VMX operations.
+
+**Serial console requirement updated:** Physical serial console is not available on the Hetzner
+remote server. Crash observability is provided by:
+- Phase 0–1: QEMU guest serial log at `/root/phantom/logs/guest.log`
+- Phase 2+: kdump crash dumps + netconsole over UDP
 
 ---
 
 ## 5. SSH Remote Execution
 
-### Phase 0–1: Local Nested KVM
+**The dev machine is WSL2 (kernel 6.6.87) — kernel modules cannot be built locally** because the
+running kernel version does not match the server (kernel 6.8.0-90-generic). All builds happen on
+the server. The workflow is always: rsync sources → build remotely → deploy.
+
+### All Phases: Rsync + Remote Build
 
 ```bash
-# Development machine runs phantom.ko in nested KVM:
-# outer_host → KVM guest (dev machine) → phantom.ko → guest VM
-make -C kernel/
-sudo insmod kernel/phantom.ko
-dmesg | tail -20
+# Step 1: Sync sources to server (run from WSL2)
+rsync -az --delete \
+  --exclude='.git' --exclude='*.o' --exclude='*.ko' --exclude='*.mod*' \
+  /mnt/d/fuzzer/ phantom-bench:/root/phantom/src/
+
+# Step 2: Build on server
+ssh phantom-bench "make -C /root/phantom/src/kernel/ 2>&1"
 ```
 
-### Phase 2+: SSH to Bare Metal (`phantom-bench`)
+### Phase 0–1: Deploy into QEMU Guest
 
 ```bash
-# SSH target defined in ~/.ssh/config as "phantom-bench"
-# The /deploy-test skill automates this sequence:
+# The guest mounts /root/phantom/src via 9p virtfs at /mnt/phantom
+# No scp needed — .ko is immediately visible in guest after remote build
 
-make -C kernel/
-scp kernel/phantom.ko phantom-bench:/tmp/
-ssh phantom-bench "sudo rmmod phantom 2>/dev/null; sudo insmod /tmp/phantom.ko"
-ssh phantom-bench "sudo dmesg | tail -30"
-ssh phantom-bench "sudo bash /tmp/run_test.sh"
+# Ensure guest is running
+ssh phantom-bench "pgrep qemu-system-x86 >/dev/null || \
+  bash /root/phantom/src/scripts/launch-guest.sh"
+
+# Load module in guest
+ssh phantom-bench "ssh -p 2222 -o StrictHostKeyChecking=no root@localhost \
+  'rmmod phantom 2>/dev/null || true; insmod /mnt/phantom/kernel/phantom.ko'"
+
+# Check dmesg in guest
+ssh phantom-bench "ssh -p 2222 -o StrictHostKeyChecking=no root@localhost \
+  'dmesg | tail -30'"
+
+# Run test in guest
+ssh phantom-bench "ssh -p 2222 -o StrictHostKeyChecking=no root@localhost \
+  'bash /mnt/phantom/tests/{test-name}.sh'"
+```
+
+### Phase 2+: Deploy Directly on Server
+
+```bash
+# Unload kvm_intel first (Phantom takes exclusive VMX ownership)
+ssh phantom-bench "rmmod kvm_intel 2>/dev/null || true"
+
+# Load module
+ssh phantom-bench "rmmod phantom 2>/dev/null || true; \
+  insmod /root/phantom/src/kernel/phantom.ko"
+ssh phantom-bench "dmesg | tail -30"
+
+# Run test
+ssh phantom-bench "bash /root/phantom/src/tests/{test-name}.sh"
 ```
 
 The `tester` agent is the primary executor for SSH-based test runs. It handles:
-- `insmod` / `rmmod` sequencing
-- `dmesg` capture and parsing
+- rsync + remote build
+- `insmod` / `rmmod` sequencing (guest or server depending on phase)
+- `dmesg` capture and parsing from the correct target
 - debugfs counter verification
 - Benchmark methodology (disable turbo boost, 30 runs, report median + p25/p75)
+
+### One-Time Server Setup
+
+Before Phase 0 development, run the provisioning script on the server:
+```bash
+ssh phantom-bench "bash -s" < scripts/server-setup.sh
+# Then reboot the server (required for crashkernel= to activate)
+ssh phantom-bench "bash /root/phantom/src/scripts/create-guest-image.sh"
+ssh phantom-bench "bash /root/phantom/src/scripts/launch-guest.sh"
+```
 
 ---
 

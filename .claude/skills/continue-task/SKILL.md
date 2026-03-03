@@ -39,10 +39,35 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, query `gh issue lis
      - Uncheck items that were marked done but have no code evidence (phantom completions)
      - Apply the updated checklist: `gh issue edit {number} --repo melbinkm/Phantom --body "{updated body}"`
 
-5. **Crash recovery path** (if last comment was recent and a kdump exists):
-   - Check for `/var/crash/` dumps newer than the last issue comment timestamp
-   - If found, suggest: `crash /usr/lib/debug/vmlinux /var/crash/<latest>/vmcore`
-   - Remind: `crash> mod -s phantom` then `crash> bt <phantom_vmx_exit_handler>`
+5. **Crash recovery path** (if last comment was recent and a crash may have occurred):
+
+   **Phase 0–1 (QEMU guest crash):**
+   - Check guest serial log for panic output:
+     ```bash
+     ssh phantom-bench "tail -100 /root/phantom/logs/guest.log"
+     ```
+   - If the guest is dead, restart it:
+     ```bash
+     ssh phantom-bench "bash /root/phantom/src/scripts/launch-guest.sh"
+     ```
+   - The host (phantom-bench) is unaffected — only the QEMU process may have died.
+
+   **Phase 2+ (host server crash):**
+   - Check if server is reachable: `ssh phantom-bench "echo ok; uname -r"`
+   - If unreachable: wait ~2 minutes for kdump + reboot cycle, then retry.
+   - Check for kdump crash dump:
+     ```bash
+     ssh phantom-bench "ls -lt /var/crash/ | head"
+     ```
+   - If a dump exists, suggest:
+     ```bash
+     ssh phantom-bench "crash /usr/lib/debug/vmlinux /var/crash/<latest>/vmcore"
+     # In crash shell:
+     # crash> mod -s phantom /root/phantom/src/kernel/phantom.ko
+     # crash> bt <phantom_vmx_exit_handler>
+     # crash> struct phantom_instance <addr>
+     ```
+   - Check netconsole output if it was configured on the dev machine (UDP port 6666).
 
 6. **Post checkpoint comment:**
    - Run:

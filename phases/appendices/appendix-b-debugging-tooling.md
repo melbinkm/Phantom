@@ -57,19 +57,87 @@ Before every VMLAUNCH and VMRESUME (in debug builds): check all VMCS fields agai
 
 Compiled out in production (`#ifdef PHANTOM_DEBUG`). In development: compile with `-DPHANTOM_DEBUG` at all times.
 
-## 6. kdump Post-Mortem Procedure
+## 6. Crash Observability Procedure
 
-When a host kernel panic occurs (expected during Phase 1 development):
+**Crash observability is a hard requirement** — debugging host panics without post-mortem data is
+infeasible. The approach differs between Phase 0–1 (QEMU guest) and Phase 2+ (bare-metal server).
 
-1. kdump captures crash dump to dedicated partition (configured at OS install, Week 1 deliverable)
-2. Boot to recovery: `crash /usr/lib/debug/vmlinux /var/crash/<dump>/vmcore`
-3. Examine Phantom state:
-   - `crash> mod -s phantom` — load Phantom module symbols
-   - `crash> bt <phantom_vmx_exit_handler>` — backtrace from last known handler
-   - `crash> struct phantom_instance <addr>` — inspect per-CPU instance state
-4. Companion script `tools/crash-scripts/phantom-state.py` automates extraction of Phantom-specific state (instance status, dirty list, VMCS last-snapshot values) from the crash dump.
+### Phase 0–1: QEMU Guest Crash Recovery
 
-**Serial console to a second machine is a hard requirement** — not optional. Without it, debugging host panics in the nested KVM environment is infeasible. Set up in Week 1 before writing any VMX code.
+When phantom.ko in the nested KVM guest panics:
+
+1. The QEMU guest process dies; the host server (phantom-bench) is **unaffected**.
+2. Guest serial output (panic backtrace) is captured to the serial log:
+   ```bash
+   ssh phantom-bench "tail -100 /root/phantom/logs/guest.log"
+   ```
+3. Examine the panic backtrace and call trace from the serial log.
+4. Restart the guest and reload for another attempt:
+   ```bash
+   ssh phantom-bench "bash /root/phantom/src/scripts/launch-guest.sh"
+   ```
+5. No kdump, no reboot needed — recovery is seconds, not minutes.
+
+### Phase 2+: Bare-Metal Host Crash Recovery
+
+When phantom.ko on phantom-bench triggers a host panic:
+
+1. kdump captures crash dump to `/var/crash/` (requires `crashkernel=256M` in boot cmdline;
+   configured by `scripts/server-setup.sh`, requires one reboot to activate).
+2. Server reboots automatically. Reconnect after ~2 minutes:
+   ```bash
+   ssh phantom-bench "echo ok; uname -r"
+   ```
+3. Verify kdump captured a dump:
+   ```bash
+   ssh phantom-bench "ls -lt /var/crash/ | head"
+   ```
+4. Examine Phantom state:
+   ```bash
+   ssh phantom-bench
+   crash /usr/lib/debug/vmlinux /var/crash/<latest-dir>/vmcore
+   # In crash shell:
+   crash> mod -s phantom /root/phantom/src/kernel/phantom.ko
+   crash> bt <phantom_vmx_exit_handler>
+   crash> struct phantom_instance <addr>
+   ```
+5. Companion script `tools/crash-scripts/phantom-state.py` automates extraction of
+   Phantom-specific state (instance status, dirty list, VMCS last-snapshot values).
+
+### Netconsole (UDP Serial Substitute for Remote Servers)
+
+Physical serial console is not available on the Hetzner dedicated server. Netconsole sends
+kernel log messages over UDP to the dev machine during and after a panic — this is the substitute.
+
+**One-time setup on phantom-bench:**
+```bash
+# Find the server's NIC
+IFACE=$(ip route get 8.8.8.8 | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -1)
+
+# Load netconsole (replace DEV_MACHINE_IP with your WSL2 IP)
+modprobe netconsole "netconsole=@/${IFACE},6666@DEV_MACHINE_IP/"
+
+# Verify: kernel messages appear on dev machine
+echo "netconsole test" > /dev/kmsg
+```
+
+**Dev machine (WSL2) — listen for messages:**
+```bash
+nc -u -l -p 6666
+```
+
+**To find WSL2 IP from the server:** `cat /etc/resolv.conf | grep nameserver` on WSL2, or
+check `ip addr` on the WSL2 default interface.
+
+**To make netconsole persistent** across reboots, edit `/etc/modprobe.d/netconsole.conf`
+(created by `scripts/server-setup.sh` with a template — fill in `DEV_MACHINE_IP`).
+
+### Summary: Crash Observability by Phase
+
+| Phase | Crash Target | Recovery Method | Time to Recovery |
+|-------|-------------|-----------------|-----------------|
+| 0–1 | QEMU guest | Serial log at `/root/phantom/logs/guest.log` | ~5 seconds |
+| 2+ | phantom-bench host | kdump at `/var/crash/` + netconsole | ~2 minutes (reboot) |
 
 ## debug.c Skeleton (Week 1 Setup)
 
