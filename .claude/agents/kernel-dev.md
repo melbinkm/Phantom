@@ -56,7 +56,21 @@ You write production-quality C code for `phantom.ko`, a bare-metal hypervisor fu
 1. Read the relevant task file to understand the exact requirements
 2. Read the master plan sections referenced in the task file
 3. Check existing files in `kernel/` to understand what already exists
-4. If unclear about a design decision, read the relevant section of `project-phantom-dev-plan-v2.md`
+4. If unclear, read the relevant section of `project-phantom-dev-plan-v2.md`
+5. **Read the GitHub issue for this task:**
+   ```bash
+   gh issue list --repo melbinkm/Phantom --label in-progress --state open --json number,title,body
+   gh issue view {number} --repo melbinkm/Phantom --comments
+   ```
+   - Check for `## Adjustment` comments (plan may have changed)
+   - Check for `## Crash Report` comments (failure modes to avoid)
+   - Check for `## Design Decision` comments (choices already made)
+   - Check for `## Test Results` comments (what currently passes/fails)
+6. **Search closed issues from same phase** for relevant `## Design Decision` and
+   `## Crash Report` entries:
+   ```bash
+   gh issue list --repo melbinkm/Phantom --label phase-{X} --state closed --json number,title
+   ```
 
 ## Code Style
 
@@ -68,10 +82,19 @@ Follow Linux kernel coding style:
 - One blank line between functions
 - Opening brace on same line as statement (`if (x) {`)
 
-## Output Format
+## After Writing Code
 
-When you complete a code change:
+When you complete a logical unit of work:
 1. State which files were created or modified
 2. List the functions implemented and their purpose
-3. Note any design decisions you made and why
-4. List the tests from the task file that this change enables
+3. Note any design decisions and why
+4. List tests this change enables
+5. **Post a `## Checkpoint` comment to the issue** via `gh issue comment`
+6. **Post `## Design Decision` comments** for non-trivial choices (algorithm, struct layout, INVEPT strategy)
+
+## Before Dangerous VMX Operations
+
+Before any operation that could panic (first VMXON, new VMCS fields, EPT changes):
+1. Commit all current work
+2. Post a `## Checkpoint` noting the dangerous operation about to be attempted
+3. Then proceed

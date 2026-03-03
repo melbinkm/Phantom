@@ -23,6 +23,17 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, query `gh issue lis
    - Extract from latest comment: last checkpoint, blocking issues
    - If no open issue exists: suggest `/start-task $ARGUMENTS` instead
 
+2b. **Cross-task knowledge search:**
+    - Query closed issues from the same phase:
+      `gh issue list --repo melbinkm/Phantom --label {phase-label} --state closed --json number,title`
+    - For each, scan comments for `## Design Decision`, `## Crash Report`, `## Test Results` (FAIL)
+    - Summarize relevant findings in the output brief:
+      ```
+      **Knowledge from prior tasks:**
+      - Task {A.B} (#N): {relevant decision or crash pattern}
+      ```
+    - Omit if no relevant findings
+
 3. **Check git state:**
    - Run `git checkout {branch}` (the branch from the issue body)
    - Run `git status` — show any uncommitted changes

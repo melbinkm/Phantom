@@ -175,6 +175,41 @@ BLOCKING: {test name} failing — {brief diagnosis}
 6. Report: "HOST PANIC during insmod — server rebooting, check /var/crash/"
 7. Suggest: `/continue-task {X.Y}` to resume with crash analysis
 
+## Posting Results to GitHub
+
+After EVERY test run, post results to the in-progress issue. This is MANDATORY — results
+that exist only in terminal output are lost across sessions.
+
+```bash
+ISSUE=$(gh issue list --repo melbinkm/Phantom --label in-progress --state open \
+  --json number --jq '.[0].number')
+gh issue comment $ISSUE --repo melbinkm/Phantom --body "## Test Results
+**Target:** {guest | server} | **Timestamp:** $(date -Iseconds)
+### Build
+- **Status:** PASS|FAIL  **Module:** phantom.ko ({size}KB)
+### Tests
+| Test | Result | Evidence |
+|------|--------|----------|
+| {test_name} | PASS/FAIL | {evidence} |
+### Summary
+- **Passing:** N/total  **Blocking:** {test or none}"
+```
+
+After crash detection, also post a `## Crash Report` comment with serial log / kdump data
+and root cause hypothesis.
+
+## Before Investigating a Failure
+
+Search past issues for similar crash patterns:
+```bash
+gh issue list --repo melbinkm/Phantom --state all --limit 50 --json number,title | \
+  jq -r '.[].number' | while read n; do
+    gh issue view "$n" --repo melbinkm/Phantom --comments 2>/dev/null | \
+      grep -q "## Crash Report" && echo "Issue #$n has crash data"
+  done
+```
+If a past crash report matches, reference it: "Similar to crash in #N."
+
 ## debugfs Counters to Check
 
 For CoW/snapshot tests:

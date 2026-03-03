@@ -103,6 +103,15 @@ cross-compile for the server (kernel 6.8.0-generic). All steps go through SSH.
    NEXT: investigate pool exhaustion in kernel/ept_cow.c phantom_pool_alloc()
    ```
 
+9. **Post results to GitHub issue:**
+   ```bash
+   ISSUE=$(gh issue list --repo melbinkm/Phantom --label in-progress --state open \
+     --json number --jq '.[0].number')
+   ```
+   - If no in-progress issue: skip (standalone test run)
+   - Post a `## Test Results` comment with the full report from step 8
+   - If a crash was detected, also post a `## Crash Report` comment
+
 ## Notes
 
 - Always check `dmesg | grep -E "(phantom|BUG|OOPS|WARNING)"` after insmod

@@ -84,9 +84,24 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, check open GitHub i
    ```
 
 8. **Output confirmation:**
-   - PR URL
-   - Summary of what was submitted
-   - Suggest next task (check CLAUDE.md CURRENT_PHASE and next unstarted task)
+   - PR URL and summary of what was submitted
+
+9. **Phase gate check** (only if this is the LAST task in a phase):
+   - Phase-to-last-task: 0→0.1, 1a→1.4, 1b→1.8, 2→2.4, 3→3.4, 4→4.3
+   - Verify all phase tasks are closed:
+     `gh issue list --repo melbinkm/Phantom --label phase-{X} --state open`
+   - Check gate conditions from CLAUDE.md "Active Gates":
+     - Phase 1b exit: search task 1.8 issue for performance data
+     - Phase 3 exit: search task 3.2 issue for "1000/1000" determinism
+   - Post `## Phase Gate Check` comment on this issue
+   - If gate FAILS: STOP. Require manual intervention.
+   - If gate PASSES: update `CURRENT_PHASE` in CLAUDE.md
+
+10. **Auto-chain to next task:**
+    - Task order: 0.1→1.1→1.2→1.3→1.4→1.5→1.6→1.7→1.8→2.1→2.2→2.3→2.4→3.1→3.2→3.3→3.4→4.1→4.2→4.3
+    - If phase gate just FAILED: STOP
+    - If task 4.3 (final): "Project Phantom complete." STOP
+    - Otherwise: execute `/start-task {next}`
 
 ## Notes
 
@@ -94,3 +109,5 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, check open GitHub i
 - Never force-push to main
 - If the PR fails to create (no GitHub auth): commit and push, then provide the gh command for the user to run manually
 - After submission, update `CURRENT_PHASE` in CLAUDE.md if this task completes a phase
+- Auto-chaining respects phase gates — cannot skip to next phase if gate fails
+- Task ordering is strictly linear (matches "Depends On" in phase READMEs)

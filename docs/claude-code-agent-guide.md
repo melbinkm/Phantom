@@ -76,6 +76,59 @@ Every issue body includes an `## Implementation Steps` section generated automat
 
 Each checkbox maps 1:1 to a top-level bullet from the task file's "What to Build" section. This makes the issue a lightweight PRD — visible progress tracker, audit trail for adjustments, and input for `/sync-progress` reconciliation.
 
+### Structured Knowledge Comments
+
+Every agent and skill posts comments with standard headings, making them machine-searchable
+via `gh issue view --comments | grep "## Test Results"`.
+
+| Heading | Posted By | When |
+|---------|-----------|------|
+| `## Test Results` | `deploy-test`, `tester` | After every test run |
+| `## Crash Report` | `tester`, `continue-task` | When crash detected |
+| `## Design Decision` | `kernel-dev`, `task-planner` | Non-trivial architectural choice |
+| `## Checkpoint` | `kernel-dev` | After each logical unit of work |
+| `## Phase Gate Check` | `submit-task`, `run-phase` | At phase boundaries |
+| `## Resuming` | `continue-task` | On session resume |
+| `## Completed` | `submit-task` | On task submission |
+| `## Adjustment` | `/adjust` | Mid-work plan change |
+| `## Progress Sync` | `/sync-progress` | Reality-wins reconciliation |
+
+**`## Test Results` schema:**
+```
+**Target:** {guest | server} | **Timestamp:** {ISO 8601}
+### Build
+- **Status:** PASS|FAIL  **Module:** phantom.ko ({size}KB)
+### Tests
+| Test | Result | Evidence |
+### Summary
+- **Passing:** N/total  **Blocking:** {test or none}
+```
+
+**`## Crash Report` schema:**
+```
+**Crash type:** GUEST_PANIC|HOST_PANIC|KASAN  **Phase:** {0-1 guest | 2+ host}
+### Trigger — what was happening
+### Crash Data — first 50 lines of serial log / kdump / KASAN
+### Analysis — faulting function, hypothesis, affected file:line
+```
+
+**`## Checkpoint` schema:**
+```
+**Branch:** {name}  **Commit:** {hash} — {message}
+### Completed — bullet list
+### Remaining — bullet list
+### Next Step — single action
+```
+
+**`## Design Decision` schema:**
+```
+**Decision:** one-sentence summary
+### Context — why needed
+### Options — what was considered
+### Chosen — what and why
+### Impact — files, performance, risk
+```
+
 ### Lifecycle
 
 1. **Before `/start-task`:** No issue exists
@@ -280,6 +333,7 @@ Not all config files are relevant at every phase. This table shows when each bec
     │   ├── phase-status/SKILL.md          ← /phase-status
     │   ├── deploy-test/SKILL.md           ← /deploy-test [test-name]
     │   ├── submit-task/SKILL.md           ← /submit-task <X.Y>
+    │   ├── run-phase/SKILL.md             ← /run-phase <phase> (autonomous orchestrator)
     │   ├── adjust/SKILL.md                ← /adjust <reason>
     │   ├── sync-progress/SKILL.md         ← /sync-progress [X.Y]
     │   ├── vmx-reference/SKILL.md         ← Auto: VMX domain knowledge
@@ -293,7 +347,7 @@ Not all config files are relevant at every phase. This table shows when each bec
 ### Skills vs Agents
 
 **Skills** are prompt expansions — they inject context into the current session. They are either:
-- **User-invocable (7):** `/start-task`, `/continue-task`, `/phase-status`, `/deploy-test`, `/submit-task`, `/adjust`, `/sync-progress`
+- **User-invocable (8):** `/start-task`, `/continue-task`, `/phase-status`, `/deploy-test`, `/submit-task`, `/adjust`, `/sync-progress`, `/run-phase`
 - **Auto-invocable:** Claude decides to load `vmx-reference` when it sees VMX code, etc.
 
 **Agents** are sub-processes with their own tool access. Spawned by Claude when a specialised role is needed:
@@ -303,49 +357,99 @@ Not all config files are relevant at every phase. This table shows when each bec
 
 ---
 
-## 8. Recommended Workflow for Each Task
+## 8. Workflows
+
+### Standard Manual Workflow (per task)
 
 ```
 1. /start-task <X.Y>
    → Read task file, extract "What to Build" bullets as checklist,
-     check existing GitHub issue, create git branch,
-     create GitHub issue with `started` label + ## Implementation Steps,
+     create git branch + GitHub issue with ## Implementation Steps,
      output implementation brief with checklist count
 
 2. Delegate planning to task-planner agent
-   → Read-only analysis of master plan + task file
-   → Output: which functions, structs, files, algorithms
+   → Reads task file + master plan + GitHub issue (Adjustment/Crash Report comments)
+   → Searches closed phase issues for prior Design Decision/Crash Report
+   → Output: function list, structs, dependency order, risks, test strategy
 
 3. Delegate implementation to kernel-dev agent
+   → Reads GitHub issue before coding (Adjustment/Crash Report/Design Decision comments)
    → vmx-reference / ept-reference / intel-pt-reference auto-loaded
-   → phantom-conventions auto-loaded
-   → .claude/rules/kernel-code.md enforced on kernel/**/*.c
+   → phantom-conventions + .claude/rules/kernel-code.md enforced
+   → Posts ## Checkpoint after each logical unit + ## Design Decision for non-trivial choices
+   → Posts ## Checkpoint BEFORE dangerous VMX operations (commit first)
 
-4. Delegate testing to tester agent
-   → Build, deploy (local or SSH), capture dmesg
-   → Report pass/fail with evidence
+4. /deploy-test [test-name]
+   → Build (remote) → deploy (guest or server) → run tests → capture dmesg
+   → Posts ## Test Results to GitHub issue (mandatory)
+   → Posts ## Crash Report if crash detected
 
-5. Post GitHub issue comment checkpoint after each sub-step
-
-6. /sync-progress [X.Y]       (run after each burst of implementation)
+5. /sync-progress [X.Y]
    → Compare git state to ## Implementation Steps checklist
    → "Reality wins": check off done items, uncheck phantom completions
-   → Post ## Progress Sync comment with DONE/PARTIAL/NOT_STARTED/DIVERGED table
+   → Post ## Progress Sync comment
 
-7. /adjust <reason>            (run when the plan needs to change mid-task)
+6. /adjust <reason>            (if plan changes mid-task)
    → Post structured ## Adjustment comment with impact analysis
-   → Add `adjusted` label; update checklist to reflect revised direction
-   → Preserves completed items; documents previous vs revised approach
+   → Add `adjusted` label; update checklist
 
-8. /submit-task <X.Y>
+7. /submit-task <X.Y>
    → Verify all tests pass, commit, push, create PR
+   → Phase gate check if last task in phase
+   → Auto-chain to next task via /start-task {next}
+```
+
+### Autonomous Workflow (entire phase)
+
+```bash
+/run-phase 0    # Run phase 0 (task 0.1) autonomously
+/run-phase 1a   # Run phase 1a (tasks 1.1–1.4) autonomously
+/run-phase 1b   # Run phase 1b (tasks 1.5–1.8) autonomously
+```
+
+Each phase run:
+- Checks prior phases are complete + entry gates pass
+- Skips already-closed tasks (resumable)
+- Per task: start/resume → plan (task-planner) → implement (kernel-dev) → test → iterate (max 5) → submit
+- Stops on `blocked` tasks or failed phase gates
+- Posts ## Phase Gate Check at phase boundaries
+
+### Knowledge Flow Diagram
+
+```
+GitHub Issues (melbinkm/Phantom)
+        │
+        │  read before coding          write after coding
+        ▼                              ▲
+  kernel-dev agent ─────────────────► ## Checkpoint
+        │                             ## Design Decision
+        │  reads: ## Adjustment
+        │         ## Crash Report     tester / deploy-test
+        │         ## Design Decision       │
+        │         ## Test Results          ▼
+        │                             ## Test Results
+  task-planner agent                  ## Crash Report
+        │
+        │  reads: ## Adjustment       submit-task
+        │         ## Crash Report          │
+        │         closed-phase issues      ▼
+        │                             ## Phase Gate Check
+  continue-task                       → auto-chain to /start-task
+        │
+        │  reads: current issue
+        │         closed-phase issues
+        │         (cross-task search)
+        ▼
+  Output brief with
+  "Knowledge from prior tasks"
 ```
 
 ### When to use each command
 
 | Command | When to run |
 |---------|-------------|
-| `/start-task` | Beginning a new task — always first |
+| `/run-phase <X>` | Run an entire phase end-to-end autonomously |
+| `/start-task` | Beginning a new task manually — always first |
 | `/continue-task` | Resuming after a session break or host panic |
 | `/sync-progress` | After a burst of implementation work; before `/submit-task` |
 | `/adjust` | When the implementation approach needs to change mid-task |
