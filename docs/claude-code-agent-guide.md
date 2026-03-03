@@ -38,7 +38,7 @@ This document explains how Project Phantom uses Claude Code's slash commands, su
 | `/ship-issue <N>` | `/submit-task <X.Y>` | Commit + push + PR creation |
 | `/standup` | `/phase-status` | Shows all 20 tasks + gate conditions |
 | Custom deploy command | `/deploy-test` | Build + SSH deploy + dmesg capture |
-| GitHub issues as memory | `<!-- PHANTOM_PROGRESS -->` markers | In task `.md` files (no GitHub yet) |
+| GitHub issues as memory | GitHub Issues | Via `gh` CLI (`melbinkm/Phantom`) |
 | Code agent | `kernel-dev` agent | VMX/EPT/PT specialist, phantom_ prefix |
 | Test agent | `tester` agent | Local KVM + SSH bare-metal support |
 | Plan agent | `task-planner` agent | Read-only, plan mode permission |
@@ -47,34 +47,29 @@ This document explains how Project Phantom uses Claude Code's slash commands, su
 
 ---
 
-## 3. Progress Tracking with `<!-- PHANTOM_PROGRESS -->` Markers
+## 3. Progress Tracking with GitHub Issues
 
-Until the project has a GitHub repository with Issues, task state is tracked directly in the task `.md` files using HTML comment markers. These are invisible in rendered markdown but readable by Claude.
+Task state is tracked as GitHub Issues on `melbinkm/Phantom` via the `gh` CLI. Each task gets one issue for its lifetime.
 
-### Marker Format
+### Issue Convention
 
-```html
-<!-- PHANTOM_PROGRESS
-status: STARTED | IN_PROGRESS | BLOCKED | COMPLETED
-branch: task-1.3-basic-rw-ept
-started: 2026-03-03
-last_activity: 2026-03-03T14:32:00
-checkpoint: EPT 4-level structure built; MMIO classification done; CoW not started
-blocking: none
--->
-```
+- **Title:** `Task X.Y: {task title}` (e.g., `Task 1.3: Basic R/W EPT`)
+- **Labels:** phase label (`phase-0` … `phase-4`) + status label (`started`, `in-progress`, `blocked`)
+- **Body:** task objective, branch name, link to task file
+- **Comments:** checkpoint updates — what was done, what remains, blocking issues
+- **Closed issue** = completed task
 
 ### Lifecycle
 
-1. **Before `/start-task`:** No marker in the file
-2. **After `/start-task`:** Marker inserted with `status: STARTED`
-3. **During work:** Marker updated to `status: IN_PROGRESS`, `checkpoint` updated
-4. **After crash/panic:** Marker retains last checkpoint; `/continue-task` reads it
-5. **After `/submit-task`:** Marker updated to `status: COMPLETED`
+1. **Before `/start-task`:** No issue exists
+2. **After `/start-task`:** Issue created with `started` label
+3. **During work:** Issue updated to `in-progress`, comments added at checkpoints
+4. **After crash/panic:** Issue retains last comment as checkpoint; `/continue-task` reads it
+5. **After `/submit-task`:** Issue closed; PR body references `Closes #{number}`
 
-### `/phase-status` aggregates all markers
+### `/phase-status` aggregates all issues
 
-The `/phase-status` command scans all 20 task files, reads their markers, and produces a status table showing which tasks are pending/started/in-progress/blocked/completed.
+The `/phase-status` command queries `gh issue list --label phase-{X}` for each phase and produces a status table showing which tasks are pending/started/in-progress/blocked/completed.
 
 ---
 
@@ -106,13 +101,13 @@ Host kernel panics are **expected** during Phase 0–1 development. The workflow
    /continue-task 1.2
         │
         ▼
-7. Claude reads PHANTOM_PROGRESS marker,
+7. Claude reads open GitHub issue for the task,
    checks git status on task branch,
    reconciles planned vs actual state,
-   resumes from last checkpoint
+   resumes from last checkpoint comment
 ```
 
-**PHANTOM_PROGRESS checkpoint** serves as the "commit" before a crash. Always update the checkpoint before triggering potentially dangerous VMX operations.
+**GitHub issue comment** serves as the "commit" before a crash. Always post a checkpoint comment before triggering potentially dangerous VMX operations.
 
 ---
 
@@ -214,8 +209,8 @@ Not all config files are relevant at every phase. This table shows when each bec
 
 ```
 1. /start-task <X.Y>
-   → Read task file, check existing progress, create git branch,
-     insert PHANTOM_PROGRESS marker, output implementation brief
+   → Read task file, check existing GitHub issue, create git branch,
+     create GitHub issue with `started` label, output implementation brief
 
 2. Delegate planning to task-planner agent
    → Read-only analysis of master plan + task file
@@ -230,7 +225,7 @@ Not all config files are relevant at every phase. This table shows when each bec
    → Build, deploy (local or SSH), capture dmesg
    → Report pass/fail with evidence
 
-5. Update PHANTOM_PROGRESS checkpoint after each sub-step
+5. Post GitHub issue comment checkpoint after each sub-step
 
 6. /submit-task <X.Y>
    → Verify all tests pass, commit, push, create PR

@@ -7,7 +7,7 @@ argument-hint: "[task-number]"
 
 # Continue Phantom Task
 
-Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, scan all task files for `status: IN_PROGRESS` and prompt to choose.
+Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, query `gh issue list --repo melbinkm/Phantom --label in-progress` and prompt to choose.
 
 ## Steps
 
@@ -15,37 +15,51 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, scan all task files
    - Locate `phases/phase-{X}*/task-{X}.{Y}-*.md`
    - Read the full task file
 
-2. **Read PHANTOM_PROGRESS marker:**
-   - Find `<!-- PHANTOM_PROGRESS` block
-   - Extract: `status`, `branch`, `started`, `last_activity`, `checkpoint`, `blocking`
-   - If no marker: suggest `/start-task $ARGUMENTS` instead
+2. **Read GitHub issue:**
+   - Run: `gh issue list --repo melbinkm/Phantom --search "Task {X.Y}:" --state open --json number,title,labels,body`
+   - Fetch issue comments: `gh issue view {number} --repo melbinkm/Phantom --comments`
+   - Extract from body: branch name, objective
+   - Extract from latest comment: last checkpoint, blocking issues
+   - If no open issue exists: suggest `/start-task $ARGUMENTS` instead
 
 3. **Check git state:**
-   - Run `git checkout {branch}` (the branch from the marker)
+   - Run `git checkout {branch}` (the branch from the issue body)
    - Run `git status` — show any uncommitted changes
    - Run `git log --oneline -10` — show recent commits on the branch
-   - Note any files that have been created or modified since the checkpoint
+   - Note any files that have been created or modified since the last checkpoint
 
 4. **Reconcile plan vs reality:**
    - Compare the checkpoint description against files that actually exist
    - Compare test results in the checkpoint against tests that currently pass
-   - If reality is ahead of the checkpoint (e.g., more files exist than noted), update the checkpoint to reflect current state
+   - If reality is ahead of the checkpoint (e.g., more files exist than noted), update accordingly
    - If reality is behind (e.g., panic erased work), note what was lost
 
-5. **Crash recovery path** (if last_activity was recent and a kdump exists):
-   - Check for `/var/crash/` dumps newer than `last_activity`
+5. **Crash recovery path** (if last comment was recent and a kdump exists):
+   - Check for `/var/crash/` dumps newer than the last issue comment timestamp
    - If found, suggest: `crash /usr/lib/debug/vmlinux /var/crash/<latest>/vmcore`
    - Remind: `crash> mod -s phantom` then `crash> bt <phantom_vmx_exit_handler>`
 
-6. **Update marker:**
-   - Set `status: IN_PROGRESS`
-   - Set `last_activity` to now
-   - Update `checkpoint` to reflect current state
+6. **Post checkpoint comment:**
+   - Run:
+   ```bash
+   gh issue comment {number} --repo melbinkm/Phantom --body "## Resuming
+
+   **Status:** IN_PROGRESS
+   **Branch:** \`{branch}\`
+   **Resumed:** {now}
+
+   {summary of current state and what remains}"
+   ```
+   - Also add the `in-progress` label if not already present:
+   ```bash
+   gh issue edit {number} --repo melbinkm/Phantom --add-label "in-progress" --remove-label "started"
+   ```
 
 7. **Output resume brief:**
    - **Task:** `{X.Y} — {title}`
+   - **Issue:** `melbinkm/Phantom#{number}`
    - **Branch:** `{branch}`
-   - **Last checkpoint:** what was done before the break
+   - **Last checkpoint:** what was done before the break (from latest issue comment)
    - **What remains:** bullet list of incomplete steps from "What to Build"
    - **Next step:** specific first action to take
    - **Tests not yet passing:** from the task file's test list
@@ -53,6 +67,6 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, scan all task files
 
 ## Notes
 
-- This command is safe to run multiple times — it only reads and updates the marker
+- This command is safe to run multiple times — it reads and comments on the issue
 - After a host panic, always run this before resuming to ensure git state is clean
-- The checkpoint is only as accurate as the last manual update — encourage frequent updates
+- The checkpoint is only as accurate as the last manual update — encourage frequent comments

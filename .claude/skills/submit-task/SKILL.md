@@ -7,7 +7,7 @@ argument-hint: "[task-number]"
 
 # Submit Phantom Task
 
-Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, check PHANTOM_PROGRESS markers for current IN_PROGRESS task.
+Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, check open GitHub issues with the `in-progress` label: `gh issue list --repo melbinkm/Phantom --label in-progress`.
 
 ## Steps
 
@@ -27,10 +27,23 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, check PHANTOM_PROGR
    - Run `git diff --stat HEAD` — show what changed
    - Verify we are on the task branch (`git branch --show-current`)
 
-4. **Update PHANTOM_PROGRESS marker:**
-   - Set `status: COMPLETED`
-   - Set `last_activity` to now
-   - Set `checkpoint: All tests passing. Submitted.`
+4. **Close GitHub issue:**
+   - Find the open issue for this task:
+     `gh issue list --repo melbinkm/Phantom --search "Task {X.Y}:" --state open --json number`
+   - Post a closing comment:
+   ```bash
+   gh issue comment {number} --repo melbinkm/Phantom --body "## Completed
+
+   **Status:** COMPLETED
+   **All tests passing:** {count} tests
+   **Submitted:** {now}
+
+   PR: (will be linked after push)"
+   ```
+   - Close the issue:
+   ```bash
+   gh issue close {number} --repo melbinkm/Phantom
+   ```
 
 5. **Commit:**
    ```bash
@@ -64,6 +77,8 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, check PHANTOM_PROGR
 
    ## Exit criteria
    {paste exit criteria from task file, mark each ✓}
+
+   Closes #{issue-number}
 
    🤖 Generated with Claude Code"
    ```

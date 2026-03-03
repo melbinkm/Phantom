@@ -22,43 +22,52 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`, `0.1`, `2.2`).
    - Check `CURRENT_PHASE` in CLAUDE.md
 
 3. **Check for existing progress:**
-   - Scan the task file for `<!-- PHANTOM_PROGRESS` marker
-   - If found with `status: COMPLETED`: warn the task is already done; ask to confirm restart
-   - If found with any other status: warn it's already in progress; suggest `/continue-task $ARGUMENTS` instead
-   - If not found: proceed
+   - Run: `gh issue list --repo melbinkm/Phantom --search "Task {X.Y}:" --state all --json number,title,state,labels`
+   - If a closed issue exists for this task: warn the task is already done; ask to confirm restart
+   - If an open issue exists for this task: warn it's already in progress; suggest `/continue-task $ARGUMENTS` instead
+   - If no issue exists: proceed
 
 4. **Create git branch:**
    - Extract the task slug from the filename (e.g., `task-1.3-basic-rw-ept` → slug `basic-rw-ept`)
    - Run: `git checkout -b task-{X.Y}-{slug}`
    - If branch already exists: `git checkout task-{X.Y}-{slug}`
 
-5. **Insert PHANTOM_PROGRESS marker:**
-   - Add the following block immediately after the first `## Objective` heading in the task file:
+5. **Create GitHub issue:**
+   - Run:
+   ```bash
+   gh issue create \
+     --repo melbinkm/Phantom \
+     --title "Task {X.Y}: {task title}" \
+     --label "phase-{phase-label},started" \
+     --body "## Objective
+   {one-sentence objective from the task file}
 
-   ```html
-   <!-- PHANTOM_PROGRESS
-   status: STARTED
-   branch: task-{X.Y}-{slug}
-   started: {today's date}
-   last_activity: {now}
-   checkpoint: Not started
-   blocking: none
-   -->
+   ## Branch
+   \`task-{X.Y}-{slug}\`
+
+   ## Task file
+   \`phases/phase-{X}*/task-{X}.{Y}-*.md\`
+
+   ## Checkpoint
+   Not started"
    ```
+   - Note the issue number returned (e.g., `#12`)
 
 6. **Output implementation brief:**
    Print a structured summary:
    - **Task:** `{X.Y} — {title}`
+   - **Issue:** `melbinkm/Phantom#{issue-number}`
    - **Objective:** one-sentence summary from the task file
    - **What to build:** bullet list from the "What to Build" section
    - **Key data structures:** extracted from the task file
    - **Source files to create/modify:** table from the task file
    - **Tests to run:** list from the task file
    - **Suggested first step:** the most logical first implementation action
-   - **Reminder:** Update the PHANTOM_PROGRESS checkpoint before any dangerous VMX/EPT operations
+   - **Reminder:** Update the GitHub issue with a comment before any dangerous VMX/EPT operations
 
 ## Notes
 
 - Task numbering: 0.1, 1.1–1.8, 2.1–2.4, 3.1–3.4, 4.1–4.3
+- Phase label mapping: 0→`phase-0`, 1a→`phase-1a`, 1b→`phase-1b`, 2→`phase-2`, 3→`phase-3`, 4→`phase-4`
 - Phase directory names include descriptive suffixes (e.g., `phase-1a-vmx-bootstrap`)
 - Do not start tasks out of order if their dependencies are not COMPLETED

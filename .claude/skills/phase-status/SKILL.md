@@ -8,18 +8,24 @@ user-invocable: true
 
 ## Steps
 
-1. **Scan all task files:**
-   - Find all files matching `phases/*/task-*.md`
-   - For each file, check for `<!-- PHANTOM_PROGRESS` marker
-   - Extract `status` field (or `PENDING` if no marker)
+1. **Query GitHub issues for task status:**
+   - Run: `gh issue list --repo melbinkm/Phantom --state all --json number,title,state,labels --limit 50`
+   - For each task, determine status from issue state and labels:
+     - No issue → `PENDING`
+     - Open issue with `started` label → `STARTED`
+     - Open issue with `in-progress` label → `IN_PROGRESS`
+     - Open issue with `blocked` label → `BLOCKED`
+     - Closed issue → `COMPLETED`
+   - For each phase, query by label: `gh issue list --repo melbinkm/Phantom --label phase-{X} --state all`
 
 2. **Read phase READMEs:**
    - Read each `phases/*/README.md` for phase exit criteria
 
 3. **Check gate conditions:**
-   - **kdump/serial gate (Phase 1a entry):** Look for task 1.1 PHANTOM_PROGRESS status
-   - **Determinism gate (Phase 3 entry):** Look for task 3.2 PHANTOM_PROGRESS showing 1000/1000 pass
-   - **Performance gate (Phase 3 entry):** Look for task 1.8 PHANTOM_PROGRESS showing <100μs for 500 pages
+   - **kdump/serial gate (Phase 1a entry):** Check if Task 1.1 issue is closed (COMPLETED)
+   - **Determinism gate (Phase 3 entry):** Check Task 3.2 issue comments for "1000/1000 pass" evidence
+   - **Performance gate (Phase 3 entry):** Check Task 1.8 issue comments for "<100μs for 500 pages" evidence
+   - Gate labels: issues tagged `gate` represent blocking conditions
 
 4. **Read CURRENT_PHASE from CLAUDE.md**
 
@@ -68,6 +74,6 @@ PHASE 4: Campaigns + Publication
   [PASS/FAIL/PENDING] Performance <100μs / 500 pages (Phase 3 entry)
 ```
 
-Status codes: `PENDING` (no marker) | `STARTED` | `IN_PROGRESS` | `BLOCKED` | `COMPLETED`
+Status codes: `PENDING` (no issue) | `STARTED` | `IN_PROGRESS` | `BLOCKED` | `COMPLETED`
 
-If a task shows `BLOCKED`, also display the `blocking` field from its marker.
+If a task shows `BLOCKED`, fetch the issue and display the blocking reason from the latest comment.

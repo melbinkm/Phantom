@@ -38,7 +38,7 @@ Parse `$ARGUMENTS` as an optional test name or pattern (e.g., `vmxon`, `cow`, `a
    ```
 
 5. **Run tests:**
-   - If `$ARGUMENTS` is empty or `all`: run all tests for the current task (check PHANTOM_PROGRESS marker for current task, then run its full test list)
+   - If `$ARGUMENTS` is empty or `all`: run all tests for the current task (check open GitHub issue with `in-progress` label: `gh issue list --repo melbinkm/Phantom --label in-progress --state open --json number,title`, then run the full test list from the corresponding task file)
    - If `$ARGUMENTS` is a specific test name: run only that test
 
    **Local tests:**
