@@ -5,8 +5,8 @@
  * Hot-path events use trace_printk(), not printk().  All macros are
  * compiled to no-ops when PHANTOM_DEBUG is not defined.
  *
- * VMCS dump and EPT walker are defined in debug.c and are only called
- * from slow-path contexts (module init, unexpected VM exit).
+ * VMCS dump and field validator are defined in debug.c and are only
+ * called from slow-path contexts (module init, unexpected VM exit).
  */
 #ifndef PHANTOM_DEBUG_H
 #define PHANTOM_DEBUG_H
@@ -16,39 +16,36 @@
 
 /* ------------------------------------------------------------------
  * Hot-path trace macros — active only when PHANTOM_DEBUG is defined.
- * Using trace_printk keeps them completely off the critical path in
- * production: the macro expands to nothing and the compiler eliminates
- * any dead code around the call site.
  * ------------------------------------------------------------------ */
 
 #ifdef PHANTOM_DEBUG
 
-#define PHANTOM_TRACE_VM_ENTRY(inst_id)					\
-	trace_printk("PHANTOM VMX_ENTRY inst=%d\n", (inst_id))
+#define PHANTOM_TRACE_VM_ENTRY(cpu_id)					\
+	trace_printk("PHANTOM VMX_ENTRY cpu=%d\n", (cpu_id))
 
-#define PHANTOM_TRACE_VM_EXIT(inst_id, reason)				\
-	trace_printk("PHANTOM VMX_EXIT inst=%d reason=%u\n",		\
-		     (inst_id), (reason))
+#define PHANTOM_TRACE_VM_EXIT(cpu_id, reason)				\
+	trace_printk("PHANTOM VMX_EXIT cpu=%d reason=%u\n",		\
+		     (cpu_id), (reason))
 
 #define PHANTOM_TRACE_COW(gpa, priv_hpa)				\
 	trace_printk("PHANTOM COW gpa=0x%llx priv=0x%llx\n",		\
 		     (u64)(gpa), (u64)(priv_hpa))
 
-#define PHANTOM_TRACE_SNAPSHOT(inst_id, dirty_n)			\
-	trace_printk("PHANTOM SNAPSHOT_RESTORE inst=%d dirty=%u\n",	\
-		     (inst_id), (dirty_n))
+#define PHANTOM_TRACE_SNAPSHOT(cpu_id, dirty_n)				\
+	trace_printk("PHANTOM SNAPSHOT_RESTORE cpu=%d dirty=%u\n",	\
+		     (cpu_id), (dirty_n))
 
-#define PHANTOM_TRACE_HYPERCALL(inst_id, nr)				\
-	trace_printk("PHANTOM HYPERCALL inst=%d nr=%llu\n",		\
-		     (inst_id), (u64)(nr))
+#define PHANTOM_TRACE_HYPERCALL(cpu_id, nr)				\
+	trace_printk("PHANTOM HYPERCALL cpu=%d nr=%llu\n",		\
+		     (cpu_id), (u64)(nr))
 
 #else /* !PHANTOM_DEBUG */
 
-#define PHANTOM_TRACE_VM_ENTRY(inst_id)		do {} while (0)
-#define PHANTOM_TRACE_VM_EXIT(inst_id, reason)	do {} while (0)
+#define PHANTOM_TRACE_VM_ENTRY(cpu_id)		do {} while (0)
+#define PHANTOM_TRACE_VM_EXIT(cpu_id, reason)	do {} while (0)
 #define PHANTOM_TRACE_COW(gpa, priv_hpa)	do {} while (0)
-#define PHANTOM_TRACE_SNAPSHOT(inst_id, dn)	do {} while (0)
-#define PHANTOM_TRACE_HYPERCALL(inst_id, nr)	do {} while (0)
+#define PHANTOM_TRACE_SNAPSHOT(cpu_id, dn)	do {} while (0)
+#define PHANTOM_TRACE_HYPERCALL(cpu_id, nr)	do {} while (0)
 
 #endif /* PHANTOM_DEBUG */
 
@@ -69,10 +66,21 @@
 void phantom_dump_vmcs(int inst_id, int cpu, u32 exit_reason,
 		       u64 iteration);
 
+#ifdef PHANTOM_DEBUG
 /**
- * phantom_debug_init - Initialise debug subsystem (no-op stub for 1.1).
+ * phantom_validate_vmcs - Validate VMCS guest state against SDM §26.3.
  *
- * Reserved for future debugfs node creation.
+ * Checks CR0/CR4 fixed bits, CS access rights, IA-32e consistency,
+ * VMCS link pointer, and activity state.
+ *
+ * Returns 0 if all checks pass, -EINVAL on any violation.
+ * Compiled out (not available) in non-debug builds.
+ */
+int phantom_validate_vmcs(void);
+#endif
+
+/**
+ * phantom_debug_init - Initialise debug subsystem.
  * Returns 0 always.
  */
 int phantom_debug_init(void);

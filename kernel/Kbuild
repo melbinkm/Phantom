@@ -9,7 +9,9 @@ phantom-objs := \
 	phantom_main.o \
 	vmx_core.o \
 	interface.o \
-	debug.o
+	debug.o \
+	hypercall.o \
+	nmi.o
 
 # Enable debug assertions and trace_printk during development.
 # Remove -DPHANTOM_DEBUG for production builds.

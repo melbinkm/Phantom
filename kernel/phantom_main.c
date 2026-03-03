@@ -264,6 +264,18 @@ static void __exit phantom_exit(void)
 
 	pdev->initialized = false;
 
+	/* Tear down VMCS guest execution resources first */
+	{
+		int cpu;
+
+		for_each_cpu(cpu, pdev->vmx_cpumask) {
+			struct phantom_vmx_cpu_state *state;
+
+			state = per_cpu_ptr(&phantom_vmx_state, cpu);
+			phantom_vmcs_teardown(state);
+		}
+	}
+
 	phantom_vmcs_free_all(pdev->vmx_cpumask);
 	phantom_vmxoff_all(pdev->vmx_cpumask);
 	phantom_chardev_unregister(pdev);
@@ -278,5 +290,5 @@ module_exit(phantom_exit);
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Phantom Project");
-MODULE_DESCRIPTION("Bare-metal hypervisor fuzzer — VMX bootstrap");
-MODULE_VERSION("1.1.0");
+MODULE_DESCRIPTION("Bare-metal hypervisor fuzzer — VMCS + guest execution");
+MODULE_VERSION("1.2.0");
