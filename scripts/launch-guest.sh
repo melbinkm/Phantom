@@ -50,9 +50,13 @@ echo "==> Checking prerequisites"
 if [[ -f "$GUEST_PID" ]]; then
     OLD_PID=$(cat "$GUEST_PID")
     if kill -0 "$OLD_PID" 2>/dev/null; then
-        echo "WARNING: Guest already running (PID $OLD_PID). Kill it? [y/N]"
-        read -r ans
-        [[ "$ans" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+        if [[ -t 0 ]]; then
+            echo "WARNING: Guest already running (PID $OLD_PID). Kill it? [y/N]"
+            read -r ans
+            [[ "$ans" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+        else
+            echo "Non-interactive mode: auto-killing guest (PID $OLD_PID)"
+        fi
         kill "$OLD_PID"
         sleep 2
     fi

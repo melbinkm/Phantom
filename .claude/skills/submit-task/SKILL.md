@@ -14,7 +14,7 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, check open GitHub i
 1. **Find the task file and read test criteria:**
    - Locate `phases/phase-{X}*/task-{X}.{Y}-*.md`
    - Extract the full "Tests to Run" section
-   - Extract the "Exit Criteria" section
+   - Extract the "Exit Criteria" section; if absent, use the "Deliverables" section
 
 2. **Verify all tests pass:**
    - Run each test from the "Tests to Run" section
@@ -27,7 +27,25 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, check open GitHub i
    - Run `git diff --stat HEAD` — show what changed
    - Verify we are on the task branch (`git branch --show-current`)
 
-4. **Close GitHub issue:**
+4. **Commit:**
+   ```bash
+   # Stage source files non-interactively (never use git add -p or -i)
+   git add kernel/ tests/ benchmarks/ userspace/ Makefile phases/ scripts/ docs/ .claude/
+   git diff --cached --stat   # Show what is staged
+   git commit -m "task-{X.Y}: {task title}
+
+   - {brief description of what was built}
+   - Tests: {count} passing
+
+   Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+   ```
+
+5. **Push:**
+   ```bash
+   git push -u origin task-{X.Y}-{slug}
+   ```
+
+6. **Close GitHub issue:**
    - Find the open issue for this task:
      `gh issue list --repo melbinkm/Phantom --search "Task {X.Y}:" --state open --json number`
    - Post a closing comment:
@@ -37,28 +55,12 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, check open GitHub i
    **Status:** COMPLETED
    **All tests passing:** {count} tests
    **Submitted:** {now}
-
-   PR: (will be linked after push)"
+   **Commit:** $(git rev-parse --short HEAD)
+   **Branch:** task-{X.Y}-{slug}"
    ```
    - Close the issue:
    ```bash
    gh issue close {number} --repo melbinkm/Phantom
-   ```
-
-5. **Commit:**
-   ```bash
-   git add -p   # Stage changes interactively, or stage specific files
-   git commit -m "task-{X.Y}: {task title}
-
-   - {brief description of what was built}
-   - Tests: {count} passing
-
-   Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
-   ```
-
-6. **Push:**
-   ```bash
-   git push -u origin task-{X.Y}-{slug}
    ```
 
 7. **Create Pull Request:**

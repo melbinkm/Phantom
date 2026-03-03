@@ -89,12 +89,20 @@ When you complete a logical unit of work:
 2. List the functions implemented and their purpose
 3. Note any design decisions and why
 4. List tests this change enables
-5. **Post a `## Checkpoint` comment to the issue** via `gh issue comment`
-6. **Post `## Design Decision` comments** for non-trivial choices (algorithm, struct layout, INVEPT strategy)
+5. **Commit and push** (never use `git add -p` or `-i`):
+   ```bash
+   git add kernel/ tests/ benchmarks/ userspace/ Makefile phases/ scripts/ docs/ .claude/
+   git commit -m "checkpoint: {what was completed} — task-{X.Y}
+
+   Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+   git push origin $(git branch --show-current)
+   ```
+6. **Post a `## Checkpoint` comment to the issue** via `gh issue comment`
+7. **Post `## Design Decision` comments** for non-trivial choices (algorithm, struct layout, INVEPT strategy)
 
 ## Before Dangerous VMX Operations
 
 Before any operation that could panic (first VMXON, new VMCS fields, EPT changes):
-1. Commit all current work
+1. Commit and push all current work (same commands as above)
 2. Post a `## Checkpoint` noting the dangerous operation about to be attempted
 3. Then proceed

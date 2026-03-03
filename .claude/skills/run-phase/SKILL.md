@@ -18,16 +18,24 @@ boundaries before advancing.
 
 ## Step 1: Validate Phase and Check Prerequisites
 
-1. **Confirm the phase exists** in CLAUDE.md and matches `$ARGUMENTS`.
-2. **Check prior phases are complete:**
+1. **Pre-flight checks** (verify all external dependencies before starting any work):
+   ```bash
+   gh auth status --hostname github.com          # GitHub CLI auth
+   git push --dry-run origin HEAD 2>&1           # Git push credentials
+   ssh -o BatchMode=yes -o ConnectTimeout=5 phantom-bench "echo ok"  # SSH to server
+   ```
+   If any fail: STOP. Report which credential/connection is missing.
+2. **Confirm the phase exists** and matches `$ARGUMENTS`.
+   Derive phase completion state from GitHub issues (not CLAUDE.md, which is gitignored):
+   ```bash
+   gh issue list --repo melbinkm/Phantom --label phase-{prior} --state open --json number
+   ```
+3. **Check prior phases are complete:**
    - Phase 1a requires phase 0 complete
    - Phase 1b requires phase 1a complete
    - Phase 2+ requires all prior phases complete
-   ```bash
-   gh issue list --repo melbinkm/Phantom --label phase-{prior} --state open
-   ```
    If any prior-phase tasks are still open: STOP. Report which tasks are blocking.
-3. **Check phase entry gates** from CLAUDE.md "Active Gates":
+4. **Check phase entry gates:**
    - Phase 1a entry: kdump/crash observability gate must be PASSED
    - Phase 3 entry: Determinism gate and Performance (Class A) gate must both be PASSED
    If a gate has not passed: STOP. Report which gate is blocking.
@@ -161,7 +169,7 @@ When all tasks in the phase are closed:
    ```
 
 3. **If gate PASSES (or no gate):**
-   - Update `CURRENT_PHASE` in CLAUDE.md to the next phase
+   - Phase state is tracked via GitHub issue labels (closed issues = complete). No file update needed.
    - Output phase completion summary:
      ```
      Phase {X} complete. {N} tasks submitted.
@@ -173,7 +181,7 @@ When all tasks in the phase are closed:
 4. **If gate FAILS:** STOP. Output:
    ```
    Phase {X} BLOCKED at gate: {gate name}
-   Condition: {condition from CLAUDE.md}
+   Condition: {condition from Active Gates in project docs}
    Current data: {what was found in issues}
    Required: manual investigation and gate re-verification
    ```

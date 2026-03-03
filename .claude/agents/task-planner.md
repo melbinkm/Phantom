@@ -87,4 +87,4 @@ Present the plan clearly with numbered sections. Be specific about function name
 - Adjustments from the current issue (if work was started and pivoted)
 - Reference specific issue numbers for traceability
 
-After the plan, ask: "Does this plan look correct? Any design decisions to revisit before implementation begins?"
+After the plan, state: "Plan complete. Proceeding to implementation unless adjustments are posted to the GitHub issue."
