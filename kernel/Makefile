@@ -7,17 +7,17 @@
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
 all:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
 
 # Static analysis via sparse (C=1) — zero warnings required
 check:
-	$(MAKE) -C $(KDIR) M=$(PWD) C=1 modules
+	$(MAKE) -C $(KDIR) M=$(CURDIR) C=1 modules
 
 # Install into running kernel (for testing only — not used in CI)
 install:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules_install
 
 .PHONY: all clean check install
