@@ -9,7 +9,7 @@ user-invocable: true
 ## Steps
 
 1. **Query GitHub issues for task status:**
-   - Run: `gh issue list --repo melbinkm/Phantom --state all --json number,title,state,labels --limit 50`
+   - Run: `gh issue list --repo melbinkm/Phantom --state all --json number,title,state,labels,body --limit 50`
    - For each task, determine status from issue state and labels:
      - No issue → `PENDING`
      - Open issue with `started` label → `STARTED`
@@ -17,6 +17,9 @@ user-invocable: true
      - Open issue with `blocked` label → `BLOCKED`
      - Closed issue → `COMPLETED`
    - For each phase, query by label: `gh issue list --repo melbinkm/Phantom --label phase-{X} --state all`
+   - For each open issue, parse the `## Implementation Steps` checklist from the body:
+     - Count total items and checked items (`- [x]` vs `- [ ]`)
+     - Compute percentage: `{checked}/{total} ({percent}%)`
 
 2. **Read phase READMEs:**
    - Read each `phases/*/README.md` for phase exit criteria
@@ -74,6 +77,19 @@ PHASE 4: Campaigns + Publication
   [PASS/FAIL/PENDING] Performance <100μs / 500 pages (Phase 3 entry)
 ```
 
-Status codes: `PENDING` (no issue) | `STARTED` | `IN_PROGRESS` | `BLOCKED` | `COMPLETED`
+Status codes: `PENDING` (no issue) | `STARTED` | `IN_PROGRESS N/T P%` | `BLOCKED` | `COMPLETED`
 
-If a task shows `BLOCKED`, fetch the issue and display the blocking reason from the latest comment.
+- For `IN_PROGRESS` tasks, append checklist progress inline: `[IN_PROGRESS 3/7 43%] Task 1.3 — Basic R/W EPT`
+- If a task shows `BLOCKED`, fetch the issue and display the blocking reason from the latest comment
+- After the main table, add a detail section for any in-progress tasks:
+
+```
+=== IN-PROGRESS TASK DETAIL ===
+Task {X.Y} — {title}  ({checked}/{total} steps, {percent}%)
+  Remaining steps:
+    [ ] {unchecked step 1}
+    [ ] {unchecked step 2}
+    ...
+  Labels: {label list}
+  Issue: melbinkm/Phantom#{number}
+```

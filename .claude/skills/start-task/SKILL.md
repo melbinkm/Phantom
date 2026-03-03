@@ -21,6 +21,12 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`, `0.1`, `2.2`).
    - Read the phase README for exit criteria and dependencies
    - Check `CURRENT_PHASE` in CLAUDE.md
 
+2b. **Extract implementation steps:**
+   - Identify the "What to Build" section in the task file
+   - Extract each top-level bullet point as one implementation step
+   - Summarise each bullet to ~80 characters if longer — the full detail lives in the task file
+   - These become the checkboxes in the GitHub issue (1:1 mapping, never split or merge bullets)
+
 3. **Check for existing progress:**
    - Run: `gh issue list --repo melbinkm/Phantom --search "Task {X.Y}:" --state all --json number,title,state,labels`
    - If a closed issue exists for this task: warn the task is already done; ask to confirm restart
@@ -48,6 +54,11 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`, `0.1`, `2.2`).
    ## Task file
    \`phases/phase-{X}*/task-{X}.{Y}-*.md\`
 
+   ## Implementation Steps
+   - [ ] {step 1 extracted from "What to Build" bullet 1, ≤80 chars}
+   - [ ] {step 2 extracted from "What to Build" bullet 2, ≤80 chars}
+   - [ ] {… one checkbox per top-level bullet …}
+
    ## Checkpoint
    Not started"
    ```
@@ -58,6 +69,7 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`, `0.1`, `2.2`).
    - **Task:** `{X.Y} — {title}`
    - **Issue:** `melbinkm/Phantom#{issue-number}`
    - **Objective:** one-sentence summary from the task file
+   - **Implementation checklist:** `{count} steps extracted from "What to Build"`
    - **What to build:** bullet list from the "What to Build" section
    - **Key data structures:** extracted from the task file
    - **Source files to create/modify:** table from the task file

@@ -19,6 +19,7 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, query `gh issue lis
    - Run: `gh issue list --repo melbinkm/Phantom --search "Task {X.Y}:" --state open --json number,title,labels,body`
    - Fetch issue comments: `gh issue view {number} --repo melbinkm/Phantom --comments`
    - Extract from body: branch name, objective
+   - Extract from body: `## Implementation Steps` checklist — count checked vs total (e.g., `3/7`)
    - Extract from latest comment: last checkpoint, blocking issues
    - If no open issue exists: suggest `/start-task $ARGUMENTS` instead
 
@@ -33,6 +34,10 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, query `gh issue lis
    - Compare test results in the checkpoint against tests that currently pass
    - If reality is ahead of the checkpoint (e.g., more files exist than noted), update accordingly
    - If reality is behind (e.g., panic erased work), note what was lost
+   - If a `## Implementation Steps` checklist is present in the issue body, cross-reference each item against actual file state:
+     - Check off items where code evidence exists (file created, function present, test passing)
+     - Uncheck items that were marked done but have no code evidence (phantom completions)
+     - Apply the updated checklist: `gh issue edit {number} --repo melbinkm/Phantom --body "{updated body}"`
 
 5. **Crash recovery path** (if last comment was recent and a kdump exists):
    - Check for `/var/crash/` dumps newer than the last issue comment timestamp
@@ -59,6 +64,7 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, query `gh issue lis
    - **Task:** `{X.Y} — {title}`
    - **Issue:** `melbinkm/Phantom#{number}`
    - **Branch:** `{branch}`
+   - **Checklist progress:** `{checked}/{total}` (from `## Implementation Steps` in issue body)
    - **Last checkpoint:** what was done before the break (from latest issue comment)
    - **What remains:** bullet list of incomplete steps from "What to Build"
    - **Next step:** specific first action to take
