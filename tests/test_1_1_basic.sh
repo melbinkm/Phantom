@@ -76,12 +76,20 @@ else
 fi
 
 # ---- Test 4: compile and run ioctl test binary ----------------------
+#
+# gcc may not be available in the minimal guest.  Fall back to the
+# pre-compiled binary shipped in tests/ (compiled on the server host).
 
 log "--- Test 4: ioctl GET_VERSION ---"
+PREBUILT=/mnt/phantom/tests/test_ioctl
 if gcc -O2 -Wall -o "$TEST_BIN" "$TEST_SRC" 2>/dev/null; then
 	pass "compiled test_ioctl.c"
+elif [ -x "$PREBUILT" ]; then
+	log "      gcc unavailable — using pre-compiled binary"
+	TEST_BIN="$PREBUILT"
+	pass "pre-compiled test_ioctl binary available"
 else
-	fail "compiled test_ioctl.c (gcc failed)"
+	fail "no test_ioctl binary available (gcc failed and no pre-built)"
 fi
 
 if [ -x "$TEST_BIN" ]; then
@@ -89,7 +97,6 @@ if [ -x "$TEST_BIN" ]; then
 		pass "ioctl test binary: all assertions passed"
 	else
 		fail "ioctl test binary: one or more assertions failed"
-		# Run again with output visible
 		"$TEST_BIN" || true
 	fi
 fi

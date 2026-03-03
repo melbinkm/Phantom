@@ -29,7 +29,8 @@
 #include <linux/cpumask.h>
 #include <linux/errno.h>
 #include <linux/string.h>
-#include <asm/cr4.h>
+#include <asm/processor.h>
+#include <asm/tlbflush.h>
 
 #include "phantom.h"
 #include "vmx_core.h"
@@ -143,7 +144,7 @@ static void phantom_read_cr4_vmxe(void *data)
 {
 	struct phantom_cr4_check_work *work = data;
 
-	if (read_cr4() & X86_CR4_VMXE)
+	if (native_read_cr4() & X86_CR4_VMXE)
 		work->vmxe_set = true;
 }
 

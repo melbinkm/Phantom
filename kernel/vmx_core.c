@@ -28,8 +28,10 @@
 #include <linux/percpu.h>
 #include <asm/processor.h>
 #include <asm/cpufeature.h>
+#include <asm/cpuid.h>
 #include <asm/msr.h>
-#include <asm/cr4.h>
+#include <asm/tlbflush.h>
+#include <asm/io.h>
 #include <asm/vmx.h>
 
 #include "phantom.h"
@@ -186,13 +188,16 @@ int phantom_vmx_check_cpu_features(struct phantom_cpu_features *feat)
 		}
 	}
 
-	/* Secondary proc-based controls: EPT enable is bit 1 */
+	/* Secondary proc-based controls: EPT enable (SECONDARY_EXEC_ENABLE_EPT
+	 * = BIT(1)).  The "allowed-1" mask lives in the high 32 bits of the
+	 * MSR.  Bit 1 in the high half = bit 33 of the 64-bit MSR value.
+	 */
 	if (rdmsrl_safe(MSR_IA32_VMX_PROCBASED_CTLS2, &secondary_ctls_msr)) {
 		pr_err("phantom: failed to read MSR_IA32_VMX_PROCBASED_CTLS2\n");
 		return -ENODEV;
 	}
-	/* Allowed-1 bits in high 32; EPT is bit 1 */
-	feat->ept = !!(secondary_ctls_msr & BIT_ULL(33)); /* bit 1 + 32 */
+	feat->ept = !!(secondary_ctls_msr &
+		       ((u64)SECONDARY_EXEC_ENABLE_EPT << 32));
 	if (!feat->ept) {
 		pr_err("phantom: EPT not supported by this CPU\n");
 		return -ENODEV;
@@ -204,10 +209,11 @@ int phantom_vmx_check_cpu_features(struct phantom_cpu_features *feat)
 		return -ENODEV;
 	}
 
-	feat->ept_4lvl = !!(ept_vpid_cap & VMX_EPT_VPID_CAP_4LVL);
-	feat->ept_wb   = !!(ept_vpid_cap & VMX_EPT_VPID_CAP_WB);
-	feat->ept_2mb  = !!(ept_vpid_cap & VMX_EPT_VPID_CAP_2MB);
-	feat->ept_ad   = !!(ept_vpid_cap & VMX_EPT_VPID_CAP_AD);
+	/* Use kernel-defined EPT capability bit names from <asm/vmx.h> */
+	feat->ept_4lvl = !!(ept_vpid_cap & VMX_EPT_PAGE_WALK_4_BIT);
+	feat->ept_wb   = !!(ept_vpid_cap & VMX_EPTP_WB_BIT);
+	feat->ept_2mb  = !!(ept_vpid_cap & VMX_EPT_2MB_PAGE_BIT);
+	feat->ept_ad   = !!(ept_vpid_cap & VMX_EPT_AD_BIT);
 
 	if (!feat->ept_4lvl) {
 		pr_err("phantom: EPT 4-level page walk not supported\n");
@@ -261,9 +267,11 @@ static void phantom_vmxon_cpu(void *data)
 {
 	struct phantom_vmxon_work *work = data;
 	struct phantom_vmx_cpu_state *state;
-	u64 cr4, phys;
+	unsigned long cr4;
+	u64 phys;
 	u32 *rev_ptr;
 	int cpu, ret;
+	bool we_set_vmxe = false;
 
 	cpu   = smp_processor_id();
 	state = this_cpu_ptr(&phantom_vmx_state);
@@ -271,20 +279,27 @@ static void phantom_vmxon_cpu(void *data)
 	state->cpu      = cpu;
 	state->init_err = 0;
 
-	/* Save CR4 so we can restore it on failure */
-	cr4 = read_cr4();
+	/* Read current CR4 via hardware register (not the shadow, in case
+	 * another module changed it without updating the per-CPU shadow).
+	 * native_read_cr4() is a static inline — no export required.
+	 */
+	cr4 = native_read_cr4();
 	state->saved_cr4 = cr4;
 
 	/* Advisory pre-check: if CR4.VMXE is already set, another entity
 	 * may own VMX on this core.  We still attempt VMXON — the hardware
 	 * response (CF flag) is the authoritative ownership test.
 	 */
-	if (cr4 & X86_CR4_VMXE)
+	if (cr4 & X86_CR4_VMXE) {
 		pr_warn("phantom: CPU%d: CR4.VMXE already set — "
 			"VMX likely active (conflict possible)\n", cpu);
-
-	/* Enable VMXE before VMXON */
-	write_cr4(cr4 | X86_CR4_VMXE);
+	} else {
+		/* Set CR4.VMXE via cr4_set_bits() which updates both the
+		 * hardware register and the per-CPU shadow atomically.
+		 */
+		cr4_set_bits(X86_CR4_VMXE);
+		we_set_vmxe = true;
+	}
 
 	/* Write revision ID into the pre-allocated VMXON region */
 	rev_ptr  = (u32 *)page_address(state->vmxon_region);
@@ -298,7 +313,8 @@ static void phantom_vmxon_cpu(void *data)
 	if (ret) {
 		pr_err("phantom: CPU%d: VMXON failed (err=%d) — "
 		       "is kvm_intel loaded?\n", cpu, ret);
-		write_cr4(cr4); /* restore CR4.VMXE */
+		if (we_set_vmxe)
+			cr4_clear_bits(X86_CR4_VMXE);
 		state->vmx_active = false;
 		state->init_err   = ret;
 		work->result      = ret;
@@ -322,7 +338,14 @@ static void phantom_vmxoff_cpu(void *data)
 		return;
 
 	__vmxoff();
-	write_cr4(state->saved_cr4);
+
+	/* Restore CR4.VMXE to its pre-VMXON state.
+	 * If we set VMXE (saved_cr4 did not have it), clear it now.
+	 * If it was already set before us, leave it set.
+	 */
+	if (!(state->saved_cr4 & X86_CR4_VMXE))
+		cr4_clear_bits(X86_CR4_VMXE);
+
 	state->vmx_active = false;
 
 	pr_info("phantom: CPU%d: VMX root exited\n", smp_processor_id());

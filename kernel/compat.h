@@ -10,7 +10,7 @@
 #define PHANTOM_COMPAT_H
 
 #include <linux/version.h>
-#include <linux/device/class.h>
+#include <linux/device.h>
 
 /*
  * class_create() API change: prior to 6.4 it takes (owner, name);

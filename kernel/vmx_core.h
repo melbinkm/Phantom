@@ -65,20 +65,21 @@
 #define MSR_IA32_VMX_TRUE_ENTRY_CTLS	0x00000490
 #endif
 
-/* ------------------------------------------------------------------
- * EPT/VPID capability bits (MSR_IA32_VMX_EPT_VPID_CAP)
- * ------------------------------------------------------------------ */
-#define VMX_EPT_VPID_CAP_4LVL		BIT_ULL(6)   /* 4-level page walk     */
-#define VMX_EPT_VPID_CAP_WB		BIT_ULL(14)  /* WB memory type        */
-#define VMX_EPT_VPID_CAP_2MB		BIT_ULL(16)  /* 2MB large pages       */
-#define VMX_EPT_VPID_CAP_AD		BIT_ULL(21)  /* EPT A/D bits          */
+/*
+ * EPT/VPID capability bits (MSR_IA32_VMX_EPT_VPID_CAP).
+ *
+ * The kernel's <asm/vmx.h> defines these as VMX_EPT_PAGE_WALK_4_BIT,
+ * VMX_EPTP_WB_BIT, VMX_EPT_2MB_PAGE_BIT, VMX_EPT_AD_BIT.  We include
+ * that header in vmx_core.c and use those names directly, so no aliases
+ * are needed here.
+ */
 
-/* Secondary proc-based controls: EPT enable is bit 1 */
-#define VMX_SECONDARY_EXEC_ENABLE_EPT	BIT(1)
-
-/* VMX_BASIC bits */
+/*
+ * VMX_BASIC bits — only define what the kernel headers do NOT already
+ * provide.  VMX_BASIC_TRUE_CTLS is in <asm/msr-index.h> since 5.x;
+ * do not redefine it.
+ */
 #define VMX_BASIC_REVISION_MASK		0x7fffffffULL
-#define VMX_BASIC_TRUE_CTLS		BIT_ULL(55)  /* TRUE controls MSRs present */
 
 /* ------------------------------------------------------------------
  * Per-CPU VMX state
@@ -90,7 +91,7 @@ struct phantom_vmx_cpu_state {
 	struct page	*vmxon_region;	/* 4KB VMXON region, NUMA-local      */
 	struct page	*vmcs_region;	/* 4KB VMCS region, NUMA-local       */
 	bool		 vmx_active;	/* true after successful VMXON       */
-	u64		 saved_cr4;	/* CR4 value before we set VMXE      */
+	unsigned long	 saved_cr4;	/* CR4 value before we set VMXE      */
 	int		 cpu;		/* physical CPU index                */
 	int		 init_err;	/* error code if VMXON/alloc failed  */
 };
