@@ -76,35 +76,68 @@ The spike target (Intel i7-6700) supports the TRUE MSRs.
 
 ---
 
-## Findings (to be filled in after testing)
+## Findings (filled in 2026-03-03)
 
 ### VMXON result
-- [ ] CF=0, ZF=0 (success)
-- [ ] CF=1 (failure — kvm_intel still loaded?)
-- [ ] ZF=1 (instruction error — check VMCS field 0x4400)
+- [x] CF=0, ZF=0 (success) — after rmmod kvm_intel in the guest
 
 ### VMLAUNCH result
-- [ ] Guest launched successfully
-- [ ] VMLAUNCH failed (instr_err = ?)
+- [x] Guest launched successfully (after HOST_TR_SEL encoding fix)
+- Initial failure: VMLAUNCH instr_err=8 ("invalid control field") — caused by
+  HOST_TR_SELECTOR encoded as 0x0c0e instead of the correct 0x0c0c.
+  The vmwrite to field 0x0c0e silently failed (wrote to a reserved field),
+  leaving HOST_TR_SELECTOR as 0 which triggered error 8.
 
 ### VMCALL exit
-- [ ] Observed with correct exit reason (18)
-- [ ] RIP advanced by 3 bytes correctly
+- [ ] Not observed yet — the guest triggers an EPT violation before reaching vmcall
+- Reason: the guest's first instruction (vmcall) may access the LIDT/GDT region
+  or the CPU checks some data structure; the identity-mapped EPT only covers the
+  2MB region containing guest_code, but the CPU accesses other physical addresses
+  before executing the first instruction.
 
 ### EPT violation exit
-- [ ] Observed with GPA=0xdead000
-- [ ] Exit qualification bits logged correctly
+- [x] Observed — exit_count=1, GPA=0x6343c000, qual=0x81
+- GPA is not 0xdead000 (the deliberate unmapped access in guest code)
+- GPA=0x6343c000 is accessed BEFORE the vmcall executes; likely a page table
+  walk or system structure access initiated by the CPU before the first instruction
+- qual=0x81: bit 0 (read access) + bit 7 (GPA field valid) = read access to
+  an unmapped GPA
 
 ### kdump
-- [ ] kdump captured vmcore after trigger_panic=1
-- [ ] Serial console showed panic output
-- [ ] crash(1) could load vmcore with module symbols
+- [ ] Not yet tested — trigger_panic=1 test pending
+- Note: QEMU guest uses KVM nested virtualisation; kdump in the QEMU guest
+  would capture a guest vmcore, not a host panic. For kdump of a host panic,
+  the test should run on the bare server (Phase 2+).
 
 ---
 
 ## Surprises / Tooling Gaps
 
-(to be filled in during testing)
+1. **VMCS HOST_TR_SEL encoding**: The vmx-reference skill and the task spec
+   both had 0x0c0e; the correct value per Intel SDM and KVM source (asm/vmx.h)
+   is 0x0c0c. The vmwrite to a reserved field silently succeeds but the field
+   stays 0, causing VMLAUNCH error 8. Always cross-check with asm/vmx.h.
+
+2. **objtool RETPOLINE/RETHUNK issues**: Ubuntu's 6.8 kernel build enforces
+   objtool checks for RETPOLINE (indirect jumps) and RETHUNK (bare ret). The
+   spike's longjmp-back mechanism required:
+   - No bare `retq` in the trampoline (use `ud2` after unreachable call)
+   - ANNOTATE_RETPOLINE_SAFE for the indirect `jmpq *` in spike_maybe_resume
+   - UNWIND_HINT_UNDEFINED before the stack-clobbering longjmp asm
+
+3. **EPT identity-map coverage**: Guest code at a kernel virtual address
+   (0xffffffff_xxxxxxxx) has a physical address in the direct-map range
+   (2-4GB typically). The 2MB EPT entry covers the code, but the CPU may
+   access other physical addresses before executing the first instruction.
+   Production code needs to map the full guest memory range, not just the
+   code page.
+
+4. **nested KVM VMX support**: kvm_intel must be rmmod'd in the QEMU guest
+   before loading spike.ko. CR4.VMXE pre-check correctly warns if kvm_intel
+   is still loaded.
+
+5. **MODULE_LICENSE**: Use "GPL v2" not "GPL-2.0-only" in MODULE_LICENSE()
+   macro (the latter form is for SPDX, not for module_param).
 
 ---
 
