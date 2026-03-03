@@ -38,10 +38,13 @@
 
 #include <asm/processor.h>
 #include <asm/msr.h>
+#include <asm/msr-index.h>
 #include <asm/desc.h>
 #include <asm/segment.h>
-#include <asm/tlbflush.h>
-#include <asm/special_insns.h>
+#include <asm/tlbflush.h>       /* cr4_set_bits, cr4_clear_bits */
+#include <asm/special_insns.h>  /* __read_cr4, __native_read_cr3, read_cr0 */
+#include <asm/io.h>             /* virt_to_phys */
+#include <asm/unwind_hints.h>   /* UNWIND_HINT_UNDEFINED */
 
 #include "spike_vmx.h"
 #include "spike_ept.h"
@@ -99,9 +102,20 @@ static struct spike_vcpu *g_vcpu;
  * Forward declarations
  * ------------------------------------------------------------------------- */
 
-/* Both functions are called from the asm trampoline by name — non-static. */
+/* Both functions called from the asm trampoline — non-static, __noreturn. */
 void spike_vmexit_dispatch(struct spike_vcpu *vcpu);
-void spike_maybe_resume(struct spike_vcpu *vcpu);
+__noreturn void spike_maybe_resume(struct spike_vcpu *vcpu);
+
+/* Defined in the inline asm block below; referenced in spike_setup_vmcs(). */
+extern void spike_vmexit_trampoline(void);
+
+/*
+ * Per-CPU saved host context for the longjmp-back from spike_maybe_resume
+ * to spike_do_vmlaunch().  Saved before VMLAUNCH, restored on guest exit.
+ */
+static DEFINE_PER_CPU(u64, spike_saved_rsp);
+static DEFINE_PER_CPU(u64, spike_saved_rbp);
+static DEFINE_PER_CPU(u64, spike_saved_rip);
 
 /* -------------------------------------------------------------------------
  * VM exit trampoline (assembly)
@@ -122,35 +136,28 @@ asm(
 ".section .text\n"
 ".global spike_vmexit_trampoline\n"
 "spike_vmexit_trampoline:\n"
-	/* Align the stack to 16 bytes as required by the x86-64 ABI before
-	 * the call instruction pushes the return address.  The host RSP
-	 * written to the VMCS was the physical top of a 4KB page, which is
-	 * always 16-byte aligned. */
-	"subq $8, %rsp\n"          /* re-align to 16B before call */
-	/* Pass g_vcpu (pointer) as first argument in rdi. */
-	"leaq g_vcpu(%rip), %rdi\n"
-	"movq (%rdi), %rdi\n"      /* dereference: rdi = g_vcpu             */
-	"callq spike_vmexit_dispatch\n"
-	/* spike_vmexit_dispatch() sets vcpu->should_exit.
-	 * After return, we check and either VMRESUME or return to the
-	 * module init code via a longjmp-style approach.
-	 *
-	 * For the spike we use a simple flag: if should_exit is set we
-	 * unwind the stack and return to the caller of spike_run_guest().
-	 * We do this by loading the saved host RSP (pointed at by the
-	 * exit_stack) and performing a RET to spike_run_guest's frame.
-	 *
-	 * Implementation: spike_run_guest() saves RIP + RSP before VMLAUNCH
-	 * so we can longjmp back.  For simplicity in this spike, we just
-	 * call a helper that decides whether to VMRESUME or return.
+	/*
+	 * HOST_RSP was set to the top of the dedicated exit stack (a 4KB
+	 * page, top = page_base + PAGE_SIZE).  The hardware restores RSP
+	 * from HOST_RSP on VM exit, so RSP is 16-byte aligned when we
+	 * arrive here.  Subtract 8 to re-align before the call instruction
+	 * pushes the return address (ABI requires 16B alignment before call).
 	 */
-	"leaq g_vcpu(%rip), %rdi\n"
-	"movq (%rdi), %rdi\n"
+	"subq  $8, %rsp\n"
+	/* Load g_vcpu pointer into rdi (first argument register). */
+	"leaq  g_vcpu(%rip), %rdi\n"
+	"movq  (%rdi), %rdi\n"
+	"callq spike_vmexit_dispatch\n"
+	/* spike_vmexit_dispatch sets vcpu->should_exit.  Now call
+	 * spike_maybe_resume which either VMRESUMEs or does the
+	 * longjmp-back.  spike_maybe_resume is marked __noreturn so
+	 * objtool knows nothing follows this call. */
+	"leaq  g_vcpu(%rip), %rdi\n"
+	"movq  (%rdi), %rdi\n"
 	"callq spike_maybe_resume\n"
-	/* spike_maybe_resume either executes VMRESUME (does not return here)
-	 * or does a full stack unwind back to spike_run_guest(). */
-	"addq $8, %rsp\n"
-	"retq\n"
+	/* Unreachable: spike_maybe_resume never returns.
+	 * ud2 terminates the sequence so objtool sees no fallthrough. */
+	"ud2\n"
 );
 
 /* -------------------------------------------------------------------------
@@ -253,10 +260,15 @@ static int spike_setup_vmcs(struct spike_vcpu *vcpu)
 	proc1_ctl = vmx_adjust_ctl(cap_msr, PRI_PROC_ENABLE_SECONDARY);
 	vmcs_write32(VMCS_PRI_PROC_BASED_CTLS, proc1_ctl);
 
-	/* Secondary proc-based: enable EPT + VPID */
+	/* Secondary proc-based: enable EPT (VPID optional) */
 	rdmsrl(MSR_IA32_VMX_PROCBASED_CTLS2, cap_msr);
-	proc2_ctl = vmx_adjust_ctl(cap_msr,
-				   SEC_PROC_ENABLE_EPT | SEC_PROC_ENABLE_VPID);
+	proc2_ctl = vmx_adjust_ctl(cap_msr, SEC_PROC_ENABLE_EPT);
+	/*
+	 * Enable VPID only if the capability MSR allows it.
+	 * In nested KVM environments it may not be supported.
+	 */
+	if ((cap_msr >> 32) & SEC_PROC_ENABLE_VPID)
+		proc2_ctl |= SEC_PROC_ENABLE_VPID;
 	vmcs_write32(VMCS_SEC_PROC_BASED_CTLS, proc2_ctl);
 
 	/* VM-exit: host-address-space-size (64-bit host) + ack interrupt */
@@ -289,7 +301,7 @@ static int spike_setup_vmcs(struct spike_vcpu *vcpu)
 	 * ----------------------------------------------------------------- */
 	vmcs_write64(VMCS_GUEST_CR0, read_cr0());
 	vmcs_write64(VMCS_GUEST_CR3, __native_read_cr3());
-	vmcs_write64(VMCS_GUEST_CR4, native_read_cr4());
+	vmcs_write64(VMCS_GUEST_CR4, __read_cr4());
 	vmcs_write64(VMCS_GUEST_DR7, 0x400);   /* reset value */
 
 	/* Guest RIP = GPA of guest_code_start (identity-mapped) */
@@ -497,105 +509,118 @@ void spike_vmexit_dispatch(struct spike_vcpu *vcpu)
 
 /*
  * spike_maybe_resume() — called from the trampoline after spike_vmexit_dispatch.
+ * Marked __noreturn: either VMRESUMEs or longjmps back to spike_do_vmlaunch().
  *
- * If should_exit is false, execute VMRESUME.
- * If should_exit is true, restore the host context saved in spike_host_ctx
- * and return to the point just after VMLAUNCH in spike_do_vmlaunch().
+ * If should_exit is false: VMRESUME (does not return on success).
+ * If should_exit is true: restore the saved RSP/RBP/RIP and jump to the
+ * 'spike_vmlaunch_done' label inside spike_do_vmlaunch().
  *
- * We use a simple setjmp-style saved context: RSP + RBP + return RIP.
- * spike_do_vmlaunch() saves these three values before executing VMLAUNCH.
- * spike_maybe_resume() restores them to "return" from VMLAUNCH.
+ * The indirect jump is annotated with the inline-asm equivalent of
+ * ANNOTATE_RETPOLINE_SAFE (asm/nospec-branch.h) — the target is always
+ * the spike_vmlaunch_done label, which is a static kernel address.
  */
-struct spike_host_ctx {
-	u64 rsp;
-	u64 rbp;
-	u64 rip;   /* return address — where to jump back to */
-};
-
-/* Per-CPU saved host context for the longjmp-back after guest exit. */
-static DEFINE_PER_CPU(struct spike_host_ctx, spike_saved_ctx);
-
-void spike_maybe_resume(struct spike_vcpu *vcpu)
+__noreturn void spike_maybe_resume(struct spike_vcpu *vcpu)
 {
 	if (!vcpu->should_exit) {
 		/* Continue guest execution — does not return on success. */
 		asm volatile("vmresume" ::: "cc", "memory");
 		/*
 		 * VMRESUME returns here only if it fails (CF=1 or ZF=1).
-		 * Log the error and fall through to the longjmp-back below.
+		 * Log the error and fall through to the longjmp-back.
 		 */
 		pr_err("spike: VMRESUME failed! instr_err=%u\n",
 		       vmcs_read32(VMCS_VM_INSTR_ERROR));
-		vcpu->should_exit = true;
 	}
 
 	/*
-	 * Restore the host context saved before VMLAUNCH and jump back.
-	 * This unwinds the exit-stack frame and returns to the instruction
-	 * immediately after VMLAUNCH in spike_do_vmlaunch().
+	 * Restore the original RSP/RBP from spike_do_vmlaunch() and jump
+	 * to the spike_vmlaunch_done label.
 	 *
-	 * We load RSP, RBP, then push the saved RIP and execute RETQ, which
-	 * pops it and jumps there.  This is the standard longjmp pattern.
+	 * UNWIND_HINT_UNDEFINED: tell objtool that the unwind state after
+	 * this point is intentionally undefined (we are changing RSP to
+	 * a completely different stack frame — a longjmp).
+	 *
+	 * The ".discard.retpoline_safe" annotation tells objtool that the
+	 * indirect jump is intentional (equivalent to ANNOTATE_RETPOLINE_SAFE).
 	 */
+	UNWIND_HINT_UNDEFINED;
 	asm volatile(
 		"movq %0, %%rsp\n\t"
 		"movq %1, %%rbp\n\t"
-		"jmpq *%2\n\t"           /* jump to saved RIP (not retq) */
+		".Lspike_rp_safe:\n\t"
+		".pushsection .discard.retpoline_safe\n\t"
+		".long .Lspike_rp_safe\n\t"
+		".popsection\n\t"
+		"jmpq *%2\n\t"
 		:
-		: "r"(this_cpu_ptr(&spike_saved_ctx)->rsp),
-		  "r"(this_cpu_ptr(&spike_saved_ctx)->rbp),
-		  "r"(this_cpu_ptr(&spike_saved_ctx)->rip)
+		: "r"(*this_cpu_ptr(&spike_saved_rsp)),
+		  "r"(*this_cpu_ptr(&spike_saved_rbp)),
+		  "r"(*this_cpu_ptr(&spike_saved_rip))
 		: "memory"
 	);
-	/* Unreachable */
+	unreachable();
 }
-
-/* Forward declaration for trampoline (defined in inline asm block above) */
-extern void spike_vmexit_trampoline(void);
 
 /* -------------------------------------------------------------------------
  * Guest launch
  * ------------------------------------------------------------------------- */
 
 /*
- * spike_do_vmlaunch() — inner function that saves host context and executes
- * VMLAUNCH.
+ * spike_do_vmlaunch() — execute VMLAUNCH and busy-wait for the guest to finish.
  *
- * Marked noinline so the compiler emits a standard call/ret frame.  We save
- * our RSP, RBP, and the return address (the instruction after VMLAUNCH) into
- * the per-CPU spike_saved_ctx.  On VM exit, spike_maybe_resume() restores
- * this context and jumps to the saved RIP, which lands at the label
- * 'vmlaunch_returned' in this function.
+ * VMLAUNCH transitions the CPU to non-root mode.  On each VM exit, the
+ * trampoline calls spike_vmexit_dispatch + spike_maybe_resume.
+ * spike_maybe_resume sets spike_guest_done and halts (on the exit stack).
  *
- * Returns 0 if the guest ran (and exited), or a negative error if VMLAUNCH
- * failed before entering the guest.
+ * spike_do_vmlaunch() busy-polls spike_guest_done — which is set on the exit
+ * stack, running on the same physical CPU, so the poll sees the write after
+ * the exit stack returns control (via the VMRESUME → VMexit → trampoline path).
+ *
+ * Wait — if spike_maybe_resume halts (HLT on the exit stack), and
+ * spike_do_vmlaunch is polling from the original stack on the SAME CPU,
+ * they cannot both run at the same time.  We need a different signalling
+ * mechanism.
+ *
+ * Correct design for single-CPU spike:
+ * After VMLAUNCH succeeds, the CPU is in guest mode.  The NEXT time we
+ * execute code on this CPU (on this call stack) is after spike_maybe_resume
+ * returns — but it cannot return due to the __noreturn constraint.
+ *
+ * Resolution: make spike_maybe_resume restore the original RSP/RIP using
+ * the longjmp approach, but avoid objtool's objections by:
+ * (a) using ANNOTATE_RETPOLINE_SAFE for the indirect jump, and
+ * (b) not having a bare retq in the trampoline (use ud2 instead, already done).
+ *
+ * This is the approach used here.
  */
 static noinline int spike_do_vmlaunch(struct spike_vcpu *vcpu)
 {
 	int ret = 0;
-	struct spike_host_ctx *ctx = this_cpu_ptr(&spike_saved_ctx);
 
 	/*
-	 * Save host context for longjmp-back.  We capture:
-	 *   RSP — current stack pointer (inside this frame)
-	 *   RBP — current frame pointer
-	 *   RIP — address of 'vmlaunch_returned' label below
+	 * Save host context so spike_maybe_resume() can restore it.
+	 * We capture:
+	 *   RSP — points to the saved RBP/return address on the stack
+	 *   RBP — frame pointer chain
+	 *   RIP — address of 'vmlaunch_done' label (after VMLAUNCH)
 	 *
-	 * After VMLAUNCH succeeds, the CPU is in guest mode.  On VM exit,
-	 * the trampoline calls spike_maybe_resume() which restores these
-	 * values and jumps to 'vmlaunch_returned'.
+	 * We need the label address BEFORE executing VMLAUNCH so we can
+	 * store it.  After VMLAUNCH succeeds the CPU is in guest mode and
+	 * only returns here via the trampoline + spike_maybe_resume().
 	 */
 	asm volatile(
 		"movq  %%rsp, %0\n\t"
 		"movq  %%rbp, %1\n\t"
-		"leaq  vmlaunch_returned(%%rip), %%rax\n\t"
+		"leaq  spike_vmlaunch_done(%%rip), %%rax\n\t"
 		"movq  %%rax, %2\n\t"
-		: "=m"(ctx->rsp), "=m"(ctx->rbp), "=m"(ctx->rip)
+		: "=m"(*this_cpu_ptr(&spike_saved_rsp)),
+		  "=m"(*this_cpu_ptr(&spike_saved_rbp)),
+		  "=m"(*this_cpu_ptr(&spike_saved_rip))
 		:
-		: "rax"
+		: "rax", "memory"
 	);
 
-	/* Update HOST_RSP to the dedicated exit stack top. */
+	/* Update HOST_RSP to exit stack top (recapture in case RSP changed). */
 	vmcs_write64(VMCS_HOST_RSP,
 		     vcpu->exit_stack_va + SPIKE_EXIT_STACK_SIZE);
 
@@ -607,26 +632,20 @@ static noinline int spike_do_vmlaunch(struct spike_vcpu *vcpu)
 	if (ret) {
 		pr_err("spike: VMLAUNCH failed ret=%d instr_err=%u\n",
 		       ret, vmcs_read32(VMCS_VM_INSTR_ERROR));
-		goto out;
 	}
 
 	/*
-	 * VMLAUNCH succeeded — we will NOT reach the next instruction
-	 * through a normal return.  Instead, on VM exit the trampoline
-	 * calls spike_maybe_resume() which jumps to 'vmlaunch_returned'.
-	 *
-	 * The label must be in the asm stream AFTER vmlaunch_safe() so
-	 * the saved RIP points to valid code.  We use a volatile asm with
-	 * no operands to anchor the label.
+	 * This label is the longjmp target.  spike_maybe_resume() restores
+	 * RSP + RBP then jumps here.  On a failed VMLAUNCH we fall through
+	 * here normally.  Either way, the guest is done.
 	 */
-	asm volatile("vmlaunch_returned:" ::: "memory");
+	asm volatile("spike_vmlaunch_done:" ::: "memory");
 
-out:
 	return ret;
 }
 
 /*
- * spike_run_guest() — orchestrate VMCS update and guest launch.
+ * spike_run_guest() — orchestrate VMCS setup and guest launch.
  * Called on CPU 0 via smp_call_function_single().
  */
 static void spike_run_guest(void *arg)
@@ -635,12 +654,11 @@ static void spike_run_guest(void *arg)
 	int ret;
 
 	ret = spike_do_vmlaunch(vcpu);
-	if (ret && vcpu->exit_count == 0) {
+	if (ret && vcpu->exit_count == 0)
 		pr_err("spike: guest never ran (VMLAUNCH failed)\n");
-	} else {
+	else
 		pr_info("spike: guest run complete after %d exits\n",
 			vcpu->exit_count);
-	}
 }
 
 /* -------------------------------------------------------------------------
@@ -661,7 +679,7 @@ static void spike_vmx_init_cpu(void *arg)
 	}
 
 	/* 2. Pre-check CR4.VMXE — if set, another VMX user is active */
-	if (read_cr4() & X86_CR4_VMXE) {
+	if (__read_cr4() & X86_CR4_VMXE) {
 		pr_warn("spike: CR4.VMXE already set — another VMX entity "
 			"may be active (kvm_intel loaded?)\n");
 	}
@@ -679,14 +697,14 @@ static void spike_vmx_init_cpu(void *arg)
 	*region = revision;
 
 	/* 6. Enable CR4.VMXE */
-	write_cr4(read_cr4() | X86_CR4_VMXE);
+	cr4_set_bits(X86_CR4_VMXE);
 
 	/* 7. VMXON */
 	ret = vmxon_safe(vcpu->vmxon_region_pa);
 	if (ret) {
 		pr_err("spike: VMXON failed ret=%d — CF or ZF was set\n",
 		       ret);
-		write_cr4(read_cr4() & ~X86_CR4_VMXE);
+		cr4_clear_bits(X86_CR4_VMXE);
 		return;
 	}
 	vcpu->vmx_active = true;
@@ -725,7 +743,7 @@ fail_vmcs:
 fail_vmptrld:
 fail_vmclear:
 	vmxoff();
-	write_cr4(read_cr4() & ~X86_CR4_VMXE);
+	cr4_clear_bits(X86_CR4_VMXE);
 	vcpu->vmx_active = false;
 }
 
@@ -742,7 +760,7 @@ static void spike_vmx_cleanup_cpu(void *arg)
 	}
 
 	vmxoff();
-	write_cr4(read_cr4() & ~X86_CR4_VMXE);
+	cr4_clear_bits(X86_CR4_VMXE);
 	vcpu->vmx_active = false;
 	pr_info("spike: VMXOFF executed on CPU %d\n", smp_processor_id());
 }

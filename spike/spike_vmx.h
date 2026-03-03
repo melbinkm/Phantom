@@ -115,7 +115,7 @@
 #define VMCS_HOST_DS_SEL                0x0c06
 #define VMCS_HOST_FS_SEL                0x0c08
 #define VMCS_HOST_GS_SEL                0x0c0a
-#define VMCS_HOST_TR_SEL                0x0c0e
+#define VMCS_HOST_TR_SEL                0x0c0c  /* SDM Vol.3C App.B: 0x00000c0c */
 
 /* Natural-width host state */
 #define VMCS_HOST_CR0                   0x6c00
@@ -202,20 +202,12 @@
 /* LDTR: unusable */
 #define GUEST_LDTR_AR_UNUSABLE          0x00010000
 
-/* -----------------------------------------------------------------------
- * MSRs
- * ----------------------------------------------------------------------- */
-
-#define MSR_IA32_VMX_BASIC              0x480
-#define MSR_IA32_VMX_PINBASED_CTLS      0x481
-#define MSR_IA32_VMX_PROCBASED_CTLS     0x482
-#define MSR_IA32_VMX_EXIT_CTLS          0x483
-#define MSR_IA32_VMX_ENTRY_CTLS         0x484
-#define MSR_IA32_VMX_TRUE_PINBASED_CTLS 0x48d
-#define MSR_IA32_VMX_TRUE_PROCBASED_CTLS 0x48e
-#define MSR_IA32_VMX_TRUE_EXIT_CTLS     0x48f
-#define MSR_IA32_VMX_TRUE_ENTRY_CTLS    0x490
-#define MSR_IA32_VMX_PROCBASED_CTLS2    0x48b
+/*
+ * MSR definitions — use the kernel's own definitions from asm/msr-index.h
+ * (included transitively via asm/msr.h).  We only define the ones that the
+ * kernel does NOT define.
+ */
+#include <asm/msr-index.h>
 
 /* EPTP memory type WB (6), page-walk length 4 (value 3 = 4-1) */
 #define EPTP_FLAGS_WB_4LEVEL            ((6ULL) | (3ULL << 3))

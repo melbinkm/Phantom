@@ -34,6 +34,8 @@
 #include <linux/vmalloc.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <asm/io.h>          /* virt_to_phys */
+#include <asm/page.h>        /* page_to_phys */
 
 #include "spike_ept.h"
 
