@@ -31,9 +31,14 @@ cross-compile for the server (kernel 6.8.0-generic). All steps go through SSH.
      - Missing tools: `ssh phantom-bench "apt install build-essential"`
    - If build succeeds: confirm `phantom.ko` was produced and note its size.
 
-3. **Determine deployment target** (check CLAUDE.md `CURRENT_PHASE`):
-   - **Phase 0–1:** Deploy into QEMU nested KVM guest via 9p share
-   - **Phase 2+:** Deploy directly on the server
+3. **Determine deployment target** (infer from in-progress GitHub issue title):
+   ```bash
+   TASK=$(gh issue list --repo melbinkm/Phantom --label in-progress --state open \
+     --json title --jq '.[0].title' | grep -oP 'Task \K[\d]+')
+   # TASK is the major number: 0 or 1 → guest; 2+ → server
+   ```
+   - **Task 0.x or 1.x (Phase 0–1):** Deploy into QEMU nested KVM guest via 9p share
+   - **Task 2.x or higher (Phase 2+):** Deploy directly on the server
 
 4. **Deploy — Phase 0–1 (QEMU guest):**
 

@@ -25,6 +25,14 @@ boundaries before advancing.
    ssh -o BatchMode=yes -o ConnectTimeout=5 phantom-bench "echo ok"  # SSH to server
    ```
    If any fail: STOP. Report which credential/connection is missing.
+
+   **Ensure GitHub labels exist** (idempotent — safe to re-run):
+   ```bash
+   for label in phase-0 phase-1a phase-1b phase-2 phase-3 phase-4 \
+                started in-progress blocked adjusted gate; do
+     gh label create "$label" --repo melbinkm/Phantom --force 2>/dev/null || true
+   done
+   ```
 2. **Confirm the phase exists** and matches `$ARGUMENTS`.
    Derive phase completion state from GitHub issues (not CLAUDE.md, which is gitignored):
    ```bash

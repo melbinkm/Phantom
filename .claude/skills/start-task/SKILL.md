@@ -19,7 +19,7 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`, `0.1`, `2.2`).
 2. **Read context:**
    - Read the full task file
    - Read the phase README for exit criteria and dependencies
-   - Check `CURRENT_PHASE` in CLAUDE.md
+   - Phase context is derived from the task number in `$ARGUMENTS` (not CLAUDE.md)
 
 2b. **Extract implementation steps:**
    - Identify the "What to Build" section in the task file

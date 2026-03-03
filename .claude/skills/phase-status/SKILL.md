@@ -30,9 +30,7 @@ user-invocable: true
    - **Performance gate (Phase 3 entry):** Check Task 1.8 issue comments for "<100μs for 500 pages" evidence
    - Gate labels: issues tagged `gate` represent blocking conditions
 
-4. **Read CURRENT_PHASE from CLAUDE.md**
-
-5. **Output status table:**
+4. **Output status table:**
 
 ```
 === PROJECT PHANTOM STATUS ===

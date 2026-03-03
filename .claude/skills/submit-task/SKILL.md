@@ -97,7 +97,7 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, check open GitHub i
      - Phase 3 exit: search task 3.2 issue for "1000/1000" determinism
    - Post `## Phase Gate Check` comment on this issue
    - If gate FAILS: STOP. Require manual intervention.
-   - If gate PASSES: update `CURRENT_PHASE` in CLAUDE.md
+   - If gate PASSES: phase state is recorded via closed GitHub issues — no file update needed.
 
 10. **Auto-chain to next task:**
     - Task order: 0.1→1.1→1.2→1.3→1.4→1.5→1.6→1.7→1.8→2.1→2.2→2.3→2.4→3.1→3.2→3.3→3.4→4.1→4.2→4.3
@@ -110,6 +110,6 @@ Parse `$ARGUMENTS` as a task number (e.g., `1.3`). If empty, check open GitHub i
 - Never commit if any test is failing
 - Never force-push to main
 - If the PR fails to create (no GitHub auth): commit and push, then provide the gh command for the user to run manually
-- After submission, update `CURRENT_PHASE` in CLAUDE.md if this task completes a phase
+- Phase state is derived from GitHub issue state (closed issues = complete) — no CLAUDE.md update needed
 - Auto-chaining respects phase gates — cannot skip to next phase if gate fails
 - Task ordering is strictly linear (matches "Depends On" in phase READMEs)
