@@ -36,6 +36,7 @@
 #define VMCS_SEC_PROC_BASED_CTLS        0x401e
 
 /* 64-bit control fields */
+#define VMCS_MSR_BITMAP                 0x2004
 #define VMCS_EPT_POINTER                0x201a
 
 /* -----------------------------------------------------------------------
@@ -157,7 +158,13 @@
 #define VMX_EXIT_EXT_INTERRUPT          1
 #define VMX_EXIT_TRIPLE_FAULT           2
 #define VMX_EXIT_CPUID                  10
+#define VMX_EXIT_HLT                    12
 #define VMX_EXIT_VMCALL                 18
+#define VMX_EXIT_CR_ACCESS              28  /* MOV to/from CR */
+#define VMX_EXIT_MOV_DR                 29  /* MOV to/from DR */
+#define VMX_EXIT_IO_INSTR               30  /* IN/OUT */
+#define VMX_EXIT_RDMSR                  31
+#define VMX_EXIT_WRMSR                  32
 #define VMX_EXIT_EPT_VIOLATION          48
 #define VMX_EXIT_EPT_MISCONFIG          49
 #define VMX_EXIT_PREEMPT_TIMER          52
@@ -172,6 +179,7 @@
 
 /* Primary processor-based controls */
 #define PRI_PROC_HLT_EXITING            (1U << 7)
+#define PRI_PROC_USE_MSR_BITMAPS        (1U << 28)
 #define PRI_PROC_ENABLE_SECONDARY       (1U << 31)
 
 /* Secondary processor-based controls */

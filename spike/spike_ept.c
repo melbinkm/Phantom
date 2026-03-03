@@ -114,129 +114,73 @@ int spike_ept_build(struct spike_ept *ept)
 	pd   = page_address(ept->pd_page);
 
 	/* ----------------------------------------------------------------
-	 * Map the 2MB code region (identity-map, large page).
+	 * Identity-map all of physical memory 0-512GB using 1GB pages.
 	 *
-	 * guest_code_start is a kernel virtual address.  The GPA we assign
-	 * to it is the same as its host physical address (identity mapping):
-	 *   GPA = HPA = virt_to_phys(guest_code_start)
+	 * The guest runs with the host's CR3, so the CPU needs to walk the
+	 * host's page tables (physical addresses 0-62GB on phantom-bench).
+	 * Rather than mapping individual regions, we map all 512 1GB slots
+	 * in a single PDPT covering GPA 0 to 512GB.
 	 *
-	 * The 2MB-aligned base of that physical address selects a single PD
-	 * entry covering the whole 2MB region containing the code.
+	 * PML4[0] → PDPT (covering GPA 0x0000_0000 to 0x7FFF_FFFF_FFFF)
+	 * PDPT[0..511] → 1GB large pages at GPA i*1GB (identity-mapped)
+	 *
+	 * The code GPA is in the kernel direct-map (above 0xffff_8000_0000_0000)
+	 * which maps to physical addresses 0-maxRAM.  PML4[0] covers the
+	 * physical range used by those page-table walks.
 	 * ---------------------------------------------------------------- */
-	code_virt  = (unsigned long)guest_code_start;
-	code_phys  = virt_to_phys((void *)code_virt);
-	guest_phys = code_phys & ~((u64)(2 * 1024 * 1024 - 1)); /* 2MB align */
+	{
+		unsigned int i;
+
+		for (i = 0; i < 512; i++) {
+			/*
+			 * 1GB PDPT entry: PS=1 (bit 7), RWX, WB memory type.
+			 * Physical address = i * 1GB.
+			 */
+			pdpt[i] = ((u64)i << 30) | EPT_ENTRY_RAM | (1ULL << 7);
+		}
+	}
+
+	/* PML4[0] → PDPT covering GPA 0 to 512GB */
+	pml4[0] = page_to_phys(ept->pdpt_page) | EPT_RWX;
 
 	/*
-	 * Store the identity base so the caller can use it as guest RIP.
-	 * The guest RIP must be the GPA, which equals the HPA here.
+	 * Store the code GPA (= HPA = virt_to_phys(guest_code_start)).
+	 * The code lives in the direct-map, so its GPA is its physical addr.
 	 */
-	ept->code_gpa = code_phys;    /* exact GPA for RIP */
-	ept->code_hpa = code_phys;    /* HPA is the same   */
+	code_virt  = (unsigned long)guest_code_start;
+	code_phys  = virt_to_phys((void *)code_virt);
+	guest_phys = code_phys;
 
-	/* Decompose the 2MB-aligned GPA into EPT walk indices. */
-	pml4_idx = (guest_phys >> 39) & 0x1ff;
-	pdpt_idx = (guest_phys >> 30) & 0x1ff;
-	pd_idx   = (guest_phys >> 21) & 0x1ff;
+	ept->code_gpa = code_phys;
+	ept->code_hpa = code_phys;
 
-	/* PML4[pml4_idx] → PDPT */
-	pml4[pml4_idx] = page_to_phys(ept->pdpt_page) | EPT_RWX;
+	/*
+	 * The PD page is pre-allocated but not wired into the EPT since the
+	 * 1GB PDPT entries cover all physical memory.  We keep the allocation
+	 * so spike_ept_destroy() frees it without any changes to that path.
+	 * Suppress unused-variable warnings for the index variables.
+	 */
+	pml4_idx = (guest_phys >> 39) & 0x1ff; (void)pml4_idx;
+	pdpt_idx = (guest_phys >> 30) & 0x1ff; (void)pdpt_idx;
+	pd_idx   = (guest_phys >> 21) & 0x1ff; (void)pd_idx;
 
-	/* PDPT[pdpt_idx] → PD */
-	pdpt[pdpt_idx] = page_to_phys(ept->pd_page) | EPT_RWX;
-
-	/* PD[pd_idx] → 2MB large page (identity) */
-	pd[pd_idx] = guest_phys | EPT_ENTRY_RAM | EPT_PD_LARGE;
-
-	/* ----------------------------------------------------------------
-	 * Map the 4KB guest stack page.
+	/*
+	 * Stack mapping: the 1GB identity PDPT already covers
+	 * GPA 0x1000000 (SPIKE_GUEST_STACK_GPA).  Guest RSP = GPA top of
+	 * the stack page, which maps to whatever physical frame is at that
+	 * address in host RAM.  We still allocate a stack_page so the struct
+	 * fields are non-NULL and destroy() can free them safely.
 	 *
-	 * SPIKE_GUEST_STACK_GPA is chosen so that it does NOT fall in the
-	 * same 2MB region as the code (to avoid aliasing the large-page PD
-	 * entry).  We use a separate EPT PT for this mapping.
-	 *
-	 * If SPIKE_GUEST_STACK_GPA falls within the same PML4/PDPT/PD as
-	 * the code region but in a different 2MB slot, we reuse the same
-	 * PDPT/PD pages (they were already wired in above).  However, the
-	 * stack GPA may need a different PDPT or PD entry — the code below
-	 * handles this generically.
-	 * ---------------------------------------------------------------- */
+	 * The stack_pt_page, stack_pdpt_page, stack_pd_page are not wired
+	 * into the EPT — the 1GB entries cover the stack GPA already.
+	 */
 	stack_phys = page_to_phys(ept->stack_page);
 	ept->stack_gpa = SPIKE_GUEST_STACK_GPA;
 	ept->stack_hpa = stack_phys;
 
-	{
-		u64  sgpa      = SPIKE_GUEST_STACK_GPA;
-		unsigned int s_pml4 = (sgpa >> 39) & 0x1ff;
-		unsigned int s_pdpt = (sgpa >> 30) & 0x1ff;
-		unsigned int s_pd   = (sgpa >> 21) & 0x1ff;
-		unsigned int s_pt   = (sgpa >> 12) & 0x1ff;
-		u64 *stack_pt = page_address(ept->stack_pt_page);
-		u64 *tgt_pdpt, *tgt_pd;
-
-		/*
-		 * The stack GPA lives in a different 1GB slot from the code
-		 * (SPIKE_GUEST_STACK_GPA = 0x1000000, code is typically in
-		 * the kernel's direct-map at ~0xffff...).  We therefore need
-		 * separate PDPT/PD allocations for the stack only if the walk
-		 * indices differ from those used by the code path.
-		 *
-		 * For simplicity, reuse the same pml4/pdpt/pd pages if the
-		 * indices match, otherwise allocate additional pages.
-		 *
-		 * In practice the stack GPA (16MB) and code GPA (kernel
-		 * direct-map > 0xffff800000000000) always have different
-		 * PML4 indices, so we allocate dedicated PDPT/PD for stack.
-		 */
-		if (s_pml4 != pml4_idx) {
-			/* Need a dedicated PDPT for the stack region. */
-			ept->stack_pdpt_page =
-				alloc_page(GFP_KERNEL | __GFP_ZERO);
-			if (!ept->stack_pdpt_page) {
-				ret = -ENOMEM;
-				goto err_stack_pdpt;
-			}
-			ept->stack_pd_page =
-				alloc_page(GFP_KERNEL | __GFP_ZERO);
-			if (!ept->stack_pd_page) {
-				ret = -ENOMEM;
-				goto err_stack_pd;
-			}
-			tgt_pdpt = page_address(ept->stack_pdpt_page);
-			tgt_pd   = page_address(ept->stack_pd_page);
-			pml4[s_pml4] = page_to_phys(ept->stack_pdpt_page)
-				       | EPT_RWX;
-			tgt_pdpt[s_pdpt] = page_to_phys(ept->stack_pd_page)
-					  | EPT_RWX;
-		} else if (s_pdpt != pdpt_idx) {
-			/*
-			 * Same PML4, different PDPT entry — reuse pml4/pdpt
-			 * pages, but allocate a new PD for the stack.
-			 */
-			ept->stack_pdpt_page = NULL;
-			ept->stack_pd_page =
-				alloc_page(GFP_KERNEL | __GFP_ZERO);
-			if (!ept->stack_pd_page) {
-				ret = -ENOMEM;
-				goto err_stack_pd_only;
-			}
-			tgt_pdpt = pdpt;
-			tgt_pd   = page_address(ept->stack_pd_page);
-			tgt_pdpt[s_pdpt] = page_to_phys(ept->stack_pd_page)
-					  | EPT_RWX;
-		} else {
-			/* Same PML4 and PDPT, different PD entry. */
-			ept->stack_pdpt_page = NULL;
-			ept->stack_pd_page   = NULL;
-			tgt_pd = pd;
-		}
-
-		/* tgt_pd[s_pd] → EPT PT for 4KB stack mapping */
-		tgt_pd[s_pd] = page_to_phys(ept->stack_pt_page) | EPT_RWX;
-
-		/* stack_pt[s_pt] → actual stack page (RW, no-execute) */
-		stack_pt[s_pt] = stack_phys | EPT_RWX | EPT_MEM_WB;
-	}
+	/* Null out optional pages that are not allocated in this path. */
+	ept->stack_pdpt_page = NULL;
+	ept->stack_pd_page   = NULL;
 
 	/*
 	 * Build the EPTP value:
@@ -255,28 +199,6 @@ int spike_ept_build(struct spike_ept *ept)
 	/* ----------------------------------------------------------------
 	 * Error-cleanup labels — reverse order of allocation.
 	 * ---------------------------------------------------------------- */
-err_stack_pd:
-	/*
-	 * stack_pd_page alloc failed after stack_pdpt_page succeeded.
-	 * Free stack_pdpt_page before falling through to common cleanup.
-	 */
-	if (ept->stack_pdpt_page) {
-		__free_page(ept->stack_pdpt_page);
-		ept->stack_pdpt_page = NULL;
-	}
-	goto err_common;
-
-err_stack_pdpt:
-	/* stack_pdpt_page alloc itself failed — nothing extra to free. */
-	goto err_common;
-
-err_stack_pd_only:
-	/* stack_pd_page alloc failed (no stack_pdpt_page was allocated). */
-	goto err_common;
-
-err_common:
-	__free_page(ept->stack_pt_page);
-	ept->stack_pt_page = NULL;
 err_stack_pt:
 	__free_page(ept->stack_page);
 	ept->stack_page = NULL;

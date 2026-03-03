@@ -85,6 +85,14 @@ struct spike_vcpu {
 	unsigned long exit_stack_va;
 	u64           exit_stack_top_pa; /* physical addr of last byte + 1 */
 
+	/*
+	 * MSR bitmap: 4KB page, all zeros = no MSR intercepts.
+	 * Enables "use MSR bitmaps" (bit 28 of primary proc-based ctls)
+	 * so that RDMSR/WRMSR do NOT cause VM exits unless we mark them.
+	 */
+	unsigned long msr_bitmap_va;
+	u64           msr_bitmap_pa;
+
 	/* EPT */
 	struct spike_ept ept;
 
@@ -252,12 +260,19 @@ static int spike_setup_vmcs(struct spike_vcpu *vcpu)
 
 	/* Pin-based: no NMI-exiting, no preemption timer — simplest config */
 	rdmsrl(MSR_IA32_VMX_TRUE_PINBASED_CTLS, cap_msr);
+	pr_info("spike: PINBASED_CTLS cap_msr=0x%llx\n", cap_msr);
 	pin_ctl = vmx_adjust_ctl(cap_msr, 0);
 	vmcs_write32(VMCS_PIN_BASED_CTLS, pin_ctl);
 
-	/* Primary proc-based: enable secondary controls (bit 31) */
+	/* Primary proc-based: enable secondary controls (bit 31) +
+	 * use MSR bitmaps (bit 28) so RDMSR/WRMSR don't exit by default. */
 	rdmsrl(MSR_IA32_VMX_TRUE_PROCBASED_CTLS, cap_msr);
-	proc1_ctl = vmx_adjust_ctl(cap_msr, PRI_PROC_ENABLE_SECONDARY);
+	pr_info("spike: PROCBASED_CTLS cap_msr=0x%llx (forced=0x%08x)\n",
+		cap_msr, (u32)cap_msr);
+	proc1_ctl = vmx_adjust_ctl(cap_msr,
+				   PRI_PROC_ENABLE_SECONDARY |
+				   PRI_PROC_USE_MSR_BITMAPS);
+	pr_info("spike: proc1_ctl=0x%08x\n", proc1_ctl);
 	vmcs_write32(VMCS_PRI_PROC_BASED_CTLS, proc1_ctl);
 
 	/* Secondary proc-based: enable EPT (VPID optional) */
@@ -283,10 +298,28 @@ static int spike_setup_vmcs(struct spike_vcpu *vcpu)
 	entry_ctl = vmx_adjust_ctl(cap_msr, VMENTRY_IA32E_MODE_GUEST);
 	vmcs_write32(VMCS_ENTRY_CTLS, entry_ctl);
 
-	/* Exception bitmap: 0 — don't intercept any exceptions */
-	vmcs_write32(VMCS_EXCEPTION_BITMAP, 0);
+	/*
+	 * Exception bitmap: intercept #PF (bit 14) so that the deliberate
+	 * unmapped access in guest_code generates a VM exit rather than
+	 * being delivered to the guest IDT (which would run the host's page
+	 * fault handler in guest context and cause a re-entrant fault loop).
+	 *
+	 * All other exceptions (0-13, 15-31) are NOT intercepted and are
+	 * delivered to the guest IDT as normal.
+	 *
+	 * Error-code mask/match set to 0/0 so ALL #PF exits are taken
+	 * regardless of the error code.
+	 */
+	vmcs_write32(VMCS_EXCEPTION_BITMAP, 1U << 14);
 	vmcs_write32(VMCS_PF_ERROR_CODE_MASK,  0);
 	vmcs_write32(VMCS_PF_ERROR_CODE_MATCH, 0);
+
+	/* -----------------------------------------------------------------
+	 * MSR bitmap: all zeros = no MSR interception.
+	 * Required when PRI_PROC_USE_MSR_BITMAPS is set in proc1_ctl.
+	 * The page was zeroed at allocation time (GFP_ZERO).
+	 * ----------------------------------------------------------------- */
+	vmcs_write64(VMCS_MSR_BITMAP, vcpu->msr_bitmap_pa);
 
 	/* -----------------------------------------------------------------
 	 * EPT pointer and VPID
@@ -304,8 +337,20 @@ static int spike_setup_vmcs(struct spike_vcpu *vcpu)
 	vmcs_write64(VMCS_GUEST_CR4, __read_cr4());
 	vmcs_write64(VMCS_GUEST_DR7, 0x400);   /* reset value */
 
-	/* Guest RIP = GPA of guest_code_start (identity-mapped) */
-	vmcs_write64(VMCS_GUEST_RIP,    vcpu->ept.code_gpa);
+	/*
+	 * Guest RIP = kernel virtual address of guest_code_start.
+	 *
+	 * The guest shares the host's CR3 + page tables, so virtual addresses
+	 * resolve normally through the host PT + EPT two-level walk:
+	 *   VA 0xffffffff_xxxxxxxx → (host PT) → GPA = HPA = phys(guest_code)
+	 *                         → (EPT 1GB identity map) → same HPA
+	 *
+	 * DO NOT use code_gpa (the physical address) here — that would start
+	 * the guest executing at a low virtual address (the raw physical frame
+	 * number), which is not mapped in the host's kernel page tables and
+	 * would immediately cause a guest page fault.
+	 */
+	vmcs_write64(VMCS_GUEST_RIP, (u64)(uintptr_t)guest_code_start);
 
 	/* Guest RSP = top of stack (stack grows down; GPA + size = top) */
 	vmcs_write64(VMCS_GUEST_RSP,
@@ -444,6 +489,23 @@ static int spike_setup_vmcs(struct spike_vcpu *vcpu)
  * ------------------------------------------------------------------------- */
 
 /*
+ * skip_emulated_instruction() — advance guest RIP past the current instruction.
+ *
+ * Used for exits caused by instructions the spike does not need to emulate
+ * (CPUID, MOV DR, RDMSR, WRMSR, CR accesses).  The CPU always stores the
+ * length of the exiting instruction in VMCS_EXIT_INSTR_LEN.
+ */
+static void skip_emulated_instruction(void)
+{
+	u64 rip;
+	u32 len;
+
+	rip = vmcs_read64(VMCS_GUEST_RIP);
+	len = vmcs_read32(VMCS_EXIT_INSTR_LEN);
+	vmcs_write64(VMCS_GUEST_RIP, rip + len);
+}
+
+/*
  * spike_vmexit_dispatch() — called from the trampoline on every VM exit.
  *
  * Reads VMCS_EXIT_REASON, dispatches to the appropriate handler, and sets
@@ -462,6 +524,34 @@ void spike_vmexit_dispatch(struct spike_vcpu *vcpu)
 	vcpu->exit_count++;
 
 	switch (reason) {
+	case VMX_EXIT_CPUID:
+		/*
+		 * CPUID is always intercepted in VMX non-root mode.  The
+		 * spike does not emulate it — just advance RIP and resume.
+		 * The guest will get stale/undefined values in RAX/RBX/RCX/RDX
+		 * since we don't save/restore GPRs, but that is fine: the spike
+		 * guest code does not use CPUID results.
+		 */
+		rip = vmcs_read64(VMCS_GUEST_RIP);
+		pr_info("spike: CPUID exit #%d at RIP=0x%llx — skipping\n",
+			vcpu->exit_count, rip);
+		skip_emulated_instruction();
+		vcpu->should_exit = false;
+		break;
+
+	case VMX_EXIT_HLT:
+		/*
+		 * Guest executed HLT.  This means the guest reached the HLT
+		 * safety loop at the end of guest_code — the deliberate EPT
+		 * violation access must have been mapped (not expected).
+		 * Abort cleanly.
+		 */
+		rip = vmcs_read64(VMCS_GUEST_RIP);
+		pr_info("spike: HLT exit #%d at RIP=0x%llx — guest done\n",
+			vcpu->exit_count, rip);
+		vcpu->should_exit = true;
+		break;
+
 	case VMX_EXIT_VMCALL:
 		/*
 		 * Guest executed VMCALL.  Log it and advance RIP past the
@@ -473,6 +563,61 @@ void spike_vmexit_dispatch(struct spike_vcpu *vcpu)
 			vcpu->exit_count, rip);
 		vmcs_write64(VMCS_GUEST_RIP, rip + 3);
 		vcpu->should_exit = false;  /* resume guest */
+		break;
+
+	case VMX_EXIT_CR_ACCESS:
+		/*
+		 * MOV to/from CR.  The nested KVM hypervisor may force CR
+		 * access exiting on in primary proc-based controls.  Skip the
+		 * instruction and resume; the guest CR value is not changed
+		 * (conservative but safe for the spike).
+		 */
+		rip = vmcs_read64(VMCS_GUEST_RIP);
+		pr_info("spike: CR access exit #%d at RIP=0x%llx qual=0x%llx"
+			" — skipping\n",
+			vcpu->exit_count, rip,
+			vmcs_read64(VMCS_EXIT_QUALIFICATION));
+		skip_emulated_instruction();
+		vcpu->should_exit = false;
+		break;
+
+	case VMX_EXIT_MOV_DR:
+		/*
+		 * MOV to/from debug register.  Nested KVM may force MOV-DR
+		 * exiting (bit 23 of primary proc-based controls).  Skip the
+		 * instruction and resume without emulating the register write.
+		 */
+		rip = vmcs_read64(VMCS_GUEST_RIP);
+		pr_info("spike: MOV DR exit #%d at RIP=0x%llx — skipping\n",
+			vcpu->exit_count, rip);
+		skip_emulated_instruction();
+		vcpu->should_exit = false;
+		break;
+
+	case VMX_EXIT_RDMSR:
+		/*
+		 * RDMSR.  The spike runs with MSR bitmaps not configured, so
+		 * all MSR reads exit.  Skip the instruction and leave RAX/RDX
+		 * undefined (the spike guest code does not read MSRs on purpose;
+		 * the CPU may issue implicit RDMSR before the first guest
+		 * instruction in some microarchitectures/nested setups).
+		 */
+		rip = vmcs_read64(VMCS_GUEST_RIP);
+		pr_info("spike: RDMSR exit #%d at RIP=0x%llx — skipping\n",
+			vcpu->exit_count, rip);
+		skip_emulated_instruction();
+		vcpu->should_exit = false;
+		break;
+
+	case VMX_EXIT_WRMSR:
+		/*
+		 * WRMSR — same rationale as RDMSR above.  Skip and resume.
+		 */
+		rip = vmcs_read64(VMCS_GUEST_RIP);
+		pr_info("spike: WRMSR exit #%d at RIP=0x%llx — skipping\n",
+			vcpu->exit_count, rip);
+		skip_emulated_instruction();
+		vcpu->should_exit = false;
 		break;
 
 	case VMX_EXIT_EPT_VIOLATION:
@@ -489,6 +634,36 @@ void spike_vmexit_dispatch(struct spike_vcpu *vcpu)
 		vcpu->should_exit = true;  /* abort guest */
 		break;
 
+	case VMX_EXIT_EXCEPTION_NMI:
+		/*
+		 * An exception was intercepted via EXCEPTION_BITMAP.  We only
+		 * set bit 14 (#PF), so this should always be a page fault.
+		 *
+		 * The deliberate unmapped access in guest_code ("movq (%rax)"
+		 * with rax=0xdead000) causes a #PF because the host's CR3
+		 * does not map that user-space VA.  Rather than let the host's
+		 * fault handler run inside the guest (which loops), we intercept
+		 * it here and abort cleanly.
+		 *
+		 * Exit qualification holds the faulting linear address.
+		 * EXIT_INTR_INFO bits[7:0] = vector (should be 14 = #PF).
+		 */
+		{
+			u32 intr_info = vmcs_read32(VMCS_EXIT_INTR_INFO);
+			u64 fault_va  = vmcs_read64(VMCS_EXIT_QUALIFICATION);
+			u32 vector    = intr_info & 0xff;
+
+			rip = vmcs_read64(VMCS_GUEST_RIP);
+			pr_info("spike: guest exception #%u at RIP=0x%llx "
+				"fault_VA=0x%llx (exit #%d) — %s\n",
+				vector, rip, fault_va, vcpu->exit_count,
+				vector == 14 ? "#PF — deliberate unmapped "
+					       "access confirmed" :
+					       "unexpected exception");
+			vcpu->should_exit = true;
+		}
+		break;
+
 	case VMX_EXIT_TRIPLE_FAULT:
 		pr_err("spike: guest triple-fault — aborting\n");
 		vcpu->should_exit = true;
@@ -500,8 +675,11 @@ void spike_vmexit_dispatch(struct spike_vcpu *vcpu)
 		break;
 
 	default:
-		pr_info("spike: unexpected exit reason %u — aborting guest\n",
-			reason);
+		rip = vmcs_read64(VMCS_GUEST_RIP);
+		pr_info("spike: unexpected exit reason %u at RIP=0x%llx "
+			"qual=0x%llx — aborting guest\n",
+			reason, rip,
+			vmcs_read64(VMCS_EXIT_QUALIFICATION));
 		vcpu->should_exit = true;
 		break;
 	}
@@ -624,8 +802,10 @@ static noinline int spike_do_vmlaunch(struct spike_vcpu *vcpu)
 	vmcs_write64(VMCS_HOST_RSP,
 		     vcpu->exit_stack_va + SPIKE_EXIT_STACK_SIZE);
 
-	pr_info("spike: VMLAUNCH: guest RIP=0x%llx guest RSP=0x%llx\n",
-		vcpu->ept.code_gpa,
+	pr_info("spike: VMLAUNCH: guest RIP=0x%llx (VA) / HPA=0x%llx "
+		"guest RSP=0x%llx\n",
+		(u64)(uintptr_t)guest_code_start,
+		vcpu->ept.code_hpa,
 		vcpu->ept.stack_gpa + SPIKE_GUEST_STACK_SIZE);
 
 	ret = vmlaunch_safe();
@@ -805,6 +985,19 @@ static int __init spike_init(void)
 		goto err_exit_stack;
 	}
 
+	/*
+	 * Allocate MSR bitmap: 4KB, all zeros (no MSR intercepts).
+	 * When "use MSR bitmaps" is set in proc1_ctl, a zero bitmap means
+	 * RDMSR/WRMSR instructions in the guest do NOT cause VM exits,
+	 * preventing soft-lockup from MSR-heavy page-fault handler code.
+	 */
+	g_vcpu->msr_bitmap_va = __get_free_page(GFP_KERNEL | __GFP_ZERO);
+	if (!g_vcpu->msr_bitmap_va) {
+		ret = -ENOMEM;
+		goto err_msr_bitmap;
+	}
+	g_vcpu->msr_bitmap_pa = virt_to_phys((void *)g_vcpu->msr_bitmap_va);
+
 	/* Build EPT */
 	memset(&g_vcpu->ept, 0, sizeof(g_vcpu->ept));
 	ret = spike_ept_build(&g_vcpu->ept);
@@ -855,6 +1048,8 @@ static int __init spike_init(void)
 err_smp:
 err_ept:
 	spike_ept_destroy(&g_vcpu->ept);
+	free_page(g_vcpu->msr_bitmap_va);
+err_msr_bitmap:
 	free_page(g_vcpu->exit_stack_va);
 err_exit_stack:
 	free_page(g_vcpu->vmcs_region_va);
@@ -879,6 +1074,7 @@ static void __exit spike_exit(void)
 
 	/* Free all resources */
 	spike_ept_destroy(&g_vcpu->ept);
+	free_page(g_vcpu->msr_bitmap_va);
 	free_page(g_vcpu->exit_stack_va);
 	free_page(g_vcpu->vmcs_region_va);
 	free_page(g_vcpu->vmxon_region_va);
