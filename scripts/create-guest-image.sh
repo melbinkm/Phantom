@@ -87,17 +87,36 @@ echo "PermitRootLogin yes" >> "$ROOTFS_DIR/etc/ssh/sshd_config"
 cat > "$ROOTFS_DIR/etc/fstab" <<'EOF'
 # <file system>    <mount point>   <type>  <options>               <dump>  <pass>
 LABEL=phantom-root /               ext4    errors=remount-ro       0       1
-phantom_share      /mnt/phantom    9p      trans=virtio,version=9p2000.L,rw,_netdev   0   0
+phantom_share      /mnt/phantom    9p      trans=virtio,version=9p2000.L,rw,nofail   0   0
 EOF
 
 # Create 9p mount point
 mkdir -p "$ROOTFS_DIR/mnt/phantom"
 
+# Copy host kernel modules into guest.
+# The guest uses the host kernel (-kernel /boot/vmlinuz-$(uname -r)) but the
+# debootstrap Debian rootfs has no /lib/modules. Without these, modprobe fails
+# and the 9p virtfs mount cannot load its drivers at boot.
+echo "    Copying host kernel modules (~150MB, required for 9p/virtio)..."
+KVER=$(uname -r)
+mkdir -p "$ROOTFS_DIR/lib/modules"
+cp -a "/lib/modules/$KVER" "$ROOTFS_DIR/lib/modules/"
+chroot "$ROOTFS_DIR" depmod -a "$KVER"
+
+# Install SSH public key for passwordless access from the host
+if [[ -f /root/.ssh/id_rsa.pub ]]; then
+    mkdir -p "$ROOTFS_DIR/root/.ssh"
+    chmod 700 "$ROOTFS_DIR/root/.ssh"
+    cat /root/.ssh/id_rsa.pub >> "$ROOTFS_DIR/root/.ssh/authorized_keys"
+    chmod 600 "$ROOTFS_DIR/root/.ssh/authorized_keys"
+    echo "    SSH pubkey installed (passwordless access from host)"
+fi
+
 # Auto-load 9p modules at boot (needed before fstab mount)
-cat > "$ROOTFS_DIR/etc/modules-load.d/9p.conf" <<'EOF'
-9p
-9pnet
+cat > "$ROOTFS_DIR/etc/modules-load.d/phantom.conf" <<'EOF'
 9pnet_virtio
+9p
+kvm_intel
 EOF
 
 # Convenience script: load and test phantom.ko from shared mount

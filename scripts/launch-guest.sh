@@ -95,18 +95,21 @@ QEMU_BG_PID=$!
 echo "==> Guest launched (background PID: $QEMU_BG_PID)"
 echo "    Waiting for guest SSH to come up (up to 60s)..."
 
-for i in $(seq 1 60); do
+for i in $(seq 1 90); do
     sleep 1
-    if ssh -p 2222 \
+    # Use nc TCP check first (no auth needed); fall back to key-based SSH
+    if nc -z localhost 2222 2>/dev/null && \
+       ssh -p 2222 \
            -o StrictHostKeyChecking=no \
            -o ConnectTimeout=2 \
            -o BatchMode=yes \
+           -o PasswordAuthentication=no \
            root@localhost "echo ready" 2>/dev/null | grep -q ready; then
         echo ""
         echo "==> Guest is ready!"
         echo ""
         echo "Connect:  ssh -p 2222 -o StrictHostKeyChecking=no root@localhost"
-        echo "          (password: phantom)"
+        echo "          (key auth; password: phantom)"
         echo ""
         echo "From dev machine (WSL2):"
         echo "  ssh phantom-bench \"ssh -p 2222 root@localhost 'bash /root/load-phantom.sh'\""
