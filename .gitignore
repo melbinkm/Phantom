@@ -1,4 +1,5 @@
 .secret/
+CLAUDE.md
 *.o
 *.ko
 *.mod
