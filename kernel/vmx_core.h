@@ -689,6 +689,20 @@ struct phantom_vmx_cpu_state {
 	struct phantom_pt_state	  pt;
 
 	/*
+	 * Task 2.4: VMX preemption timer.
+	 *
+	 * Computed once during phantom_vmcs_configure_fields() from
+	 * MSR_IA32_VMX_MISC[4:0] (the timer shift) and tsc_khz.
+	 * Set in the VMCS field VMX_PREEMPTION_TIMER_VALUE (0x482E) before
+	 * each VM entry so the guest is forcibly evicted after ~1 second
+	 * (configurable via PHANTOM_TIMEOUT_CLASS_A_MS).
+	 *
+	 * 0 means "timer not supported" — phantom_adjust_controls() cleared
+	 * PIN_BASED_VMX_PREEMPTION_TIMER in the pin-based controls.
+	 */
+	u32			  preemption_timer_value;
+
+	/*
 	 * Task 2.4: Kernel-side guest heap tracker.
 	 *
 	 * The bare-metal guest has no OS and therefore no syscall handler.

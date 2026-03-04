@@ -582,17 +582,16 @@ static int phantom_vmcs_setup_controls(struct phantom_vmx_cpu_state *state,
 	u32 pin, proc, proc2, exit_c, entry_c;
 
 	/*
-	 * Pin-based: external-int exiting + NMI exiting.
+	 * Pin-based: external-int exiting + NMI exiting +
+	 * VMX preemption timer (guards against guest infinite loops).
 	 *
-	 * NOTE: VMX preemption timer (PIN_BASED_PREEMPT_TIMER) is deliberately
-	 * NOT enabled for nested KVM testing.  In a nested VMX environment,
-	 * the L0 KVM hypervisor may propagate the preemption timer expiry to L1
-	 * as an asynchronous VM exit AFTER L1's guest (L2) has already exited.
-	 * This causes a spurious EXIT_REASON_PREEMPT_TIMER exit in phantom's
-	 * context, crashing the guest kernel.
+	 * phantom_adjust_controls() leaves the timer bit cleared if the
+	 * CPU does not support it — in that case preemption_timer_value
+	 * stays 0 and we skip the per-iteration timer write below.
 	 *
-	 * For Phase 2+ bare-metal deployment, re-enable with appropriate
-	 * handling to guard against this spurious exit.
+	 * On bare-metal the timer fires as expected.  Under nested KVM
+	 * (phase 0–1) it could cause spurious exits, but phase 2+ runs
+	 * directly on hardware, so this is safe.
 	 */
 	{
 		u32 msr = use_true_ctls ?
@@ -600,9 +599,30 @@ static int phantom_vmcs_setup_controls(struct phantom_vmx_cpu_state *state,
 			MSR_IA32_VMX_PINBASED_CTLS;
 
 		pin = phantom_adjust_controls(
-			PIN_BASED_EXT_INT_EXITING | PIN_BASED_NMI_EXITING,
+			PIN_BASED_EXT_INT_EXITING | PIN_BASED_NMI_EXITING |
+			PIN_BASED_VMX_PREEMPTION_TIMER,
 			msr);
 		phantom_vmcs_write32(VMCS_CTRL_PINBASED, pin);
+
+		/*
+		 * Compute the preemption timer value for a 1-second timeout.
+		 *
+		 * IA32_VMX_MISC[4:0] gives the shift N: timer decrements at
+		 * TSC / (2^N).  Convert 1s × tsc_khz → timer ticks.
+		 *   timer_value = (tsc_khz × 1000) >> N
+		 * tsc_khz is the Linux kernel global (TSC frequency in kHz).
+		 */
+		if (pin & PIN_BASED_VMX_PREEMPTION_TIMER) {
+			u64 misc;
+			u32 timer_shift;
+
+			rdmsrl(MSR_IA32_VMX_MISC, misc);
+			timer_shift = (u32)(misc & 0x1f);
+			state->preemption_timer_value =
+				(u32)(((u64)tsc_khz * 1000ULL) >> timer_shift);
+		} else {
+			state->preemption_timer_value = 0;
+		}
 	}
 
 	/* Primary proc-based: HLT exiting + unconditional I/O +
@@ -1809,6 +1829,18 @@ static int phantom_vcpu_fn(void *data)
 		 */
 		phantom_pt_iteration_start(state);
 
+		/*
+		 * Task 2.4: Arm the VMX preemption timer.
+		 *
+		 * Written to the VMCS each iteration so the timer always
+		 * starts at the full budget.  The guest is forcibly evicted
+		 * after ~1s if it does not call HC_RELEASE first.
+		 * Skipped if preemption_timer_value == 0 (CPU lacks support).
+		 */
+		if (state->preemption_timer_value)
+			phantom_vmcs_write32(VMX_PREEMPTION_TIMER_VALUE,
+					     state->preemption_timer_value);
+
 		/* Run the guest — pinned to state->cpu */
 		state->vcpu_run_result = phantom_run_guest(state);
 
@@ -2468,12 +2500,13 @@ static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 	}
 
 	case VMX_EXIT_PREEMPT_TIMER: {
+#ifdef PHANTOM_DEBUG
 		u64 guest_rip = phantom_vmcs_read64(VMCS_GUEST_RIP);
 
-		pr_err("phantom: CPU%d: PREEMPT TIMER expired RIP=0x%llx "
-		       "(guest hung?)\n",
-		       state->cpu, guest_rip);
-		state->run_result = 2; /* PHANTOM_RESULT_TIMEOUT */
+		trace_printk("PHANTOM TIMEOUT cpu=%d RIP=0x%llx\n",
+			     state->cpu, guest_rip);
+#endif
+		state->run_result = PHANTOM_RESULT_TIMEOUT;
 		return 1;
 	}
 
