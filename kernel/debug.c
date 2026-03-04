@@ -572,6 +572,9 @@ int phantom_debug_dump_ept(struct phantom_vmx_cpu_state *state)
  * Emits one trace_printk line per dirty entry:
  *   "DIRTY_ENTRY gpa=0x%llx orig=0x%llx priv=0x%llx iter=%u"
  *
+ * Also emits dirty overflow count if non-zero:
+ *   "DIRTY_OVERFLOW count=N"
+ *
  * Output goes to /sys/kernel/debug/tracing/trace.
  *
  * Returns 0 on success, -EINVAL if dirty_list is NULL.
@@ -586,10 +589,10 @@ int phantom_debug_dump_dirty_list(struct phantom_vmx_cpu_state *state)
 	}
 
 	pr_info("phantom: CPU%d: dirty list dump: last=%u current=%u/%u "
-		"(iteration %u)\n",
+		"(iteration %u, overflows=%u)\n",
 		state->cpu, state->last_dirty_count,
 		state->dirty_count, state->dirty_max,
-		state->cow_iteration);
+		state->cow_iteration, state->dirty_overflow_count);
 
 	/*
 	 * After a run completes, phantom_cow_abort_iteration() resets
@@ -610,6 +613,31 @@ int phantom_debug_dump_dirty_list(struct phantom_vmx_cpu_state *state)
 	trace_printk("DIRTY_LIST_END last_count=%u current=%u max=%u iter=%u\n",
 		     state->last_dirty_count, state->dirty_count,
 		     state->dirty_max, state->cow_iteration);
+
+	if (state->dirty_overflow_count > 0)
+		trace_printk("DIRTY_OVERFLOW count=%u\n",
+			     state->dirty_overflow_count);
+
+	return 0;
+}
+
+/**
+ * phantom_debug_dump_dirty_overflow - Emit dirty list overflow count.
+ * @state: Per-CPU VMX state.
+ *
+ * Emits: "DIRTY_OVERFLOW count=N" via trace_printk.
+ * Returns 0 always.
+ */
+int phantom_debug_dump_dirty_overflow(struct phantom_vmx_cpu_state *state)
+{
+	if (!state)
+		return 0;
+
+	trace_printk("DIRTY_OVERFLOW count=%u\n",
+		     state->dirty_overflow_count);
+
+	pr_info("phantom: CPU%d: dirty_overflow_count=%u\n",
+		state->cpu, state->dirty_overflow_count);
 	return 0;
 }
 

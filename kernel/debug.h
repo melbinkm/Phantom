@@ -124,10 +124,21 @@ int phantom_debug_dump_ept(struct phantom_vmx_cpu_state *state);
  *
  * Emits each dirty entry via trace_printk:
  *   "DIRTY_ENTRY gpa=0x%llx orig=0x%llx priv=0x%llx iter=%u"
+ * Also emits dirty overflow count if non-zero:
+ *   "DIRTY_OVERFLOW count=N"
  *
  * Output goes to /sys/kernel/debug/tracing/trace.
  * Returns 0 on success, -EINVAL if dirty_list not allocated.
  */
 int phantom_debug_dump_dirty_list(struct phantom_vmx_cpu_state *state);
+
+/**
+ * phantom_debug_dump_dirty_overflow - Emit dirty list overflow count.
+ * @state: Per-CPU VMX state.
+ *
+ * Emits one trace_printk line: "DIRTY_OVERFLOW count=N"
+ * Returns 0 always (even if overflow count is zero).
+ */
+int phantom_debug_dump_dirty_overflow(struct phantom_vmx_cpu_state *state);
 
 #endif /* PHANTOM_DEBUG_H */

@@ -8,6 +8,10 @@
  *
  * Non-leaf EPT entries (PML4, PDPT, PD→PT) MUST have RWX bits set.
  * Leaf entries are either all-zero (absent) or have at least R bit set.
+ *
+ * Task 1.5: Mixed 2MB+4KB EPT layout:
+ *   First 8MB  (GPA 0x000000–0x7FFFFF): 4 × 2MB large-page PD entries
+ *   Second 8MB (GPA 0x800000–0xFFFFFF): 4KB pages (4 PT pages × 512 entries)
  */
 #ifndef PHANTOM_EPT_H
 #define PHANTOM_EPT_H
@@ -39,13 +43,16 @@
 #define EPT_PERM_RWX		(EPT_PTE_READ | EPT_PTE_WRITE | EPT_PTE_EXEC)
 
 /* ------------------------------------------------------------------
- * Guest RAM layout for task 1.3
+ * Guest RAM layout for task 1.5 (mixed 2MB + 4KB EPT)
  *
  * 16MB flat RAM: GPA 0x00000000–0x00FFFFFF
  *   1 PML4 entry (index 0)
  *   1 PDPT entry (index 0)
  *   1 PD    (8 entries, indices 0–7 → 8 × 2MB = 16MB)
- *   8 PT    pages (512 entries each → 8 × 512 × 4KB = 16MB)
+ *
+ *   First 8MB (PD entries 0–3): 2MB large pages (PS=1, no PT needed)
+ *   Second 8MB (PD entries 4–7): 4KB pages (4 PT pages × 512 entries)
+ *
  *   4096 backing RAM pages (16MB total)
  *
  * GPA 0x01000000 and above → absent (no EPT entry).
@@ -56,9 +63,26 @@
 #define PHANTOM_EPT_RAM_END		\
 	(PHANTOM_EPT_RAM_BASE + (PHANTOM_EPT_RAM_SIZE_MB << 20))
 
-/* Number of PT pages needed: 16MB / 2MB_per_PD_entry = 8 */
+/* Total PD entries covering RAM (8 × 2MB = 16MB) */
 #define PHANTOM_EPT_NR_PD_ENTRIES	8
-#define PHANTOM_EPT_NR_PT_PAGES		PHANTOM_EPT_NR_PD_ENTRIES
+
+/*
+ * Task 1.5 mixed layout:
+ *   2MB region: PD entries 0–3 (GPA 0x000000–0x7FFFFF), no PT needed
+ *   4KB region: PD entries 4–7 (GPA 0x800000–0xFFFFFF), 4 PT pages
+ */
+#define PHANTOM_EPT_NR_2MB_ENTRIES	4	/* large-page PD entries */
+#define PHANTOM_EPT_NR_PT_PAGES		4	/* 4KB-level PT pages    */
+/* First PD index using 4KB pages (second half) */
+#define PHANTOM_EPT_4KB_PD_START	PHANTOM_EPT_NR_2MB_ENTRIES
+
+/* Size of the 2MB-mapped region in bytes */
+#define PHANTOM_EPT_2MB_REGION_SIZE	\
+	((u64)PHANTOM_EPT_NR_2MB_ENTRIES << 21)
+
+/* Number of 4KB pages in the 2MB-mapped region */
+#define PHANTOM_EPT_2MB_REGION_PAGES	\
+	(PHANTOM_EPT_NR_2MB_ENTRIES * 512U)
 
 /* Guest page layout (GPAs that must be backed by specific pages) */
 #define GUEST_CODE_GPA			0x00010000ULL
@@ -110,12 +134,16 @@ struct phantom_gpa_region {
  * Allocated by phantom_ept_alloc(), populated by phantom_ept_build(),
  * freed by phantom_ept_teardown().
  *
- * Layout of page arrays:
+ * Task 1.5 mixed layout:
  *   pml4:          1 page  (EPT PML4)
  *   pdpt:          1 page  (EPT PDPT)
  *   pd:            1 page  (EPT PD, 8 active entries)
- *   pt[0..7]:      8 pages (EPT PT pages, one per 2MB range)
+ *   pt[0..3]:      4 pages (EPT PT pages for PD entries 4–7, 4KB region)
+ *                          (pt[0..3] correspond to PD entries 4–7)
  *   ram_pages:     heap pointer → PHANTOM_EPT_RAM_PAGES page pointers
+ *
+ * PD entries 0–3 map via 2MB large pages (PS=1, no PT page needed).
+ * PD entries 4–7 map via PT pages pt[0..3] at 4KB granularity.
  *
  * ram_pages is heap-allocated (kvmalloc) because embedding 4096 pointers
  * directly in the struct would exceed the kernel percpu data size limit
@@ -128,11 +156,39 @@ struct phantom_ept_state {
 	struct page		*pml4;
 	struct page		*pdpt;
 	struct page		*pd;
+	/*
+	 * pt[0..PHANTOM_EPT_NR_PT_PAGES-1]: PT pages for 4KB region only.
+	 * pt[i] corresponds to PD entry (PHANTOM_EPT_4KB_PD_START + i).
+	 */
 	struct page		*pt[PHANTOM_EPT_NR_PT_PAGES];
+
+	/*
+	 * ram_2mb_blocks[]: order-9 (2MB = 512 × 4KB) physically contiguous
+	 * page blocks for the 2MB large-page region (first 8MB).
+	 *
+	 * ram_2mb_blocks[i] is the first struct page of the i-th 2MB block.
+	 * Each block covers 512 consecutive 4KB pages.
+	 * HPA of block i = page_to_phys(ram_2mb_blocks[i]).
+	 *
+	 * Stored separately so phantom_ept_teardown() can free them with
+	 * __free_pages(block, 9) rather than 512 × __free_page().
+	 *
+	 * ram_pages[0..PHANTOM_EPT_2MB_REGION_PAGES-1] are derived from
+	 * these blocks (each page in the block is individually tracked).
+	 */
+	struct page		*ram_2mb_blocks[PHANTOM_EPT_NR_2MB_ENTRIES];
 
 	/*
 	 * Backing RAM pages: heap-allocated array of PHANTOM_EPT_RAM_PAGES
 	 * struct page pointers.  Index = GPA >> PAGE_SHIFT.
+	 *
+	 * For the 2MB region (indices 0..PHANTOM_EPT_2MB_REGION_PAGES-1):
+	 *   ram_pages[i] = nth_page(ram_2mb_blocks[i/512], i % 512)
+	 *   These are sub-pages of order-9 blocks — do NOT free individually.
+	 *
+	 * For the 4KB region (indices PHANTOM_EPT_2MB_REGION_PAGES..4095):
+	 *   ram_pages[i] = individually allocated pages — free with __free_page.
+	 *
 	 * Allocated by kvmalloc_array in phantom_ept_alloc().
 	 * Freed in phantom_ept_teardown().
 	 */
@@ -163,7 +219,8 @@ const struct phantom_gpa_region *phantom_ept_classify_gpa(u64 gpa);
  * @ept: EPT state to populate.
  * @cpu: Physical CPU index (for NUMA-local allocation).
  *
- * Allocates: 1 PML4 + 1 PDPT + 1 PD + 8 PT pages +
+ * Allocates: 1 PML4 + 1 PDPT + 1 PD +
+ *            PHANTOM_EPT_NR_PT_PAGES PT pages (for 4KB region) +
  *            4096 backing RAM pages.
  *
  * MUST be called from process context (GFP_KERNEL OK).
@@ -216,17 +273,45 @@ struct page *phantom_ept_get_ram_page(struct phantom_ept_state *ept,
  * phantom_ept_mark_all_ro - Mark all RAM EPT leaf PTEs read-only.
  * @ept: EPT state (must have been built by phantom_ept_build).
  *
- * Walks all 4096 PT entries for the 16MB RAM region and clears the
- * EPT_PTE_WRITE bit from each present leaf PTE, leaving READ+EXEC+WB.
+ * For the 4KB region: walks all PT entries and clears EPT_PTE_WRITE.
+ * For the 2MB region: walks all 2MB large-page PD entries and clears
+ * EPT_PTE_WRITE (checking PS bit to identify large-page entries).
  *
  * This simulates the snapshot moment: after this call, any guest write
  * to a RAM GPA triggers an EPT violation (exit reason 48) which is
  * handled by phantom_cow_fault() to create a private copy.
  *
  * Called from vmx_core.c after phantom_ept_build() and before the
- * first VMLAUNCH.  Must be called from process context (uses
- * page_address() — valid for any mapped kernel page).
+ * first VMLAUNCH.  Must be called from process context.
  */
 void phantom_ept_mark_all_ro(struct phantom_ept_state *ept);
+
+/**
+ * phantom_ept_get_pd_entry - Walk PML4→PDPT→PD and return PD entry pointer.
+ * @ept: EPT state.
+ * @gpa: Guest physical address (any GPA within the 16MB RAM range).
+ *
+ * Returns a pointer to the PD entry for the 2MB region containing @gpa,
+ * or NULL if the GPA is not covered by the EPT structure.
+ *
+ * Hot-path safe: no allocation, no sleeping.
+ * The returned pointer is directly writeable (used by split logic).
+ */
+u64 *phantom_ept_get_pd_entry(struct phantom_ept_state *ept, u64 gpa);
+
+/**
+ * phantom_invept_single_context - Issue single-context INVEPT for @eptp.
+ * @eptp: EPTP value identifying the EPT context to invalidate.
+ *
+ * Required after 2MB→4KB structural splits (stale 2MB translations may
+ * exist for non-faulting GPAs in the same 2MB range).
+ *
+ * NOT required after 4KB RO→RW CoW faults (the EPT violation itself
+ * invalidated the faulting GPA's cached translation — Intel SDM §28.3.3.1).
+ *
+ * Uses trace_printk (under PHANTOM_DEBUG) to log INVEPT events.
+ * Reports via pr_err if INVEPT returns CF=1 (hardware error).
+ */
+void phantom_invept_single_context(u64 eptp);
 
 #endif /* PHANTOM_EPT_H */

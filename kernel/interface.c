@@ -400,6 +400,145 @@ static const u8 phantom_mmio_cow_guest_bin[] = {
 	0xEB, 0xFD,
 };
 
+/* ------------------------------------------------------------------
+ * Guest binary 6 (test_id=5): 2MB split + CoW test
+ *
+ * Writes to GPA 0x100000 (within first 2MB region at GPA 0x000000–0x1FFFFF).
+ * This triggers:
+ *   1. EPT violation on 2MB large-page PD entry (PS=1)
+ *   2. phantom_split_2mb_page(): allocate PT, populate 512 × 4KB RO PTEs,
+ *      replace PDE, INVEPT
+ *   3. phantom_cow_4kb_page(): CoW-promote faulting 4KB page
+ *   4. VMRESUME: guest writes succeed, VMCALL(1, 1) called
+ *
+ * Expected result:
+ *   - exit_reason = 18 (VMCALL)
+ *   - run_result_data = 1 (count of pages written)
+ *   - 1 dirty list entry (exactly one CoW fault)
+ *   - INVEPT logged in trace (PHANTOM_DEBUG builds)
+ *   - split_list.count = 1 after run
+ *
+ * Assembly: write one u64 to GPA 0x100000, then VMCALL(1, 1)
+ * ------------------------------------------------------------------ */
+static const u8 phantom_2mb_split_guest_bin[] = {
+	/* mov $0x100000, %rbx — GPA within first 2MB region */
+	0x48, 0xBB,
+	0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+	/* mov $0xCAFEBABE, %rax */
+	0x48, 0xB8, 0xBE, 0xBA, 0xFE, 0xCA, 0x00, 0x00, 0x00, 0x00,
+	/* mov %rax, (%rbx) — write to 2MB region → split + CoW */
+	0x48, 0x89, 0x03,
+	/* mov $1, %rbx — result: 1 page written */
+	0x48, 0xC7, 0xC3, 0x01, 0x00, 0x00, 0x00,
+	/* mov $1, %rax — VMCALL nr=1 (SUBMIT_RESULT) */
+	0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,
+	/* vmcall */
+	0x0F, 0x01, 0xC1,
+	/* hlt */
+	0xF4,
+	/* jmp .halt (offset = -2) */
+	0xEB, 0xFD,
+};
+
+/* ------------------------------------------------------------------
+ * Guest binary 7 (test_id=6): mixed 2MB + 4KB CoW workload
+ *
+ * Writes to 10 pages spanning both regions:
+ *   - 5 pages in 2MB region: GPA 0x100000, 0x200000, 0x300000, 0x400000, 0x500000
+ *     (all within first 8MB, each in a different 2MB region)
+ *   - 5 pages in 4KB region: GPA 0x800000, 0x801000, 0x802000, 0x803000, 0x804000
+ *
+ * Assembly strategy: write one u64 to each GPA, then VMCALL(1, 10).
+ *
+ * Expected results:
+ *   - exit_reason = 18 (VMCALL)
+ *   - run_result_data = 10
+ *   - dirty_count = 10 (5 from 2MB splits + 5 from 4KB region)
+ *   - split_list.count = up to 4 (at most 4 × 2MB regions, one per region)
+ *   - No host panic
+ *
+ * Note: each 2MB split generates exactly one split entry (the first write
+ * to that 2MB region triggers the split; subsequent writes to the same
+ * region hit the 4KB PTEs and just CoW-promote).  We write to 5 different
+ * 2MB regions (0x000000, 0x200000, 0x400000, 0x600000 via 0x500000 is in
+ * 0x400000–0x5FFFFF, so we adjust to 0x600000 for region 3).
+ *
+ * Writes:
+ *   GPA 0x100000 → 2MB region 0 (0x000000–0x1FFFFF) → split + CoW
+ *   GPA 0x200000 → 2MB region 1 (0x200000–0x3FFFFF) → split + CoW
+ *   GPA 0x400000 → 2MB region 2 (0x400000–0x5FFFFF) → split + CoW
+ *   GPA 0x600000 → 2MB region 3 (0x600000–0x7FFFFF) → split + CoW
+ *   GPA 0x110000 → 2MB region 0 (already split) → just 4KB CoW
+ *   GPA 0x800000 → 4KB region (PD entry 4) → direct 4KB CoW
+ *   GPA 0x801000 → 4KB region → direct 4KB CoW
+ *   GPA 0x802000 → 4KB region → direct 4KB CoW
+ *   GPA 0x803000 → 4KB region → direct 4KB CoW
+ *   GPA 0x804000 → 4KB region → direct 4KB CoW
+ *
+ * Total: 9 dirty entries (4 splits + 1 re-use + 5 direct 4KB = 10), 4 splits
+ *
+ * Wait, the re-use (0x110000 in already-split region 0) produces 1 CoW
+ * (no split needed — PT already exists).  Total = 10 dirty entries.
+ * ------------------------------------------------------------------ */
+static const u8 phantom_mixed_cow_guest_bin[] = {
+	/*
+	 * Write to 10 GPAs covering both 2MB and 4KB regions.
+	 * Each write: mov $GPA, %rbx; mov $val, %rax; mov %rax, (%rbx)
+	 *
+	 * Pattern: mov $IMM64, %rbx  (10 bytes)
+	 *          mov $IMM32, %rax  (7 bytes)
+	 *          mov %rax, (%rbx)  (3 bytes)
+	 *   = 20 bytes per write × 10 = 200 bytes
+	 * Then: VMCALL sequence
+	 */
+	/* Write 1: GPA 0x100000 (2MB region 0) */
+	0x48, 0xBB, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,
+	0x48, 0x89, 0x03,
+	/* Write 2: GPA 0x200000 (2MB region 1) */
+	0x48, 0xBB, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00,
+	0x48, 0x89, 0x03,
+	/* Write 3: GPA 0x400000 (2MB region 2) */
+	0x48, 0xBB, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00,
+	0x48, 0x89, 0x03,
+	/* Write 4: GPA 0x600000 (2MB region 3) */
+	0x48, 0xBB, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x48, 0xC7, 0xC0, 0x04, 0x00, 0x00, 0x00,
+	0x48, 0x89, 0x03,
+	/* Write 5: GPA 0x110000 (2MB region 0, already split) */
+	0x48, 0xBB, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x48, 0xC7, 0xC0, 0x05, 0x00, 0x00, 0x00,
+	0x48, 0x89, 0x03,
+	/* Write 6: GPA 0x800000 (4KB region) */
+	0x48, 0xBB, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x48, 0xC7, 0xC0, 0x06, 0x00, 0x00, 0x00,
+	0x48, 0x89, 0x03,
+	/* Write 7: GPA 0x801000 (4KB region) — LE: 00 10 80 00 00 00 00 00 */
+	0x48, 0xBB, 0x00, 0x10, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x48, 0xC7, 0xC0, 0x07, 0x00, 0x00, 0x00,
+	0x48, 0x89, 0x03,
+	/* Write 8: GPA 0x802000 (4KB region) — LE: 00 20 80 00 00 00 00 00 */
+	0x48, 0xBB, 0x00, 0x20, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x48, 0xC7, 0xC0, 0x08, 0x00, 0x00, 0x00,
+	0x48, 0x89, 0x03,
+	/* Write 9: GPA 0x803000 (4KB region) — LE: 00 30 80 00 00 00 00 00 */
+	0x48, 0xBB, 0x00, 0x30, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x48, 0xC7, 0xC0, 0x09, 0x00, 0x00, 0x00,
+	0x48, 0x89, 0x03,
+	/* Write 10: GPA 0x804000 (4KB region) — LE: 00 40 80 00 00 00 00 00 */
+	0x48, 0xBB, 0x00, 0x40, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x48, 0xC7, 0xC0, 0x0A, 0x00, 0x00, 0x00,
+	0x48, 0x89, 0x03,
+	/* VMCALL(1, 10): mov $10, %rbx; mov $1, %rax; vmcall */
+	0x48, 0xC7, 0xC3, 0x0A, 0x00, 0x00, 0x00,
+	0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,
+	0x0F, 0x01, 0xC1,
+	/* hlt; jmp .halt */
+	0xF4, 0xEB, 0xFD,
+};
+
 /*
  * Task 1.2 backward-compat: original trivial guest binary (test_id=0
  * before task 1.3 introduced the rw_guest_bin).  Kept for reference.
@@ -485,9 +624,11 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 *   2 = CoW write test (20 pages at GPA 0x30000–0x43000)
 		 *   3 = pool exhaustion test (5-page pool, 10-page write)
 		 *   4 = MMIO CoW rejection test (write to LAPIC MMIO GPA)
+		 *   5 = 2MB split + CoW test (write to GPA 0x100000)
+		 *   6 = mixed 2MB + 4KB workload (10 writes, both regions)
 		 */
 		test_id = args.reserved;
-		if (test_id > 4) {
+		if (test_id > 6) {
 			pr_err("phantom: RUN_GUEST: invalid test_id=%u\n",
 			       test_id);
 			ret = -EINVAL;
@@ -545,6 +686,8 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 * test_id=2: CoW write test (20 pages)
 		 * test_id=3: pool exhaustion test (5-page pool, 10-write)
 		 * test_id=4: MMIO CoW rejection test
+		 * test_id=5: 2MB split + CoW (write to GPA 0x100000)
+		 * test_id=6: mixed 2MB + 4KB workload (10 writes)
 		 */
 		if (test_id == 0) {
 			memcpy(page_address(state->guest_code_page),
@@ -632,11 +775,28 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 					memset(page_address(pg), 0, PAGE_SIZE);
 				}
 			}
-		} else {
+		} else if (test_id == 4) {
 			/* test_id=4: MMIO CoW rejection test */
 			memcpy(page_address(state->guest_code_page),
 			       phantom_mmio_cow_guest_bin,
 			       sizeof(phantom_mmio_cow_guest_bin));
+		} else if (test_id == 5) {
+			/*
+			 * test_id=5: 2MB split + CoW test.
+			 * Guest writes to GPA 0x100000 — triggers 2MB split.
+			 * No pre-zeroing needed (only one word written).
+			 */
+			memcpy(page_address(state->guest_code_page),
+			       phantom_2mb_split_guest_bin,
+			       sizeof(phantom_2mb_split_guest_bin));
+		} else {
+			/*
+			 * test_id=6: mixed 2MB + 4KB workload.
+			 * Guest writes 10 words across both regions.
+			 */
+			memcpy(page_address(state->guest_code_page),
+			       phantom_mixed_cow_guest_bin,
+			       sizeof(phantom_mixed_cow_guest_bin));
 		}
 
 		/* Save test_id for the vCPU thread */
@@ -800,6 +960,28 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		}
 
 		ret = phantom_debug_dump_dirty_list(state);
+		break;
+	}
+
+	case PHANTOM_IOCTL_DEBUG_DUMP_DIRTY_OVERFLOW: {
+		int target_cpu = -1;
+		struct phantom_vmx_cpu_state *state;
+		int cpu;
+
+		for_each_cpu(cpu, pdev->vmx_cpumask) {
+			target_cpu = cpu;
+			break;
+		}
+
+		if (target_cpu < 0) {
+			pr_err("phantom: DEBUG_DUMP_DIRTY_OVERFLOW: "
+			       "no VMX CPU\n");
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+		ret = phantom_debug_dump_dirty_overflow(state);
 		break;
 	}
 

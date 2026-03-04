@@ -1,21 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * ept_cow.h — CoW page pool, dirty list, and fault handler declarations
+ * ept_cow.h — CoW page pool, dirty list, split list, and fault handler
  *
  * The CoW engine supports snapshot-based fuzzing iterations:
  *   1. At snapshot time, all RAM EPT entries are marked read-only.
- *   2. When the guest writes to a page, an EPT violation (exit 48) fires.
- *   3. phantom_cow_fault() allocates a private page, copies the original,
+ *   2. When the guest writes to a 4KB page, an EPT violation (exit 48) fires.
+ *      phantom_cow_fault() allocates a private page, copies the original,
  *      updates the EPT PTE to RW, and records the entry in the dirty list.
+ *   3. When the guest writes to a 2MB large-page, EPT violation fires.
+ *      phantom_cow_fault() detects PS=1 in PD entry and calls
+ *      phantom_split_2mb_page() which splits into 512 × 4KB RO entries,
+ *      issues INVEPT (required for structural change), then CoW-promotes
+ *      the faulting 4KB page to RW.
  *   4. At end-of-iteration, phantom_cow_abort_iteration() resets all dirty
- *      PTEs to the original HPA (RO), returns pages to pool, issues INVEPT.
+ *      PTEs to the original HPA (RO), returns pages to pool, frees split-list
+ *      PT pages, and issues one batched INVEPT (single-context).
  *
  * INVEPT rules (Intel SDM §28.3.3.1):
  *   - 4KB RO→RW CoW fault:          NO INVEPT (EPT violation invalidated GPA)
+ *   - 2MB→4KB structural split:     YES, single-context INVEPT required
  *   - snapshot restore (abort_iter): YES, one batched INVEPT (single-context)
  *
  * Hot-path discipline: phantom_cow_fault() MUST NOT call printk, kmalloc,
  * schedule(), or mutex_lock().  All resources are pre-allocated at pool init.
+ * The split PT page uses GFP_ATOMIC (VM exit context — no NUMA node info).
  */
 #ifndef PHANTOM_EPT_COW_H
 #define PHANTOM_EPT_COW_H
@@ -58,6 +66,30 @@ struct phantom_cow_pool {
  * 4096 pages = 16MB — covers ~50-page dirty sets with large headroom.
  */
 #define PHANTOM_COW_POOL_DEFAULT_CAPACITY	4096U
+
+/* ------------------------------------------------------------------
+ * Split list: tracks 2MB→4KB splits performed during an iteration.
+ *
+ * When phantom_split_2mb_page() splits a 2MB PD entry, it allocates
+ * a new 4KB-level PT page.  The split list records these allocations
+ * so phantom_cow_abort_iteration() can free them at iteration end.
+ *
+ * Maximum splits: 64 (more than enough for 16MB guest with 4 × 2MB regions
+ * when each region might be split multiple times across iterations — though
+ * in practice each 2MB region is split at most once per lifetime).
+ * ------------------------------------------------------------------ */
+
+struct phantom_split_entry {
+	u64		 gpa_2mb;	/* 2MB-aligned GPA base of split region */
+	struct page	*pt_page;	/* new 4KB-level PT page allocated      */
+};
+
+#define PHANTOM_SPLIT_LIST_MAX	64
+
+struct phantom_split_list {
+	struct phantom_split_entry entries[PHANTOM_SPLIT_LIST_MAX];
+	u32			   count;
+};
 
 /* ------------------------------------------------------------------
  * Forward declarations
@@ -133,11 +165,25 @@ int phantom_cow_fault(struct phantom_vmx_cpu_state *state, u64 gpa);
  * For each dirty list entry:
  *   - Reset EPT PTE to orig_hpa | READ | EXEC | WB (write-protected).
  *   - Return private page to pool.
- * Then: dirty_count = 0, issue one batched INVEPT (single-context).
+ * Restore 2MB large-page PD entries for any split regions by freeing
+ * the split-list PT pages.
+ * Then: dirty_count = 0, split_list.count = 0, issue one batched
+ * INVEPT (single-context).
  *
  * Called at end of each fuzzing iteration.  NOT a hot-path (called once
  * per iteration, not per fault).  May use pr_err for error reporting.
  */
 void phantom_cow_abort_iteration(struct phantom_vmx_cpu_state *state);
+
+/**
+ * phantom_split_list_free - Free all PT pages in the split list.
+ * @sl: Split list to free.
+ *
+ * Frees each split PT page and resets count to 0.
+ * Called from phantom_vmcs_teardown() to avoid leaking pages on unload.
+ * Also called indirectly from phantom_cow_abort_iteration() which
+ * restores the 2MB PD entries and frees the split PT pages.
+ */
+void phantom_split_list_free(struct phantom_split_list *sl);
 
 #endif /* PHANTOM_EPT_COW_H */
