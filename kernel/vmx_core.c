@@ -1035,6 +1035,29 @@ int phantom_vmcs_setup(struct phantom_vmx_cpu_state *state)
 	phantom_ept_mark_all_ro(&state->ept);
 
 	/*
+	 * Task 2.4: Null guard page — GPA 0x000–0xFFF → EPT absent.
+	 *
+	 * Any guest access to GPA 0x0 (NULL pointer dereference, both
+	 * read and write) triggers an EPT violation with "GPA not readable"
+	 * qualification.  The exit handler detects this as a non-CoW fault
+	 * and sets PHANTOM_RESULT_CRASH, aborting the iteration.
+	 *
+	 * Without the guard, GPA 0x0 would be a mapped RO page; reads to
+	 * NULL would silently succeed (returning garbage from the snapshot
+	 * page) and writes would be CoW'd without crashing.
+	 *
+	 * Failure to install the guard (e.g., -ENOMEM) is non-fatal:
+	 * log a warning and continue without null-pointer crash detection.
+	 */
+	{
+		int ng_ret = phantom_ept_install_null_guard(&state->ept);
+
+		if (ng_ret && ng_ret != -EINVAL)
+			pr_warn("phantom: CPU%d: null guard install failed: %d\n",
+				state->cpu, ng_ret);
+	}
+
+	/*
 	 * Task 1.4: Initialise CoW page pool.
 	 *
 	 * Default capacity: PHANTOM_COW_POOL_DEFAULT_CAPACITY pages.

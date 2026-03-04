@@ -454,6 +454,80 @@ u64 phantom_ept_build(struct phantom_ept_state *ept)
 EXPORT_SYMBOL_GPL(phantom_ept_build);
 
 /* ------------------------------------------------------------------
+ * phantom_ept_install_null_guard - GPA 0x000–0xFFF absent (crash on access)
+ *
+ * Splits PD[0] (first 2MB large page) into 512 × 4KB PTEs.
+ * PT[0] = 0 (no R/W/X → absent).  Any access to GPA 0x0–0xFFF causes
+ * EPT violation with "GPA not readable" qualification → PHANTOM_RESULT_CRASH.
+ *
+ * PT[1..511] map sub-pages of ram_2mb_blocks[0] read-only (CoW-compatible).
+ * ------------------------------------------------------------------ */
+
+/**
+ * phantom_ept_install_null_guard - Mark GPA 0x000–0xFFF as EPT absent.
+ * @ept: EPT state (must have been built by phantom_ept_build).
+ *
+ * Returns 0 on success, -ENOMEM if PT page allocation fails.
+ */
+int phantom_ept_install_null_guard(struct phantom_ept_state *ept)
+{
+	u64 *pd;
+	u64 *pt;
+	struct page *pt_page;
+	int i;
+
+	if (!ept || !ept->ready || !ept->ram_2mb_blocks[0])
+		return -EINVAL;
+
+	if (ept->null_guard_pt)
+		return 0; /* already installed */
+
+	pd = (u64 *)page_address(ept->pd);
+
+	/* PD[0] must still be a 2MB large page */
+	if (!(pd[0] & EPT_PTE_PS)) {
+		pr_warn("phantom: null_guard: PD[0] already split\n");
+		return -EINVAL;
+	}
+
+	/* Allocate a new PT page (zeroed) */
+	pt_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+	if (!pt_page)
+		return -ENOMEM;
+
+	pt = (u64 *)page_address(pt_page);
+
+	/*
+	 * Fill PT[0..511]:
+	 *   PT[0]     = 0  → absent (null guard — crashes on any access)
+	 *   PT[1..511] = RO mappings of sub-pages of the first 2MB block
+	 *
+	 * Use READ | EXEC (no WRITE) for CoW compatibility:
+	 *   - phantom_ept_mark_all_ro() does NOT walk this PT (it only walks
+	 *     ept->pt[] for the 4KB region and PD[] for 2MB entries)
+	 *   - These entries are already RO, so CoW write faults will be
+	 *     handled correctly by phantom_cow_4kb_page() via PT lookup.
+	 */
+	pt[0] = 0; /* null guard: absent */
+	for (i = 1; i < 512; i++) {
+		u64 hpa = page_to_phys(nth_page(ept->ram_2mb_blocks[0], i));
+
+		pt[i] = hpa | EPT_PTE_READ | EPT_PTE_EXEC | EPT_PTE_MEMTYPE_WB;
+		/* No EPT_PTE_WRITE: CoW write faults will promote via 4KB path */
+	}
+
+	/* Replace PD[0] with a non-leaf pointer to the new PT page */
+	pd[0] = page_to_phys(pt_page) | EPT_PERM_RWX;
+	/* PS bit must be clear for a non-leaf PD entry */
+
+	ept->null_guard_pt = pt_page;
+
+	pr_info("phantom: null guard page installed (GPA 0x000-0xFFF → absent)\n");
+	return 0;
+}
+EXPORT_SYMBOL_GPL(phantom_ept_install_null_guard);
+
+/* ------------------------------------------------------------------
  * phantom_ept_teardown - Free all EPT + RAM pages
  * ------------------------------------------------------------------ */
 
@@ -516,6 +590,12 @@ void phantom_ept_teardown(struct phantom_ept_state *ept)
 			__free_page(ept->pt[i]);
 			ept->pt[i] = NULL;
 		}
+	}
+
+	/* Free the null guard PT page (if installed) */
+	if (ept->null_guard_pt) {
+		__free_page(ept->null_guard_pt);
+		ept->null_guard_pt = NULL;
 	}
 
 	if (ept->pd) {

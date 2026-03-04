@@ -194,6 +194,19 @@ struct phantom_ept_state {
 	 */
 	struct page		**ram_pages;
 
+	/*
+	 * null_guard_pt: PT page used to install the null-guard mapping.
+	 *
+	 * phantom_ept_install_null_guard() splits PD[0] (the 2MB large page
+	 * covering GPAs 0x000000–0x1FFFFF) into 512 × 4KB PTEs and marks
+	 * PT[0] = 0 (absent) so any access to GPA 0x000–0xFFF triggers an
+	 * EPT violation → PHANTOM_RESULT_CRASH.
+	 *
+	 * NULL until phantom_ept_install_null_guard() is called.
+	 * Freed by phantom_ept_teardown().
+	 */
+	struct page		*null_guard_pt;
+
 	/* Computed EPTP value (set by phantom_ept_build) */
 	u64			 eptp;
 
@@ -285,6 +298,26 @@ struct page *phantom_ept_get_ram_page(struct phantom_ept_state *ept,
  * first VMLAUNCH.  Must be called from process context.
  */
 void phantom_ept_mark_all_ro(struct phantom_ept_state *ept);
+
+/**
+ * phantom_ept_install_null_guard - Mark GPA 0x000–0xFFF as EPT absent.
+ * @ept: EPT state (must have been built by phantom_ept_build).
+ *
+ * Splits PD[0] (the first 2MB large-page entry) into 512 × 4KB PTEs
+ * via a newly allocated PT page.  PT[0] is set to 0 (absent — no R/W/X
+ * bits) so any access to GPA 0x000–0xFFF causes an EPT violation with
+ * "GPA not readable" qualification.  The vmx_core.c EPT violation handler
+ * detects this as a non-CoW fault and sets PHANTOM_RESULT_CRASH.
+ *
+ * PT[1..511] map their corresponding 4KB sub-pages of ram_2mb_blocks[0]
+ * as read-only (WRITE cleared so CoW still works for these pages).
+ *
+ * MUST be called after phantom_ept_build() and before the first VMLAUNCH,
+ * from process context (GFP_KERNEL allowed).
+ *
+ * Returns 0 on success, -ENOMEM if PT page allocation fails.
+ */
+int phantom_ept_install_null_guard(struct phantom_ept_state *ept);
 
 /**
  * phantom_ept_get_pd_entry - Walk PML4→PDPT→PD and return PD entry pointer.
