@@ -12,7 +12,7 @@
 #
 # Steps:
 #   1. Verify kvm_intel is unloaded (or unload it)
-#   2. Load phantom.ko with cores=0,...,N-1
+#   2. Load phantom.ko with phantom_cores=0,...,N-1
 #   3. Run kafl-bridge --cores 0,...,N-1 for --duration seconds
 #   4. Print aggregate exec/sec and per-core stats
 #   5. rmmod phantom
@@ -120,11 +120,11 @@ echo "[phantom-multi] kvm_intel not loaded: OK"
 # ---------------------------------------------------------------------------
 # 2. Load phantom.ko with all requested cores activated
 # ---------------------------------------------------------------------------
-echo "[phantom-multi] Loading phantom.ko (cores=$CORE_PARAM)..."
+echo "[phantom-multi] Loading phantom.ko (phantom_cores=$CORE_PARAM)..."
 if lsmod 2>/dev/null | grep -q "^phantom "; then
     rmmod phantom || true
 fi
-insmod "$MODULE_PATH" "cores=$CORE_PARAM" || {
+insmod "$MODULE_PATH" "phantom_cores=$CORE_PARAM" || {
     echo "ERROR: insmod phantom.ko failed" >&2
     exit 1
 }

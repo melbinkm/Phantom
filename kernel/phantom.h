@@ -100,6 +100,18 @@ struct phantom_dev {
 extern struct phantom_dev phantom_global_dev;
 
 /* ------------------------------------------------------------------
+ * Per-file-descriptor context
+ *
+ * Allocated in phantom_open(), freed in phantom_release().
+ * Tracks which CPU this fd was bound to via PHANTOM_CREATE_VM.
+ * bound_cpu == -1 means no VM has been created on this fd yet.
+ * ------------------------------------------------------------------ */
+struct phantom_file {
+	struct phantom_dev	*pdev;
+	int			 bound_cpu;  /* -1 = unbound */
+};
+
+/* ------------------------------------------------------------------
  * Module init/cleanup helpers (called from phantom_main.c)
  * ------------------------------------------------------------------ */
 

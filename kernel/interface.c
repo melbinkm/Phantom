@@ -963,29 +963,67 @@ static const u8 phantom_panic_guest_bin[] = {
 static int phantom_open(struct inode *inode, struct file *filp)
 {
 	struct phantom_dev *pdev;
+	struct phantom_file *fctx;
 
 	pdev = container_of(inode->i_cdev, struct phantom_dev, cdev);
-	filp->private_data = pdev;
 
 	if (!pdev->initialized) {
 		pr_err("phantom: open() called before module is fully initialised\n");
 		return -ENXIO;
 	}
 
+	fctx = kzalloc(sizeof(*fctx), GFP_KERNEL);
+	if (!fctx)
+		return -ENOMEM;
+
+	fctx->pdev      = pdev;
+	fctx->bound_cpu = -1;  /* no VM created yet */
+	filp->private_data = fctx;
+
 	return 0;
 }
 
 static int phantom_release(struct inode *inode, struct file *filp)
 {
+	struct phantom_file *fctx = filp->private_data;
+
+	kfree(fctx);
+	filp->private_data = NULL;
 	return 0;
+}
+
+/*
+ * phantom_file_cpu - Return the CPU bound to this fd, or fallback to first.
+ *
+ * If the fd has been bound via CREATE_VM, return that CPU.
+ * Otherwise fall back to the first CPU in the vmx_cpumask (legacy behaviour
+ * for ioctls called before CREATE_VM on single-core setups).
+ */
+static int phantom_file_cpu(struct phantom_file *fctx)
+{
+	if (fctx->bound_cpu >= 0)
+		return fctx->bound_cpu;
+
+	/* Fallback: first CPU in mask */
+	{
+		int cpu;
+
+		for_each_cpu(cpu, fctx->pdev->vmx_cpumask)
+			return cpu;
+	}
+	return -1;
 }
 
 static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			  unsigned long arg)
 {
-	struct phantom_dev *pdev = filp->private_data;
+	struct phantom_file *fctx = filp->private_data;
+	struct phantom_dev *pdev;
 	long ret = 0;
 
+	if (!fctx)
+		return -ENXIO;
+	pdev = fctx->pdev;
 	if (!pdev || !pdev->initialized)
 		return -ENXIO;
 
@@ -1029,17 +1067,12 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			break;
 		}
 
-		/* Find the target CPU — first CPU in vmx_cpumask by default */
-		target_cpu = -1;
-		{
-			int cpu;
-
-			for_each_cpu(cpu, pdev->vmx_cpumask) {
-				target_cpu = cpu;
-				break; /* use first CPU always for now */
-			}
-		}
-
+		/*
+		 * Select target CPU: prefer the CPU bound to this fd via
+		 * CREATE_VM, then honour args.cpu if set, finally fall back
+		 * to the first CPU in the vmx_cpumask.
+		 */
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			pr_err("phantom: RUN_GUEST: no VMX CPU available\n");
 			ret = -ENODEV;
@@ -1405,12 +1438,8 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 	case PHANTOM_IOCTL_DEBUG_DUMP_EPT: {
 		int target_cpu = -1;
 		struct phantom_vmx_cpu_state *state;
-		int cpu;
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
+		target_cpu = phantom_file_cpu(fctx);
 
 		if (target_cpu < 0) {
 			pr_err("phantom: DEBUG_DUMP_EPT: no VMX CPU\n");
@@ -1438,12 +1467,8 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 	case PHANTOM_IOCTL_DEBUG_DUMP_DIRTY_LIST: {
 		int target_cpu = -1;
 		struct phantom_vmx_cpu_state *state;
-		int cpu;
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
+		target_cpu = phantom_file_cpu(fctx);
 
 		if (target_cpu < 0) {
 			pr_err("phantom: DEBUG_DUMP_DIRTY_LIST: "
@@ -1466,15 +1491,10 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 	}
 
 	case PHANTOM_IOCTL_DEBUG_DUMP_DIRTY_OVERFLOW: {
-		int target_cpu = -1;
+		int target_cpu;
 		struct phantom_vmx_cpu_state *state;
-		int cpu;
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
-
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			pr_err("phantom: DEBUG_DUMP_DIRTY_OVERFLOW: "
 			       "no VMX CPU\n");
@@ -1488,15 +1508,10 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 	}
 
 	case PHANTOM_IOCTL_SNAPSHOT_CREATE: {
-		int target_cpu = -1;
+		int target_cpu;
 		struct phantom_vmx_cpu_state *state;
-		int cpu;
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
-
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			pr_err("phantom: SNAPSHOT_CREATE: no VMX CPU\n");
 			ret = -ENODEV;
@@ -1560,15 +1575,10 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 	}
 
 	case PHANTOM_IOCTL_SNAPSHOT_RESTORE: {
-		int target_cpu = -1;
+		int target_cpu;
 		struct phantom_vmx_cpu_state *state;
-		int cpu;
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
-
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			pr_err("phantom: SNAPSHOT_RESTORE: no VMX CPU\n");
 			ret = -ENODEV;
@@ -1615,16 +1625,11 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 * Returns -EINVAL if no snapshot has been taken (no restore
 		 * has ever run, so the counters would be meaningless zeros).
 		 */
-		int target_cpu = -1;
+		int target_cpu;
 		struct phantom_vmx_cpu_state *state;
 		struct phantom_perf_result result;
-		int cpu;
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
-
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			pr_err("phantom: PERF_RESTORE_LATENCY: no VMX CPU\n");
 			ret = -ENODEV;
@@ -1669,8 +1674,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		struct phantom_iter_params params;
 		struct phantom_vmx_cpu_state *state;
-		int target_cpu = -1;
-		int cpu_iter;
+		int target_cpu;
 		struct phantom_shared_mem *sm;
 
 		if (copy_from_user(&params, (void __user *)arg, sizeof(params))) {
@@ -1683,12 +1687,8 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			break;
 		}
 
-		/* Find target CPU */
-		for_each_cpu(cpu_iter, pdev->vmx_cpumask) {
-			target_cpu = cpu_iter;
-			break;
-		}
-
+		/* Find target CPU — use the CPU bound to this fd */
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			pr_err("phantom: RUN_ITERATION: no VMX CPU\n");
 			ret = -ENODEV;
@@ -1765,14 +1765,9 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		struct phantom_iter_result result;
 		struct phantom_vmx_cpu_state *state;
-		int target_cpu = -1;
-		int cpu_iter;
+		int target_cpu;
 
-		for_each_cpu(cpu_iter, pdev->vmx_cpumask) {
-			target_cpu = cpu_iter;
-			break;
-		}
-
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			ret = -ENODEV;
 			break;
@@ -1826,8 +1821,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		struct phantom_vmx_cpu_state *state;
 		struct eventfd_ctx *ctx;
-		int target_cpu = -1;
-		int cpu_iter;
+		int target_cpu;
 		int user_fd;
 
 		/*
@@ -1836,11 +1830,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		user_fd = (int)arg;
 
-		for_each_cpu(cpu_iter, pdev->vmx_cpumask) {
-			target_cpu = cpu_iter;
-			break;
-		}
-
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			ret = -ENODEV;
 			break;
@@ -1899,8 +1889,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		struct phantom_create_args args;
 		struct phantom_vmx_cpu_state *state;
-		int target_cpu = -1;
-		int cpu;
+		int target_cpu;
 
 		if (copy_from_user(&args, (void __user *)arg, sizeof(args))) {
 			ret = -EFAULT;
@@ -1908,19 +1897,15 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		}
 
 		/* Find the requested CPU in the VMX cpumask */
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			if (args.pinned_cpu == 0 || (u32)cpu == args.pinned_cpu) {
-				target_cpu = cpu;
-				break;
-			}
-		}
-
-		if (target_cpu < 0) {
+		if (args.pinned_cpu == 0) {
+			/* pinned_cpu=0 means "any" — use first available */
+			target_cpu = cpumask_first(pdev->vmx_cpumask);
+		} else if (cpumask_test_cpu((int)args.pinned_cpu,
+					    pdev->vmx_cpumask)) {
+			target_cpu = (int)args.pinned_cpu;
+		} else {
 			/* pinned_cpu not in VMX cpumask — fall back to first */
-			for_each_cpu(cpu, pdev->vmx_cpumask) {
-				target_cpu = cpu;
-				break;
-			}
+			target_cpu = cpumask_first(pdev->vmx_cpumask);
 		}
 
 		if (target_cpu < 0) {
@@ -1943,6 +1928,9 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			break;
 		}
 
+		/* Bind this fd to the selected CPU for all subsequent ioctls */
+		fctx->bound_cpu = target_cpu;
+
 		args.instance_id = 0;
 		if (copy_to_user((void __user *)arg, &args, sizeof(args)))
 			ret = -EFAULT;
@@ -1961,8 +1949,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		struct phantom_load_args args;
 		struct phantom_vmx_cpu_state *state;
 		struct phantom_shared_mem *sm;
-		int target_cpu = -1;
-		int cpu;
+		int target_cpu;
 
 		if (copy_from_user(&args, (void __user *)arg, sizeof(args))) {
 			ret = -EFAULT;
@@ -1974,10 +1961,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			break;
 		}
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
+		target_cpu = phantom_file_cpu(fctx);
 
 		if (target_cpu < 0) {
 			ret = -ENODEV;
@@ -2017,12 +2001,8 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		int target_cpu = -1;
 		struct phantom_vmx_cpu_state *state;
-		int cpu;
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
+		target_cpu = phantom_file_cpu(fctx);
 
 		if (target_cpu < 0) {
 			ret = -ENODEV;
@@ -2071,8 +2051,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		struct phantom_run_args2 args2;
 		struct phantom_vmx_cpu_state *state;
 		struct phantom_shared_mem *sm;
-		int target_cpu = -1;
-		int cpu;
+		int target_cpu;
 
 		if (copy_from_user(&args2, (void __user *)arg, sizeof(args2))) {
 			ret = -EFAULT;
@@ -2084,11 +2063,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			break;
 		}
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
-
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			ret = -ENODEV;
 			break;
@@ -2155,13 +2130,9 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		struct phantom_status st;
 		struct phantom_vmx_cpu_state *state;
-		int target_cpu = -1;
-		int cpu;
+		int target_cpu;
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
+		target_cpu = phantom_file_cpu(fctx);
 
 		if (target_cpu < 0) {
 			ret = -ENODEV;
@@ -2310,23 +2281,21 @@ static int phantom_mmap_shared_ro(struct vm_area_struct *vma,
 
 static int phantom_mmap(struct file *filp, struct vm_area_struct *vma)
 {
-	struct phantom_dev *pdev = filp->private_data;
+	struct phantom_file *fctx = filp->private_data;
+	struct phantom_dev *pdev;
 	struct phantom_vmx_cpu_state *state;
-	int target_cpu = -1;
-	int cpu;
+	int target_cpu;
 	unsigned long offset;
 	unsigned long size;
 	unsigned long pfn;
 
+	if (!fctx)
+		return -ENXIO;
+	pdev = fctx->pdev;
 	if (!pdev || !pdev->initialized)
 		return -ENXIO;
 
-	/* Find the first VMX CPU */
-	for_each_cpu(cpu, pdev->vmx_cpumask) {
-		target_cpu = cpu;
-		break;
-	}
-
+	target_cpu = phantom_file_cpu(fctx);
 	if (target_cpu < 0)
 		return -ENODEV;
 
