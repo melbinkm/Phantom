@@ -69,7 +69,8 @@
 
 #define PHANTOM_IOC_MAGIC		'P'
 
-#define PHANTOM_VERSION_EXPECTED	0x00020100U
+/* Accept any 2.x version — version bumps with each task */
+#define PHANTOM_VERSION_MIN		0x00020100U
 
 /* Result codes */
 #define PHANTOM_RESULT_OK		0
@@ -358,14 +359,14 @@ static int test_e_version(int fd)
 	ret = ioctl(fd, PHANTOM_IOCTL_GET_VERSION, &ver);
 	test_assert(ret == 0, "GET_VERSION returns 0", strerror(errno));
 
-	if (ver == PHANTOM_VERSION_EXPECTED) {
-		test_pass("version == 0x00020100 (task 2.1)");
+	if (ver >= PHANTOM_VERSION_MIN) {
+		test_pass("version >= 0x00020100 (task 2.1+)");
 	} else {
 		char buf[64];
 		snprintf(buf, sizeof(buf),
-			 "got 0x%08x, expected 0x%08x",
-			 ver, PHANTOM_VERSION_EXPECTED);
-		test_fail("version == 0x00020100", buf);
+			 "got 0x%08x, expected >= 0x%08x",
+			 ver, PHANTOM_VERSION_MIN);
+		test_fail("version >= 0x00020100", buf);
 	}
 
 	printf("    version = 0x%08x\n", ver);
