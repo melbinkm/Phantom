@@ -21,6 +21,10 @@ import struct
 import sys
 import time
 
+# Force unbuffered stdout so logs are captured even if the output file
+# is deleted (e.g., by rsync --delete) while the process is running.
+sys.stdout.reconfigure(line_buffering=True)
+
 # ---------------------------------------------------------------------------
 # Locate and import phantom_ioctl from sibling directory
 # ---------------------------------------------------------------------------
