@@ -35,6 +35,7 @@
 #include <asm/fpu/api.h>
 #include <asm/processor.h>
 #include <asm/cpuid.h>
+#include <asm/msr.h>
 
 #include "phantom.h"
 #include "vmx_core.h"
@@ -241,6 +242,8 @@ EXPORT_SYMBOL_GPL(phantom_snapshot_create);
 int phantom_snapshot_restore(struct phantom_vmx_cpu_state *state)
 {
 	const struct phantom_snapshot *snap = &state->snap;
+	u64 t0, t1, t2, t3, t4, t5;
+	u32 saved_dirty_count;
 	u32 i;
 
 	if (!snap->valid)
@@ -250,6 +253,26 @@ int phantom_snapshot_restore(struct phantom_vmx_cpu_state *state)
 	trace_printk("PHANTOM SNAPSHOT_RESTORE cpu=%d dirty_count=%u\n",
 		     state->cpu, state->dirty_count);
 #endif
+
+	/* ----------------------------------------------------------
+	 * Phase timing: t0 marks the start of the full restore path.
+	 * Six timestamps bracket five distinct phases:
+	 *   [t0, t1) — dirty list walk + EPT PTE resets + pool returns
+	 *   [t1, t2) — single batched INVEPT
+	 *   [t2, t3) — VMCS guest-state field restore
+	 *   [t3, t4) — XRSTOR (kernel_fpu_begin + xrstor64 + kernel_fpu_end)
+	 *   [t4, t5) — remainder (GPR copy, bookkeeping)
+	 *   [t0, t5) — total restore path
+	 *
+	 * rdtsc_ordered() issues an LFENCE before RDTSC to prevent
+	 * out-of-order execution from folding adjacent work into the
+	 * wrong interval.  This is the correct pattern for kernel
+	 * microbenchmarks (same as KVM's perf measurement paths).
+	 * ---------------------------------------------------------- */
+	/* Capture dirty count before the walk resets it to 0 */
+	saved_dirty_count = state->dirty_count;
+
+	t0 = rdtsc_ordered();
 
 	/* ----------------------------------------------------------
 	 * Step 1: Walk dirty list.
@@ -280,6 +303,8 @@ int phantom_snapshot_restore(struct phantom_vmx_cpu_state *state)
 	}
 	state->dirty_count = 0;
 
+	t1 = rdtsc_ordered();
+
 	/* ----------------------------------------------------------
 	 * Step 2: Single batched INVEPT after ALL EPT updates.
 	 *
@@ -291,6 +316,8 @@ int phantom_snapshot_restore(struct phantom_vmx_cpu_state *state)
 	 * One batched single-context INVEPT covers all updates.
 	 * ---------------------------------------------------------- */
 	phantom_invept_single_context(state->ept.eptp);
+
+	t2 = rdtsc_ordered();
 
 	/* ----------------------------------------------------------
 	 * Step 3: Restore VMCS guest control registers.
@@ -380,6 +407,8 @@ int phantom_snapshot_restore(struct phantom_vmx_cpu_state *state)
 	state->guest_regs.r14 = snap->r14;
 	state->guest_regs.r15 = snap->r15;
 
+	t3 = rdtsc_ordered();
+
 	/* ----------------------------------------------------------
 	 * Step 10: XRSTOR extended registers from aligned buffer.
 	 *
@@ -398,6 +427,41 @@ int phantom_snapshot_restore(struct phantom_vmx_cpu_state *state)
 			: "memory");
 		kernel_fpu_end();
 	}
+
+	t4 = rdtsc_ordered();
+
+	/*
+	 * t5 marks the end of the fully measured restore path.
+	 * The remaining work (returning to caller) is negligible.
+	 */
+	t5 = rdtsc_ordered();
+
+	/* ----------------------------------------------------------
+	 * Store per-phase cycle counts in perf_last for ioctl readout.
+	 *
+	 * These are plain stores (no atomics needed) — only the vCPU
+	 * thread writes this field, and the ioctl reads it only after
+	 * wait_for_completion() which provides the required barrier.
+	 * ---------------------------------------------------------- */
+	state->perf_last.dirty_page_count  = (u64)saved_dirty_count;
+	state->perf_last.dirty_walk_cycles = t1 - t0;
+	state->perf_last.invept_cycles     = t2 - t1;
+	state->perf_last.vmcs_cycles       = t3 - t2;
+	state->perf_last.xrstor_cycles     = t4 - t3;
+	state->perf_last.total_cycles      = t5 - t0;
+
+#ifdef PHANTOM_DEBUG
+	trace_printk("PHANTOM SNAPSHOT_RESTORE_PERF cpu=%d "
+		     "dirty=%llu walk=%llu invept=%llu vmcs=%llu "
+		     "xrstor=%llu total=%llu\n",
+		     state->cpu,
+		     state->perf_last.dirty_page_count,
+		     state->perf_last.dirty_walk_cycles,
+		     state->perf_last.invept_cycles,
+		     state->perf_last.vmcs_cycles,
+		     state->perf_last.xrstor_cycles,
+		     state->perf_last.total_cycles);
+#endif
 
 	return 0;
 	/* Caller does VMRESUME */
