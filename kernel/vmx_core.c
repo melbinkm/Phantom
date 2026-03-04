@@ -46,9 +46,11 @@
 #include "phantom.h"
 #include "vmx_core.h"
 #include "ept.h"
+#include "ept_cow.h"
 #include "hypercall.h"
 #include "nmi.h"
 #include "debug.h"
+#include "memory.h"
 
 /* Per-CPU VMX state — one entry per physical CPU */
 DEFINE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);
@@ -986,11 +988,67 @@ int phantom_vmcs_setup(struct phantom_vmx_cpu_state *state)
 	phantom_build_guest_pagetables(state);
 	phantom_build_ept(state); /* populates state->ept.eptp */
 
+	/*
+	 * Task 1.4: Mark all RAM EPT pages read-only (snapshot point).
+	 *
+	 * After this, any guest write to a RAM GPA triggers an EPT violation
+	 * (exit reason 48).  phantom_cow_fault() handles it by allocating a
+	 * private copy from the CoW pool.
+	 *
+	 * We set ept.ready here so phantom_ept_mark_all_ro can run.
+	 */
+	state->ept.ready = true;
+	phantom_ept_mark_all_ro(&state->ept);
+
+	/*
+	 * Task 1.4: Initialise CoW page pool.
+	 *
+	 * Default capacity: PHANTOM_COW_POOL_DEFAULT_CAPACITY pages.
+	 * test_id=3 (pool exhaustion test) uses a tiny 5-page pool —
+	 * the ioctl handler overrides this for that test before calling
+	 * vmcs_setup() the first time, but since vmcs_setup is idempotent
+	 * once pages_allocated is set, the override must happen before
+	 * the first call.  For all other test_ids use the default.
+	 */
+	{
+		u32 pool_cap = PHANTOM_COW_POOL_DEFAULT_CAPACITY;
+
+		ret = phantom_cow_pool_init(&state->cow_pool, cpu, pool_cap);
+		if (ret) {
+			pr_err("phantom: CPU%d: cow_pool init failed: %d\n",
+			       cpu, ret);
+			goto err_cow_pool;
+		}
+	}
+
+	/*
+	 * Task 1.4: Allocate dirty list (one entry per CoW page per iter).
+	 * Capacity matches pool capacity so they are always consistent.
+	 */
+	state->dirty_max  = state->cow_pool.capacity;
+	state->dirty_list = kvmalloc_array(state->dirty_max,
+					   sizeof(struct phantom_dirty_entry),
+					   GFP_KERNEL | __GFP_ZERO);
+	if (!state->dirty_list) {
+		pr_err("phantom: CPU%d: dirty_list alloc failed\n", cpu);
+		ret = -ENOMEM;
+		goto err_dirty_list;
+	}
+
+	state->dirty_count   = 0;
+	state->cow_iteration = 0;
+	state->cow_enabled   = true;
+
 	state->pages_allocated = true;
-	pr_info("phantom: CPU%d: pages allocated (EPT: 16MB RAM, "
-		"eptp=0x%llx)\n", cpu, state->ept.eptp);
+	pr_info("phantom: CPU%d: pages allocated (EPT: 16MB RAM RO, "
+		"eptp=0x%llx, cow_pool=%u pages)\n",
+		cpu, state->ept.eptp, state->cow_pool.capacity);
 	return 0;
 
+err_dirty_list:
+	phantom_cow_pool_destroy(&state->cow_pool);
+err_cow_pool:
+	state->ept.ready = false;
 err_guest_pages:
 	phantom_ept_teardown(&state->ept);
 	/* Clear the convenience pointers that may now be stale */
@@ -1113,6 +1171,18 @@ void phantom_vmcs_teardown(struct phantom_vmx_cpu_state *state)
 		__free_page(state->msr_bitmap);
 		state->msr_bitmap = NULL;
 	}
+
+	/* Task 1.4: free dirty list and CoW pool */
+	if (state->dirty_list) {
+		kvfree(state->dirty_list);
+		state->dirty_list  = NULL;
+		state->dirty_count = 0;
+		state->dirty_max   = 0;
+	}
+
+	phantom_cow_pool_destroy(&state->cow_pool);
+	state->cow_enabled   = false;
+	state->cow_iteration = 0;
 
 	state->pages_allocated = false;
 	state->vmcs_configured = false;
@@ -1445,10 +1515,36 @@ static int phantom_vcpu_fn(void *data)
 			phantom_vmcs_write32(VMCS_GUEST_INTR_STATE,     0);
 			phantom_vmcs_write32(VMCS_GUEST_ACTIVITY_STATE, 0);
 			phantom_vmcs_write64(VMCS_GUEST_RFLAGS,         0x2ULL);
+			/*
+			 * Task 1.4: increment iteration counter.
+			 * phantom_cow_abort_iteration was already called after
+			 * the previous run, so the EPT is back in RO state.
+			 */
+			state->cow_iteration++;
 		}
 
 		/* Run the guest — pinned to state->cpu */
 		state->vcpu_run_result = phantom_run_guest(state);
+
+		/*
+		 * Task 1.4: After each guest run, restore the snapshot.
+		 *
+		 * phantom_cow_abort_iteration() walks the dirty list, resets
+		 * all EPT PTEs to the original HPA (RO), returns private pages
+		 * to the pool, and issues one batched INVEPT (single-context).
+		 *
+		 * This must run AFTER phantom_run_guest() exits VMX-root and
+		 * BEFORE the next VMLAUNCH, ensuring the EPT is back in
+		 * snapshot (RO) state for the next iteration.
+		 *
+		 * It runs on the vCPU thread (same CPU as VMCS is current on),
+		 * which is required because INVEPT operates on the current LP.
+		 */
+		if (state->cow_enabled) {
+			/* Save dirty count before abort resets it to 0 */
+			state->last_dirty_count = state->dirty_count;
+			phantom_cow_abort_iteration(state);
+		}
 
 		/*
 		 * After the first VMLAUNCH/VMRESUME, switch to busy-wait mode.
@@ -1859,37 +1955,76 @@ static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 
 	case VMX_EXIT_EPT_VIOLATION: {
 		u64 gpa = phantom_vmcs_read64(VMCS_RO_GUEST_PHYS_ADDR);
-		u64 rip = phantom_vmcs_read64(VMCS_GUEST_RIP);
-		const struct phantom_gpa_region *rgn;
-		const char *type_str;
 
 		/*
-		 * Classify the faulting GPA for diagnostic logging.
-		 * Use trace_printk on hot path; pr_err on unexpected paths.
+		 * EPT violation qualification bits (Intel SDM §27.2.1):
+		 *   Bit 0: data read caused violation
+		 *   Bit 1: data write caused violation
+		 *   Bit 2: instruction fetch caused violation
+		 *   Bit 3: GPA is readable in EPT
+		 *   Bit 4: GPA is writable in EPT
+		 *   Bit 5: GPA is executable in EPT
+		 *   Bit 7: GPA valid (GUEST_PHYSICAL_ADDRESS field valid)
+		 *
+		 * CoW condition: write access (bit 1 set) to a RAM GPA
+		 * that is readable but not writable (bit 3 set, bit 4 clear).
+		 * This is the snapshot read-only state.
 		 */
-		rgn = phantom_ept_classify_gpa(gpa);
-		switch (rgn->type) {
-		case PHANTOM_GPA_RAM:
-			type_str = "RAM";
-			break;
-		case PHANTOM_GPA_MMIO:
-			type_str = "MMIO";
-			break;
-		default:
-			type_str = "RESERVED";
-			break;
+		if (state->cow_enabled &&
+		    (qual & BIT(1)) &&           /* write access */
+		    (qual & BIT(3)) &&           /* GPA readable (present) */
+		    !(qual & BIT(4))) {          /* GPA not writable (RO) */
+			int cow_ret = phantom_cow_fault(state, gpa);
+
+			if (cow_ret == 0)
+				return 0; /* VMRESUME — NO INVEPT */
+
+			/*
+			 * CoW fault failed (MMIO/reserved GPA or pool empty).
+			 * run_result already set by phantom_cow_fault().
+			 * Fall through to stop guest.
+			 */
+			return 1;
 		}
 
-#ifdef PHANTOM_DEBUG
-		trace_printk("PHANTOM EPT_VIOLATION cpu=%d gpa=0x%llx "
-			     "rip=0x%llx qual=0x%llx type=%s\n",
-			     state->cpu, gpa, rip, qual, type_str);
-#endif
-		pr_err("phantom: CPU%d: EPT VIOLATION GPA=0x%llx "
-		       "RIP=0x%llx qual=0x%llx type=%s\n",
-		       state->cpu, gpa, rip, qual, type_str);
+		/*
+		 * Not a CoW write fault — could be:
+		 *   - Read/execute fault on unmapped GPA (absent test)
+		 *   - Write to MMIO/reserved area
+		 *   - Unexpected access when cow_enabled is false
+		 *
+		 * Log and abort the guest run.
+		 */
+		{
+			u64 rip = phantom_vmcs_read64(VMCS_GUEST_RIP);
+			const struct phantom_gpa_region *rgn;
+			const char *type_str;
 
-		state->run_result = 1; /* PHANTOM_RESULT_CRASH */
+			rgn = phantom_ept_classify_gpa(gpa);
+			switch (rgn->type) {
+			case PHANTOM_GPA_RAM:
+				type_str = "RAM";
+				break;
+			case PHANTOM_GPA_MMIO:
+				type_str = "MMIO";
+				break;
+			default:
+				type_str = "RESERVED";
+				break;
+			}
+
+#ifdef PHANTOM_DEBUG
+			trace_printk("PHANTOM EPT_VIOLATION cpu=%d "
+				     "gpa=0x%llx rip=0x%llx "
+				     "qual=0x%llx type=%s\n",
+				     state->cpu, gpa, rip, qual, type_str);
+#endif
+			pr_err("phantom: CPU%d: EPT VIOLATION GPA=0x%llx "
+			       "RIP=0x%llx qual=0x%llx type=%s\n",
+			       state->cpu, gpa, rip, qual, type_str);
+		}
+
+		state->run_result = PHANTOM_RESULT_CRASH;
 		return 1;
 	}
 

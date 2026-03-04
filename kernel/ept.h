@@ -212,4 +212,21 @@ u64 *phantom_ept_lookup_pte(struct phantom_ept_state *ept, u64 gpa);
 struct page *phantom_ept_get_ram_page(struct phantom_ept_state *ept,
 				      u64 gpa);
 
+/**
+ * phantom_ept_mark_all_ro - Mark all RAM EPT leaf PTEs read-only.
+ * @ept: EPT state (must have been built by phantom_ept_build).
+ *
+ * Walks all 4096 PT entries for the 16MB RAM region and clears the
+ * EPT_PTE_WRITE bit from each present leaf PTE, leaving READ+EXEC+WB.
+ *
+ * This simulates the snapshot moment: after this call, any guest write
+ * to a RAM GPA triggers an EPT violation (exit reason 48) which is
+ * handled by phantom_cow_fault() to create a private copy.
+ *
+ * Called from vmx_core.c after phantom_ept_build() and before the
+ * first VMLAUNCH.  Must be called from process context (uses
+ * page_address() — valid for any mapped kernel page).
+ */
+void phantom_ept_mark_all_ro(struct phantom_ept_state *ept);
+
 #endif /* PHANTOM_EPT_H */
