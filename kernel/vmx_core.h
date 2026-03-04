@@ -17,6 +17,7 @@
 #include <asm/msr-index.h>
 
 #include "ept.h"
+#include "ept_cow.h"
 
 /* ------------------------------------------------------------------
  * MSR constants — only defined if the running kernel headers omit them
@@ -502,10 +503,39 @@ struct phantom_vmx_cpu_state {
 	 * test_id: selects which guest binary to run.
 	 *   0 = R/W test (10 pages, compute checksum)
 	 *   1 = absent-GPA test (access GPA 0x1000000 → EPT violation)
+	 *   2 = CoW write test (20 pages at GPA 0x30000–0x43000)
+	 *   3 = pool exhaustion test (tiny 5-page pool, 10-write guest)
 	 *
 	 * Set by the ioctl handler from args.reserved before each run.
 	 */
 	u32			 test_id;
+
+	/*
+	 * Task 1.4: CoW snapshot engine fields.
+	 *
+	 * Placed AFTER host_rsp and all assembly-trampoline-referenced
+	 * fields to preserve hardcoded struct offsets in vmx_trampoline.S.
+	 *
+	 * cow_pool:      pre-allocated private page pool
+	 * dirty_list:    kvmalloc_array of phantom_dirty_entry records
+	 * dirty_count:   number of dirty entries in current iteration
+	 * dirty_max:     capacity of dirty_list (== cow_pool.capacity)
+	 * cow_iteration: current fuzzing iteration counter
+	 * cow_enabled:   true once EPT has been marked RO (snapshot taken)
+	 */
+	struct phantom_cow_pool	  cow_pool;
+	struct phantom_dirty_entry *dirty_list;
+	u32			  dirty_count;
+	u32			  dirty_max;
+	u32			  cow_iteration;
+	bool			  cow_enabled;
+	/*
+	 * last_dirty_count: number of dirty entries from the most recently
+	 * completed iteration, captured before phantom_cow_abort_iteration()
+	 * resets dirty_count to 0.  Used by the debug ioctl and test code
+	 * to verify CoW correctness without a race.
+	 */
+	u32			  last_dirty_count;
 };
 
 DECLARE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);

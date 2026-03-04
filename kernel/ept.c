@@ -488,3 +488,46 @@ struct page *phantom_ept_get_ram_page(struct phantom_ept_state *ept, u64 gpa)
 	return ept->ram_pages[idx];
 }
 EXPORT_SYMBOL_GPL(phantom_ept_get_ram_page);
+
+/* ------------------------------------------------------------------
+ * phantom_ept_mark_all_ro - Write-protect all RAM leaf PTEs
+ * ------------------------------------------------------------------ */
+
+/**
+ * phantom_ept_mark_all_ro - Clear EPT_PTE_WRITE on all 16MB RAM PTEs.
+ * @ept: EPT state with pages already built by phantom_ept_build().
+ *
+ * Iterates over all PT pages (PHANTOM_EPT_NR_PT_PAGES) and all 512
+ * entries in each, clearing bit 1 (EPT_PTE_WRITE) from any present
+ * (READ bit set) leaf PTE.
+ *
+ * After this call:
+ *   - All guest writes to RAM trigger EPT violation (exit 48).
+ *   - phantom_cow_fault() handles violations by creating private copies.
+ *   - Execute and read access still function normally.
+ *
+ * Called before the first VMLAUNCH (snapshot point).
+ * Must NOT be called while the guest is running (not re-entrant).
+ */
+void phantom_ept_mark_all_ro(struct phantom_ept_state *ept)
+{
+	int pd_idx, pt_idx;
+
+	if (!ept || !ept->ready)
+		return;
+
+	for (pd_idx = 0; pd_idx < PHANTOM_EPT_NR_PT_PAGES; pd_idx++) {
+		u64 *pt;
+
+		if (!ept->pt[pd_idx])
+			continue;
+
+		pt = (u64 *)page_address(ept->pt[pd_idx]);
+
+		for (pt_idx = 0; pt_idx < 512; pt_idx++) {
+			if (pt[pt_idx] & EPT_PTE_READ)
+				pt[pt_idx] &= ~EPT_PTE_WRITE;
+		}
+	}
+}
+EXPORT_SYMBOL_GPL(phantom_ept_mark_all_ro);

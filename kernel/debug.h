@@ -118,4 +118,16 @@ void phantom_walk_ept(struct phantom_ept_state *ept);
  */
 int phantom_debug_dump_ept(struct phantom_vmx_cpu_state *state);
 
+/**
+ * phantom_debug_dump_dirty_list - Dump CoW dirty list entries.
+ * @state: Per-CPU VMX state (must have dirty_list allocated).
+ *
+ * Emits each dirty entry via trace_printk:
+ *   "DIRTY_ENTRY gpa=0x%llx orig=0x%llx priv=0x%llx iter=%u"
+ *
+ * Output goes to /sys/kernel/debug/tracing/trace.
+ * Returns 0 on success, -EINVAL if dirty_list not allocated.
+ */
+int phantom_debug_dump_dirty_list(struct phantom_vmx_cpu_state *state);
+
 #endif /* PHANTOM_DEBUG_H */

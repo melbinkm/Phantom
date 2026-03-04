@@ -9,6 +9,8 @@ phantom-objs := \
 	phantom_main.o \
 	vmx_core.o \
 	ept.o \
+	ept_cow.o \
+	memory.o \
 	interface.o \
 	debug.o \
 	hypercall.o \

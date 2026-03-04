@@ -22,6 +22,7 @@
 #include "phantom.h"
 #include "vmx_core.h"
 #include "ept.h"
+#include "ept_cow.h"
 #include "debug.h"
 
 /* ------------------------------------------------------------------
@@ -554,6 +555,61 @@ int phantom_debug_dump_ept(struct phantom_vmx_cpu_state *state)
 	}
 
 	phantom_walk_ept(&state->ept);
+	return 0;
+}
+
+/* ------------------------------------------------------------------
+ * Dirty list dump (Task 1.4)
+ *
+ * Emits each dirty entry via trace_printk.
+ * Slow-path only — not called from hot-path contexts.
+ * ------------------------------------------------------------------ */
+
+/**
+ * phantom_debug_dump_dirty_list - Dump CoW dirty list entries.
+ * @state: Per-CPU VMX state.
+ *
+ * Emits one trace_printk line per dirty entry:
+ *   "DIRTY_ENTRY gpa=0x%llx orig=0x%llx priv=0x%llx iter=%u"
+ *
+ * Output goes to /sys/kernel/debug/tracing/trace.
+ *
+ * Returns 0 on success, -EINVAL if dirty_list is NULL.
+ */
+int phantom_debug_dump_dirty_list(struct phantom_vmx_cpu_state *state)
+{
+	u32 i;
+
+	if (!state || !state->dirty_list) {
+		pr_err("phantom: dump_dirty_list: dirty_list not allocated\n");
+		return -EINVAL;
+	}
+
+	pr_info("phantom: CPU%d: dirty list dump: last=%u current=%u/%u "
+		"(iteration %u)\n",
+		state->cpu, state->last_dirty_count,
+		state->dirty_count, state->dirty_max,
+		state->cow_iteration);
+
+	/*
+	 * After a run completes, phantom_cow_abort_iteration() resets
+	 * dirty_count to 0.  Use last_dirty_count to report the number of
+	 * dirty entries from the most recently completed iteration.
+	 * The dirty_list entries themselves are NOT zeroed (only dirty_count
+	 * is reset), so the last iteration's GPA/HPA data is still readable.
+	 */
+	for (i = 0; i < state->last_dirty_count; i++) {
+		struct phantom_dirty_entry *de = &state->dirty_list[i];
+
+		trace_printk("DIRTY_ENTRY gpa=0x%llx orig=0x%llx "
+			     "priv=0x%llx iter=%u\n",
+			     de->gpa, de->orig_hpa, de->priv_hpa,
+			     de->iter_num);
+	}
+
+	trace_printk("DIRTY_LIST_END last_count=%u current=%u max=%u iter=%u\n",
+		     state->last_dirty_count, state->dirty_count,
+		     state->dirty_max, state->cow_iteration);
 	return 0;
 }
 

@@ -21,8 +21,9 @@
  * Version encoding: 0xMMmmpp  (Major . minor . patch)
  * Task 1.2 baseline: version 1.2.0 = 0x00010200
  * Task 1.3 baseline: version 1.3.0 = 0x00010300
+ * Task 1.4 baseline: version 1.4.0 = 0x00010400
  * ------------------------------------------------------------------ */
-#define PHANTOM_VERSION		0x00010300U
+#define PHANTOM_VERSION		0x00010400U
 
 /* ------------------------------------------------------------------
  * ioctl command numbers
@@ -67,6 +68,15 @@ struct phantom_run_args {
  * Returns 0 on success, -EINVAL if pages not allocated.
  */
 #define PHANTOM_IOCTL_DEBUG_DUMP_EPT	_IO(PHANTOM_IOCTL_MAGIC, 6)
+
+/*
+ * PHANTOM_IOCTL_DEBUG_DUMP_DIRTY_LIST — dump CoW dirty list entries.
+ *
+ * No arguments.  Emits DIRTY_ENTRY lines via trace_printk.
+ * Output goes to /sys/kernel/debug/tracing/trace.
+ * Returns 0 on success, -EINVAL if dirty_list not allocated.
+ */
+#define PHANTOM_IOCTL_DEBUG_DUMP_DIRTY_LIST	_IO(PHANTOM_IOCTL_MAGIC, 7)
 
 /*
  * Reserved for future phases:
