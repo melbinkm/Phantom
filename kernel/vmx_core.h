@@ -2,8 +2,9 @@
 /*
  * vmx_core.h — VMX bootstrap declarations for phantom.ko
  *
- * Covers: per-CPU VMX state, MSR constants, VMXON/VMXOFF prototypes,
- * VMCS allocation prototypes, and feature-detection declarations.
+ * Covers: per-CPU VMX state, MSR constants, VMCS field encodings,
+ * VMCS read/write helpers, control adjustment, guest register file,
+ * VMXON/VMXOFF/VMCS allocation prototypes, and guest execution API.
  */
 #ifndef PHANTOM_VMX_CORE_H
 #define PHANTOM_VMX_CORE_H
@@ -11,12 +12,12 @@
 #include <linux/types.h>
 #include <linux/percpu.h>
 #include <linux/mm_types.h>
+#include <linux/completion.h>
+#include <linux/kthread.h>
 #include <asm/msr-index.h>
 
 /* ------------------------------------------------------------------
  * MSR constants — only defined if the running kernel headers omit them
- * (asm/msr-index.h covers most of these from 4.x onwards; keep guards
- *  so we don't clash with the kernel's own definitions).
  * ------------------------------------------------------------------ */
 
 #ifndef MSR_IA32_VMX_BASIC
@@ -53,7 +54,7 @@
 #define MSR_IA32_VMX_EPT_VPID_CAP	0x0000048c
 #endif
 #ifndef MSR_IA32_VMX_TRUE_PINBASED_CTLS
-#define MSR_IA32_VMX_TRUE_PINBASED_CTLS	0x0000048d
+#define MSR_IA32_VMX_TRUE_PINBASED_CTLS	 0x0000048d
 #endif
 #ifndef MSR_IA32_VMX_TRUE_PROCBASED_CTLS
 #define MSR_IA32_VMX_TRUE_PROCBASED_CTLS 0x0000048e
@@ -65,119 +66,599 @@
 #define MSR_IA32_VMX_TRUE_ENTRY_CTLS	0x00000490
 #endif
 
-/*
- * EPT/VPID capability bits (MSR_IA32_VMX_EPT_VPID_CAP).
- *
- * The kernel's <asm/vmx.h> defines these as VMX_EPT_PAGE_WALK_4_BIT,
- * VMX_EPTP_WB_BIT, VMX_EPT_2MB_PAGE_BIT, VMX_EPT_AD_BIT.  We include
- * that header in vmx_core.c and use those names directly, so no aliases
- * are needed here.
- */
-
-/*
- * VMX_BASIC bits — only define what the kernel headers do NOT already
- * provide.  VMX_BASIC_TRUE_CTLS is in <asm/msr-index.h> since 5.x;
- * do not redefine it.
- */
+/* VMX_BASIC bits */
 #define VMX_BASIC_REVISION_MASK		0x7fffffffULL
+
+/* ------------------------------------------------------------------
+ * VMCS field encodings (Intel SDM Vol. 3C §B.1 – §B.4)
+ *
+ * Naming: VMCS_GUEST_* / VMCS_HOST_* / VMCS_CTRL_* to avoid
+ * collisions with <asm/vmx.h> which uses similar names.
+ * ------------------------------------------------------------------ */
+
+/* 16-bit Guest-State Fields */
+#define VMCS_GUEST_ES_SELECTOR		0x0800
+#define VMCS_GUEST_CS_SELECTOR		0x0802
+#define VMCS_GUEST_SS_SELECTOR		0x0804
+#define VMCS_GUEST_DS_SELECTOR		0x0806
+#define VMCS_GUEST_FS_SELECTOR		0x0808
+#define VMCS_GUEST_GS_SELECTOR		0x080A
+#define VMCS_GUEST_LDTR_SELECTOR	0x080C
+#define VMCS_GUEST_TR_SELECTOR		0x080E
+
+/* 16-bit Host-State Fields */
+#define VMCS_HOST_ES_SELECTOR		0x0C00
+#define VMCS_HOST_CS_SELECTOR		0x0C02
+#define VMCS_HOST_SS_SELECTOR		0x0C04
+#define VMCS_HOST_DS_SELECTOR		0x0C06
+#define VMCS_HOST_FS_SELECTOR		0x0C08
+#define VMCS_HOST_GS_SELECTOR		0x0C0A
+#define VMCS_HOST_TR_SELECTOR		0x0C0C
+
+/* 16-bit Control Fields */
+#define VMCS_CTRL_VPID			0x0000
+
+/* 64-bit Control Fields */
+#define VMCS_CTRL_IO_BITMAP_A		0x2000
+#define VMCS_CTRL_IO_BITMAP_B		0x2002
+#define VMCS_CTRL_MSR_BITMAP		0x2004
+#define VMCS_CTRL_EPT_POINTER		0x201A
+#define VMCS_CTRL_VMCS_LINK_PTR		0x2800
+
+/* 64-bit Guest-State Fields */
+#define VMCS_GUEST_IA32_DEBUGCTL	0x2802
+#define VMCS_GUEST_IA32_PAT		0x2804
+#define VMCS_GUEST_IA32_EFER		0x2806
+#define VMCS_GUEST_IA32_PERF_GLOBAL	0x2808
+/* PDPTE entries (PAE paging) */
+#define VMCS_GUEST_PDPTE0		0x280A
+#define VMCS_GUEST_PDPTE1		0x280C
+#define VMCS_GUEST_PDPTE2		0x280E
+#define VMCS_GUEST_PDPTE3		0x2810
+
+/* 64-bit Host-State Fields */
+#define VMCS_HOST_IA32_PAT		0x2C00
+#define VMCS_HOST_IA32_EFER		0x2C02
+#define VMCS_HOST_IA32_PERF_GLOBAL	0x2C04
+
+/* 32-bit Control Fields */
+#define VMCS_CTRL_PINBASED		0x4000
+#define VMCS_CTRL_PROCBASED		0x4002
+#define VMCS_CTRL_EXCEPTION_BITMAP	0x4004
+#define VMCS_CTRL_PF_EC_MASK		0x4006
+#define VMCS_CTRL_PF_EC_MATCH		0x4008
+#define VMCS_CTRL_CR3_TARGET_COUNT	0x400A
+#define VMCS_CTRL_EXIT			0x400C
+#define VMCS_CTRL_EXIT_MSR_STORE_COUNT	0x400E
+#define VMCS_CTRL_EXIT_MSR_LOAD_COUNT	0x4010
+#define VMCS_CTRL_ENTRY			0x4012
+#define VMCS_CTRL_ENTRY_MSR_LOAD_COUNT	0x4014
+#define VMCS_CTRL_ENTRY_INTR_INFO	0x4016
+#define VMCS_CTRL_ENTRY_EXCEPTION_EC	0x4018
+#define VMCS_CTRL_ENTRY_INSTR_LEN	0x401A
+#define VMCS_CTRL_PROCBASED2		0x401E
+
+/* 32-bit Read-Only Data Fields */
+#define VMCS_RO_VM_INSTR_ERROR		0x4400
+#define VMCS_RO_EXIT_REASON		0x4402
+#define VMCS_RO_EXIT_INTR_INFO		0x4404
+#define VMCS_RO_EXIT_INTR_EC		0x4406
+#define VMCS_RO_IDT_VECTORING_INFO	0x4408
+#define VMCS_RO_IDT_VECTORING_EC	0x440A
+#define VMCS_RO_EXIT_INSTR_LEN		0x440C
+#define VMCS_RO_EXIT_INSTR_INFO		0x440E
+
+/* 32-bit Guest-State Fields */
+#define VMCS_GUEST_ES_LIMIT		0x4800
+#define VMCS_GUEST_CS_LIMIT		0x4802
+#define VMCS_GUEST_SS_LIMIT		0x4804
+#define VMCS_GUEST_DS_LIMIT		0x4806
+#define VMCS_GUEST_FS_LIMIT		0x4808
+#define VMCS_GUEST_GS_LIMIT		0x480A
+#define VMCS_GUEST_LDTR_LIMIT		0x480C
+#define VMCS_GUEST_TR_LIMIT		0x480E
+#define VMCS_GUEST_GDTR_LIMIT		0x4810
+#define VMCS_GUEST_IDTR_LIMIT		0x4812
+#define VMCS_GUEST_ES_AR		0x4814
+#define VMCS_GUEST_CS_AR		0x4816
+#define VMCS_GUEST_SS_AR		0x4818
+#define VMCS_GUEST_DS_AR		0x481A
+#define VMCS_GUEST_FS_AR		0x481C
+#define VMCS_GUEST_GS_AR		0x481E
+#define VMCS_GUEST_LDTR_AR		0x4820
+#define VMCS_GUEST_TR_AR		0x4822
+#define VMCS_GUEST_INTR_STATE		0x4824
+#define VMCS_GUEST_ACTIVITY_STATE	0x4826
+#define VMCS_GUEST_SMBASE		0x4828
+#define VMCS_GUEST_IA32_SYSENTER_CS	0x482A
+#define VMCS_CTRL_PREEMPT_TIMER		0x482E
+
+/* 32-bit Host-State Fields */
+#define VMCS_HOST_IA32_SYSENTER_CS	0x4C00
+
+/* Natural-width Control Fields */
+#define VMCS_CTRL_CR0_MASK		0x6000
+#define VMCS_CTRL_CR4_MASK		0x6002
+#define VMCS_CTRL_CR0_READ_SHADOW	0x6004
+#define VMCS_CTRL_CR4_READ_SHADOW	0x6006
+#define VMCS_CTRL_CR3_TARGET0		0x6008
+#define VMCS_CTRL_CR3_TARGET1		0x600A
+#define VMCS_CTRL_CR3_TARGET2		0x600C
+#define VMCS_CTRL_CR3_TARGET3		0x600E
+
+/* Natural-width Read-Only Data Fields */
+#define VMCS_RO_EXIT_QUAL		0x6400
+#define VMCS_RO_IO_RCX			0x6402
+#define VMCS_RO_IO_RSI			0x6404
+#define VMCS_RO_IO_RDI			0x6406
+#define VMCS_RO_IO_RIP			0x6408
+#define VMCS_RO_GUEST_LIN_ADDR		0x640A
+#define VMCS_RO_GUEST_PHYS_ADDR		0x2400  /* 64-bit field */
+
+/* Natural-width Guest-State Fields */
+#define VMCS_GUEST_CR0			0x6800
+#define VMCS_GUEST_CR3			0x6802
+#define VMCS_GUEST_CR4			0x6804
+#define VMCS_GUEST_ES_BASE		0x6806
+#define VMCS_GUEST_CS_BASE		0x6808
+#define VMCS_GUEST_SS_BASE		0x680A
+#define VMCS_GUEST_DS_BASE		0x680C
+#define VMCS_GUEST_FS_BASE		0x680E
+#define VMCS_GUEST_GS_BASE		0x6810
+#define VMCS_GUEST_LDTR_BASE		0x6812
+#define VMCS_GUEST_TR_BASE		0x6814
+#define VMCS_GUEST_GDTR_BASE		0x6816
+#define VMCS_GUEST_IDTR_BASE		0x6818
+#define VMCS_GUEST_DR7			0x681A
+#define VMCS_GUEST_RSP			0x681C
+#define VMCS_GUEST_RIP			0x681E
+#define VMCS_GUEST_RFLAGS		0x6820
+#define VMCS_GUEST_PENDING_DBG_EXC	0x6822
+#define VMCS_GUEST_IA32_SYSENTER_ESP	0x6824
+#define VMCS_GUEST_IA32_SYSENTER_EIP	0x6826
+
+/* Natural-width Host-State Fields */
+#define VMCS_HOST_CR0			0x6C00
+#define VMCS_HOST_CR3			0x6C02
+#define VMCS_HOST_CR4			0x6C04
+#define VMCS_HOST_FS_BASE		0x6C06
+#define VMCS_HOST_GS_BASE		0x6C08
+#define VMCS_HOST_TR_BASE		0x6C0A
+#define VMCS_HOST_GDTR_BASE		0x6C0C
+#define VMCS_HOST_IDTR_BASE		0x6C0E
+#define VMCS_HOST_IA32_SYSENTER_ESP	0x6C10
+#define VMCS_HOST_IA32_SYSENTER_EIP	0x6C12
+#define VMCS_HOST_RSP			0x6C14
+#define VMCS_HOST_RIP			0x6C16
+
+/* ------------------------------------------------------------------
+ * VM exit reason codes (Intel SDM Vol. 3C Appendix C)
+ * ------------------------------------------------------------------ */
+#define VMX_EXIT_EXCEPTION_NMI		0
+#define VMX_EXIT_EXTERNAL_INT		1
+#define VMX_EXIT_TRIPLE_FAULT		2
+#define VMX_EXIT_CPUID			10
+#define VMX_EXIT_VMCALL			18
+#define VMX_EXIT_EPT_VIOLATION		48
+#define VMX_EXIT_EPT_MISCONFIG		49
+#define VMX_EXIT_PREEMPT_TIMER		52
+
+/* ------------------------------------------------------------------
+ * VMCS control field bit definitions
+ *
+ * Use #ifndef guards to avoid clashing with <asm/vmx.h> which defines
+ * most of these with identical names.  The kernel header takes priority
+ * when included; our definitions are only active if the kernel omits them.
+ * ------------------------------------------------------------------ */
+
+/* Pin-based execution controls */
+#ifndef PIN_BASED_EXT_INT_EXITING
+#define PIN_BASED_EXT_INT_EXITING	BIT(0)
+#endif
+#ifndef PIN_BASED_NMI_EXITING
+#define PIN_BASED_NMI_EXITING		BIT(3)
+#endif
+#ifndef PIN_BASED_VIRTUAL_NMIS
+#define PIN_BASED_VIRTUAL_NMIS		BIT(5)
+#endif
+#ifndef PIN_BASED_PREEMPT_TIMER
+#define PIN_BASED_PREEMPT_TIMER		BIT(6)
+#endif
+
+/* Primary proc-based execution controls */
+#ifndef CPU_BASED_HLT_EXITING
+#define CPU_BASED_HLT_EXITING		BIT(7)
+#endif
+/* The kernel uses CPU_BASED_UNCOND_IO_EXITING (UNCOND not UNCONDITIONAL) */
+#if !defined(CPU_BASED_UNCONDITIONAL_IO) && \
+    !defined(CPU_BASED_UNCOND_IO_EXITING)
+#define CPU_BASED_UNCONDITIONAL_IO	BIT(24)
+#elif defined(CPU_BASED_UNCOND_IO_EXITING) && \
+      !defined(CPU_BASED_UNCONDITIONAL_IO)
+#define CPU_BASED_UNCONDITIONAL_IO	CPU_BASED_UNCOND_IO_EXITING
+#endif
+#ifndef CPU_BASED_USE_MSR_BITMAPS
+#define CPU_BASED_USE_MSR_BITMAPS	BIT(28)
+#endif
+/* The kernel 6.8+ uses CPU_BASED_ACTIVATE_SECONDARY_CONTROLS for bit 31 */
+#if !defined(CPU_BASED_SECONDARY_ENABLE) && \
+    !defined(CPU_BASED_ACTIVATE_SECONDARY_CONTROLS)
+#define CPU_BASED_SECONDARY_ENABLE	BIT(31)
+#elif defined(CPU_BASED_ACTIVATE_SECONDARY_CONTROLS) && \
+      !defined(CPU_BASED_SECONDARY_ENABLE)
+#define CPU_BASED_SECONDARY_ENABLE	CPU_BASED_ACTIVATE_SECONDARY_CONTROLS
+#endif
+
+/* Secondary proc-based execution controls */
+#ifndef SECONDARY_EXEC_ENABLE_EPT
+#define SECONDARY_EXEC_ENABLE_EPT	BIT(1)
+#endif
+#ifndef SECONDARY_EXEC_ENABLE_VPID
+#define SECONDARY_EXEC_ENABLE_VPID	BIT(5)
+#endif
+
+/* VM-exit controls */
+#ifndef VM_EXIT_HOST_ADDR_SPACE_SIZE
+#define VM_EXIT_HOST_ADDR_SPACE_SIZE	BIT(9)
+#endif
+/* The kernel uses VM_EXIT_ACK_INTR_ON_EXIT (note: INTR not INT) */
+#if !defined(VM_EXIT_ACK_INT_ON_EXIT) && !defined(VM_EXIT_ACK_INTR_ON_EXIT)
+#define VM_EXIT_ACK_INT_ON_EXIT		BIT(15)
+#elif defined(VM_EXIT_ACK_INTR_ON_EXIT) && !defined(VM_EXIT_ACK_INT_ON_EXIT)
+#define VM_EXIT_ACK_INT_ON_EXIT		VM_EXIT_ACK_INTR_ON_EXIT
+#endif
+#ifndef VM_EXIT_SAVE_IA32_PAT
+#define VM_EXIT_SAVE_IA32_PAT		BIT(18)
+#endif
+#ifndef VM_EXIT_LOAD_IA32_PAT
+#define VM_EXIT_LOAD_IA32_PAT		BIT(19)
+#endif
+#ifndef VM_EXIT_SAVE_IA32_EFER
+#define VM_EXIT_SAVE_IA32_EFER		BIT(20)
+#endif
+#ifndef VM_EXIT_LOAD_IA32_EFER
+#define VM_EXIT_LOAD_IA32_EFER		BIT(21)
+#endif
+
+/* VM-entry controls */
+#ifndef VM_ENTRY_IA32E_MODE
+#define VM_ENTRY_IA32E_MODE		BIT(9)
+#endif
+#ifndef VM_ENTRY_LOAD_IA32_PAT
+#define VM_ENTRY_LOAD_IA32_PAT		BIT(14)
+#endif
+#ifndef VM_ENTRY_LOAD_IA32_EFER
+#define VM_ENTRY_LOAD_IA32_EFER		BIT(15)
+#endif
+
+/* Segment access rights: unusable bit */
+#ifndef VMX_SEGMENT_AR_UNUSABLE
+#define VMX_SEGMENT_AR_UNUSABLE		BIT(16)
+#endif
+
+/* ------------------------------------------------------------------
+ * EPT constants
+ * ------------------------------------------------------------------ */
+#define EPT_PTE_READ			(1ULL << 0)
+#define EPT_PTE_WRITE			(1ULL << 1)
+#define EPT_PTE_EXEC			(1ULL << 2)
+#define EPT_PTE_MEMTYPE_WB		(6ULL << 3)
+#define EPT_PTE_PS			(1ULL << 7)  /* 2MB large page */
+
+#define EPTP_MEMTYPE_WB			(6ULL << 0)
+#define EPTP_PAGEWALK_4			(3ULL << 3)  /* 4-level walk */
+
+/* Guest physical address of the trivial guest code */
+#define GUEST_CODE_GPA			0x10000ULL
+#define GUEST_STACK_GPA			0x11000ULL
+#define GUEST_DATA_GPA			0x12000ULL
+#define GUEST_PML4_GPA			0x13000ULL
+#define GUEST_PDPT_GPA			0x14000ULL
+#define GUEST_PD_GPA			0x15000ULL
+
+/* ------------------------------------------------------------------
+ * Guest register file (saved/restored around VM entry/exit)
+ *
+ * RSP and RIP are kept in the VMCS guest-state area, not here.
+ * All 15 other GPRs are stored in this struct.
+ * ------------------------------------------------------------------ */
+struct phantom_guest_regs {
+	u64 rax;
+	u64 rbx;
+	u64 rcx;
+	u64 rdx;
+	u64 rsi;
+	u64 rdi;
+	u64 rbp;
+	u64 r8;
+	u64 r9;
+	u64 r10;
+	u64 r11;
+	u64 r12;
+	u64 r13;
+	u64 r14;
+	u64 r15;
+};
 
 /* ------------------------------------------------------------------
  * Per-CPU VMX state
  *
- * One instance per physical CPU designated for fuzzing.  Allocated
- * at module load and kept alive until module unload.
+ * Extended from task 1.1 to include VMCS guest execution state,
+ * EPT page table pages, MSR bitmap, and guest memory pages.
  * ------------------------------------------------------------------ */
 struct phantom_vmx_cpu_state {
-	struct page	*vmxon_region;	/* 4KB VMXON region, NUMA-local      */
-	struct page	*vmcs_region;	/* 4KB VMCS region, NUMA-local       */
-	bool		 vmx_active;	/* true after successful VMXON       */
-	unsigned long	 saved_cr4;	/* CR4 value before we set VMXE      */
-	int		 cpu;		/* physical CPU index                */
-	int		 init_err;	/* error code if VMXON/alloc failed  */
+	/* Task 1.1 fields */
+	struct page		*vmxon_region;
+	struct page		*vmcs_region;
+	bool			 vmx_active;
+	unsigned long		 saved_cr4;
+	int			 cpu;
+	int			 init_err;
+
+	/* Task 1.2: MSR bitmap (4KB zero page — no MSR exits) */
+	struct page		*msr_bitmap;
+
+	/* Task 1.2: EPT page-table pages (4 levels) */
+	struct page		*ept_pml4;
+	struct page		*ept_pdpt;
+	struct page		*ept_pd;
+	struct page		*ept_pt;
+
+	/* Task 1.2: Guest memory pages */
+	struct page		*guest_code_page;
+	struct page		*guest_stack_page;
+	struct page		*guest_data_page;
+	struct page		*guest_pml4_page;  /* guest CR3 page */
+	struct page		*guest_pdpt_page;
+	struct page		*guest_pd_page;
+
+	/* Task 1.2: Guest execution state */
+	struct phantom_guest_regs guest_regs;
+	u32			 exit_reason;
+	u64			 exit_qualification;
+	u32			 vm_instr_error;
+	int			 run_result;
+	u64			 run_result_data;   /* checksum from guest */
+	bool			 launched;
+	bool			 pages_allocated;   /* pages alloc'd (process ctx) */
+	bool			 vmcs_configured;   /* VMCS fields written (CPU ctx) */
+	u64			 host_rsp;          /* saved by trampoline */
+
+	/*
+	 * Dedicated vCPU kernel thread (pinned to this CPU).
+	 * The ioctl hands work to this thread via completions to avoid
+	 * the IPI mechanism which breaks KVM nested VMX state on re-entry.
+	 *
+	 * Thread stop protocol (IPI-free two-phase approach):
+	 *   1. WRITE_ONCE(vcpu_stop_requested, true) — no IPI.
+	 *   2. complete(&vcpu_run_start) — safe (only needed for Phase 1,
+	 *      where VMLAUNCH hasn't happened so the IPI is harmless).
+	 *   3. wait_for_completion(&vcpu_stopped) — thread signals this
+	 *      after VMXOFF completes (in do_stop).
+	 *   4. kthread_stop() — reclaims thread resources; by this point
+	 *      the thread is post-VMXOFF so any IPI is safe.
+	 *   phantom_vmxoff_all() skips the SMP call for this CPU because
+	 *   vmx_active == false (VMXOFF already ran in thread).
+	 *
+	 * Init protocol (IPI-free VMXON + VMCS alloc):
+	 *   After the first load's VMLAUNCH+VMXOFF cycle, KVM L0's nested
+	 *   VMX tracking for this CPU is in a post-nested-exit state.  Any
+	 *   cross-CPU IPI (smp_call_function_single) to this CPU — even
+	 *   after VMXOFF — causes a triple fault in the guest kernel.
+	 *
+	 *   Solution: the vCPU thread performs VMXON, VMCS alloc, and
+	 *   VMPTRLD locally on its own CPU at startup, then signals
+	 *   vcpu_init_done.  Module init waits on vcpu_init_done instead
+	 *   of using smp_call_function_single.  Zero cross-CPU IPIs during
+	 *   the per-CPU VMX init path.
+	 */
+	struct task_struct	*vcpu_thread;
+	struct completion	 vcpu_init_done;  /* thread → init: VMXON done */
+	int			 vcpu_init_result; /* 0 = success, else errno */
+	u32			 vmx_revision_id;  /* VMX_BASIC revision for VMXON */
+	struct completion	 vcpu_run_start;  /* ioctl → thread: 1st run */
+	struct completion	 vcpu_run_done;   /* thread → ioctl: done */
+	int			 vcpu_run_request; /* 1=run, 2=reset, 0=exit */
+	int			 vcpu_run_result;  /* thread's run result */
+	/*
+	 * vcpu_work_ready: IPI-free wakeup for runs after the first VMLAUNCH.
+	 *
+	 * After the first VMLAUNCH, KVM L0's nested VMX tracking is "dirty"
+	 * even after the guest exits.  Any RESCHEDULE IPI (e.g., from
+	 * complete()) sent to CPU0 while this state is active causes a triple
+	 * fault.  We avoid IPIs entirely by busy-waiting on this flag.
+	 *
+	 * Set by the ioctl handler (no IPI) after the first VMLAUNCH.
+	 * Read by the vCPU thread via cpu_relax() busy-wait.
+	 * Protected by smp_store_release / smp_load_acquire barriers.
+	 */
+	bool			 vcpu_work_ready;  /* set by ioctl (no IPI) */
+
+	/*
+	 * IPI-free stop protocol for post-VMLAUNCH teardown.
+	 *
+	 * After the first VMLAUNCH, KVM L0's nested VMX state is "dirty" for
+	 * this CPU.  kthread_stop() calls wake_up_process() which may send a
+	 * RESCHEDULE IPI to this CPU even when the thread appears TASK_RUNNING
+	 * (e.g., if the thread was briefly preempted by the scheduler between
+	 * cond_resched() calls).  Such an IPI causes a triple fault in the
+	 * nested KVM guest.
+	 *
+	 * Fix: phantom_vcpu_thread_stop() uses a two-phase stop:
+	 *   1. Set vcpu_stop_requested = true (plain memory write, no IPI).
+	 *   2. Wait on vcpu_stopped (thread signals this after VMXOFF).
+	 *   3. Call kthread_stop() — thread has already exited VMX-root mode
+	 *      and either returned or is about to; any IPI at this point is
+	 *      harmless (VMX is inactive, no triple fault risk).
+	 *
+	 * vcpu_stop_requested: set by phantom_vcpu_thread_stop(), read by the
+	 *   vCPU thread in both Phase 1 and Phase 2.
+	 * vcpu_stopped: signaled by the vCPU thread after do_stop (VMXOFF done),
+	 *   before the thread function returns.
+	 */
+	bool			 vcpu_stop_requested; /* flag: request stop (no IPI) */
+	struct completion	 vcpu_stopped;        /* thread → stop: VMX done */
 };
 
 DECLARE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);
 
 /* ------------------------------------------------------------------
  * VMXON region layout (Intel SDM Vol. 3C §24.2)
- *
- * Only the first 4 bytes are software-defined; the rest are reserved
- * for processor use.
  * ------------------------------------------------------------------ */
 struct phantom_vmxon_region {
-	__le32	revision_id;	/* IA32_VMX_BASIC[30:0], bit31 must be 0 */
+	__le32	revision_id;
 	u8	reserved[4092];
 } __packed;
 
 /* ------------------------------------------------------------------
- * Feature detection results (populated once at module init)
+ * Feature detection results
  * ------------------------------------------------------------------ */
 struct phantom_cpu_features {
-	bool	vtx;		/* CPUID.1:ECX[5] — VT-x present             */
-	bool	ept;		/* Secondary controls EPT bit                 */
-	bool	ept_4lvl;	/* EPT VPID CAP: 4-level walk                 */
-	bool	ept_wb;		/* EPT VPID CAP: WB memory type               */
-	bool	ept_2mb;	/* EPT VPID CAP: 2MB pages                    */
-	bool	ept_ad;		/* EPT VPID CAP: A/D bits                     */
-	bool	intel_pt;	/* CPUID.7:EBX[25] — Intel PT                 */
-	bool	xsave;		/* CPUID.1:ECX[26] — XSAVE/XRSTOR            */
-	bool	true_ctls;	/* VMX_BASIC[55]: TRUE ctrl MSRs present      */
-	u32	vmx_revision;	/* Revision ID for VMXON/VMCS regions         */
+	bool	vtx;
+	bool	ept;
+	bool	ept_4lvl;
+	bool	ept_wb;
+	bool	ept_2mb;
+	bool	ept_ad;
+	bool	intel_pt;
+	bool	xsave;
+	bool	true_ctls;
+	u32	vmx_revision;
 };
+
+/* ------------------------------------------------------------------
+ * VMCS read/write helpers (static inline — used in VMX-root context)
+ *
+ * VMWRITE takes (field, value); VMREAD takes (field) and returns value.
+ * Both modify RFLAGS; we ignore the flags here — use the dedicated
+ * VMLAUNCH/VMRESUME wrappers for error checking.
+ * ------------------------------------------------------------------ */
+
+static inline void phantom_vmcs_write64(u32 field, u64 val)
+{
+	asm volatile("vmwrite %1, %0"
+		     :: "r"((u64)field), "rm"(val)
+		     : "cc");
+}
+
+static inline void phantom_vmcs_write32(u32 field, u32 val)
+{
+	phantom_vmcs_write64(field, (u64)val);
+}
+
+static inline void phantom_vmcs_write16(u32 field, u16 val)
+{
+	phantom_vmcs_write64(field, (u64)val);
+}
+
+static inline u64 phantom_vmcs_read64(u32 field)
+{
+	u64 val;
+
+	asm volatile("vmread %1, %0"
+		     : "=rm"(val)
+		     : "r"((u64)field)
+		     : "cc");
+	return val;
+}
+
+static inline u32 phantom_vmcs_read32(u32 field)
+{
+	return (u32)phantom_vmcs_read64(field);
+}
+
+static inline u16 phantom_vmcs_read16(u32 field)
+{
+	return (u16)phantom_vmcs_read64(field);
+}
 
 /* ------------------------------------------------------------------
  * Public API
  * ------------------------------------------------------------------ */
 
-/**
- * phantom_vmx_check_cpu_features - Detect and validate CPU VMX capabilities.
- * @feat: Output structure populated on success.
- *
- * Checks VT-x, EPT (4-level, WB, 2MB, A/D), Intel PT, and XSAVE.
- * EPT with 4-level walk and WB memory type are hard requirements.
- * Intel PT and XSAVE are advisory for Phase 1.1 (logged, not fatal).
- *
- * Returns 0 on success, -ENODEV if a hard requirement is missing.
- */
 int phantom_vmx_check_cpu_features(struct phantom_cpu_features *feat);
 
-/**
- * phantom_vmxon_all - Execute VMXON on every CPU in cpumask.
- * @cpumask: Set of physical CPUs to enter VMX-root on.
- *
- * Uses smp_call_function_single() for each CPU.  Partial failure
- * triggers rollback: VMXOFF is executed on all previously-entered
- * cores before returning error.
- *
- * Returns 0 on success, negative errno on failure.
- */
 int phantom_vmxon_all(const struct cpumask *cpumask);
-
-/**
- * phantom_vmxoff_all - Execute VMXOFF on every active VMX-root CPU.
- * @cpumask: Set of physical CPUs to exit VMX-root on.
- *
- * Safe to call on CPUs where VMXON was never attempted or failed.
- * Restores CR4.VMXE to the saved value.
- */
 void phantom_vmxoff_all(const struct cpumask *cpumask);
 
-/**
- * phantom_vmcs_alloc_all - Allocate and initialise VMCS on each CPU.
- * @cpumask: Target CPU set.
- *
- * Allocates one 4KB VMCS region per CPU (NUMA-local), sets revision ID,
- * executes VMCLEAR and VMPTRLD to make the VMCS current on each core.
- *
- * Must be called after phantom_vmxon_all() succeeds.
- * Returns 0 on success, negative errno on failure.
- */
 int phantom_vmcs_alloc_all(const struct cpumask *cpumask);
+void phantom_vmcs_free_all(const struct cpumask *cpumask);
+
+/* Task 1.2: VMCS population and guest execution */
 
 /**
- * phantom_vmcs_free_all - Free VMCS regions and execute VMCLEAR.
- * @cpumask: Target CPU set.
+ * phantom_vmcs_setup - Allocate and initialise all guest/EPT pages.
+ *
+ * MUST be called from process context (GFP_KERNEL allocation).
+ * Safe to call multiple times — idempotent once pages_allocated is set.
+ * Does NOT write any VMCS fields; call phantom_vmcs_configure_fields()
+ * on the target CPU afterwards.
  */
-void phantom_vmcs_free_all(const struct cpumask *cpumask);
+int phantom_vmcs_setup(struct phantom_vmx_cpu_state *state);
+
+/**
+ * phantom_vmcs_configure_fields - Write VMCS control and state fields.
+ *
+ * MUST be called on the target CPU (VMCS must be current via VMPTRLD).
+ * Safe in interrupt context — no sleeping allocations.
+ * Idempotent once vmcs_configured is set.
+ */
+int phantom_vmcs_configure_fields(struct phantom_vmx_cpu_state *state);
+
+void phantom_vmcs_teardown(struct phantom_vmx_cpu_state *state);
+
+/**
+ * phantom_run_guest - Enter guest and run until VM exit.
+ * @state: Per-CPU VMX state with VMCS configured.
+ *
+ * Runs on the target CPU (caller must ensure this via the vCPU thread).
+ * Returns 0 on expected exit (VMCALL result available),
+ * negative errno on VM-entry failure.
+ */
+int phantom_run_guest(struct phantom_vmx_cpu_state *state);
+
+/**
+ * phantom_vcpu_thread_start - Start the per-CPU vCPU kernel thread.
+ * @state: Per-CPU VMX state for the target CPU.
+ *
+ * Creates a kernel thread pinned to state->cpu.  The thread waits for
+ * work signals via vcpu_run_start completion and executes guest runs.
+ * Returns 0 on success, negative errno on failure.
+ */
+int phantom_vcpu_thread_start(struct phantom_vmx_cpu_state *state);
+
+/**
+ * phantom_vcpu_thread_stop - Stop and destroy the per-CPU vCPU thread.
+ * @state: Per-CPU VMX state for the target CPU.
+ *
+ * Uses a two-phase IPI-free stop protocol:
+ *   1. Sets vcpu_stop_requested (no IPI).
+ *   2. Wakes Phase-1 sleeper via complete() if needed (safe — pre-VMLAUNCH).
+ *   3. Waits on vcpu_stopped (thread signals after VMXOFF).
+ *   4. Calls kthread_stop() for resource cleanup (safe — post-VMXOFF).
+ */
+void phantom_vcpu_thread_stop(struct phantom_vmx_cpu_state *state);
+
+/**
+ * phantom_vcpu_thread_wait_init - Wait for the vCPU thread's per-CPU init.
+ * @state: Per-CPU VMX state for the target CPU.
+ *
+ * Blocks until the vCPU thread has completed VMXON + VMCS alloc + VMPTRLD
+ * on its own CPU (no cross-CPU IPI involved).
+ *
+ * Returns 0 on success, negative errno if per-CPU init failed.
+ */
+int phantom_vcpu_thread_wait_init(struct phantom_vmx_cpu_state *state);
+
+/**
+ * phantom_vm_exit_return - VM exit landing pad (HOST_RIP target).
+ *
+ * This function is jumped to (not called) by the CPU hardware on VM exit.
+ * It saves guest GPRs, restores host callee-saved registers, and returns
+ * 0 to the caller of phantom_vmlaunch_trampoline.
+ *
+ * Declared __visible to prevent the compiler from removing it.
+ */
+__visible void phantom_vm_exit_return(void);
 
 #endif /* PHANTOM_VMX_CORE_H */

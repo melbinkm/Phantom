@@ -123,4 +123,9 @@ int phantom_parse_cores_param(cpumask_var_t mask);
  */
 void phantom_kvm_intel_check(const struct cpumask *cpumask);
 
+/*
+ * phantom_run_args — argument struct for PHANTOM_IOCTL_RUN_GUEST.
+ * Defined in interface.h; aliased here for convenience.
+ */
+
 #endif /* PHANTOM_H */
