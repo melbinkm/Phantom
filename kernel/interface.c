@@ -914,6 +914,49 @@ static const u8 phantom_hypercall_harness_bin[] = {
 };
 
 /* ------------------------------------------------------------------
+ * Guest binary 10 (test_id=9): deliberate panic for crash detection
+ *
+ * Issues ACQUIRE (0x11c) to take snapshot, then immediately issues
+ * PANIC (0x11e) with crash address 0xDEADBEEF.  Used by test_crash.c
+ * to verify that the host correctly detects and records the crash.
+ *
+ * Assembly:
+ *   mov $0x11c, %rax    ; HYPERCALL_KAFL_ACQUIRE
+ *   xor %rcx, %rcx
+ *   vmcall
+ *   mov $0x11e, %rax    ; HYPERCALL_KAFL_PANIC
+ *   mov $0xDEADBEEF, %rcx
+ *   vmcall
+ * .Lhang:
+ *   jmp .Lhang          ; never reached after PANIC
+ *
+ * Byte layout:
+ *   [0..9]   mov $0x11c, %rax  (REX.W B8 + 8-byte imm)
+ *   [10..12] xor %rcx, %rcx   (REX.W 31 C9)
+ *   [13..15] vmcall            (0F 01 C1)
+ *   [16..25] mov $0x11e, %rax  (REX.W B8 + 8-byte imm)
+ *   [26..35] mov $0xDEADBEEF, %rcx (REX.W B9 + 8-byte imm)
+ *   [36..38] vmcall            (0F 01 C1)
+ *   [39..40] jmp .Lhang  rel=-2 (EB FE)
+ * ------------------------------------------------------------------ */
+static const u8 phantom_panic_guest_bin[] = {
+	/* [0..9] mov $0x11c, %rax */
+	0x48, 0xB8, 0x1C, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	/* [10..12] xor %rcx, %rcx */
+	0x48, 0x31, 0xC9,
+	/* [13..15] vmcall */
+	0x0F, 0x01, 0xC1,
+	/* [16..25] mov $0x11e, %rax */
+	0x48, 0xB8, 0x1E, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	/* [26..35] mov $0xDEADBEEF, %rcx */
+	0x48, 0xB9, 0xEF, 0xBE, 0xAD, 0xDE, 0x00, 0x00, 0x00, 0x00,
+	/* [36..38] vmcall */
+	0x0F, 0x01, 0xC1,
+	/* [39..40] jmp .Lhang  rel=-2 (never reached) */
+	0xEB, 0xFE,
+};
+
+/* ------------------------------------------------------------------
  * File operations
  * ------------------------------------------------------------------ */
 
@@ -976,9 +1019,10 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 *   5 = 2MB split + CoW test (write to GPA 0x100000)
 		 *   6 = mixed 2MB + 4KB workload (10 writes, both regions)
 		 *   7 = snapshot/restore XMM test (task 1.6)
+		 *   9 = deliberate panic (ACQUIRE + PANIC(0xDEADBEEF))
 		 */
 		test_id = args.reserved;
-		if (test_id > 8) {
+		if (test_id > 9) {
 			pr_err("phantom: RUN_GUEST: invalid test_id=%u\n",
 			       test_id);
 			ret = -EINVAL;
@@ -1039,6 +1083,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 * test_id=5: 2MB split + CoW (write to GPA 0x100000)
 		 * test_id=6: mixed 2MB + 4KB workload (10 writes)
 		 * test_id=7: snapshot/restore XMM test (task 1.6)
+		 * test_id=9: deliberate panic (ACQUIRE + PANIC(0xDEADBEEF))
 		 *
 		 * Note for test_id=7: the binary has TWO phases.  On the
 		 * first run it reaches the VMCALL(1,0xAA) and exits.  The
@@ -1183,7 +1228,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 				       phantom_snapshot_xmm_guest_bin,
 				       sizeof(phantom_snapshot_xmm_guest_bin));
 			}
-		} else {
+		} else if (test_id == 8) {
 			/*
 			 * test_id=8: kAFL/Nyx ABI hypercall harness.
 			 *
@@ -1205,6 +1250,22 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 				       phantom_hypercall_harness_bin,
 				       sizeof(phantom_hypercall_harness_bin));
 			}
+		} else {
+			/*
+			 * test_id=9: deliberate panic test.
+			 *
+			 * Issues ACQUIRE (takes snapshot) then immediately
+			 * issues PANIC(0xDEADBEEF).  Used by test_crash.c to
+			 * verify crash detection: the hypercall handler must
+			 * set run_result=PHANTOM_RESULT_CRASH and record
+			 * crash_addr=0xDEADBEEF.
+			 *
+			 * Load binary fresh each run (no snapshot resume
+			 * needed — PANIC always terminates the iteration).
+			 */
+			memcpy(page_address(state->guest_code_page),
+			       phantom_panic_guest_bin,
+			       sizeof(phantom_panic_guest_bin));
 		}
 
 		/* Save test_id for the vCPU thread */
@@ -1238,6 +1299,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 * snapshot RIP rather than being reset to GUEST_CODE_GPA.
 		 *   test_id=7: snap_taken after first SNAPSHOT_CREATE.
 		 *   test_id=8: snap_acquired after first ACQUIRE hypercall.
+		 *   test_id=9: always false — PANIC terminates each run.
 		 */
 		state->snap_continue = ((test_id == 7 && state->snap_taken) ||
 					 (test_id == 8 && state->snap_acquired));
