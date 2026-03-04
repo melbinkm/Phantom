@@ -133,18 +133,22 @@ else
 	pass "no kernel oops in dmesg"
 fi
 
-# ---- Test 7: dmesg shows EPT violation log -------------------------
+# ---- Test 7: trace shows EPT violation log -------------------------
+#
+# EPT violation exits use trace_printk() (hot path), not pr_info.
+# Check the ftrace ring buffer, not dmesg.
 
 log "--- Test 7: dmesg shows EPT violation diagnostic ---"
-if dmesg | grep -q "EPT VIOLATION.*RESERVED"; then
+if [ -r "$TRACE" ] && grep -q "EPT_VIOLATION.*RESERVED" "$TRACE" 2>/dev/null; then
 	pass "dmesg shows EPT violation with RESERVED classification"
+elif [ -r "$TRACE" ] && grep -q "EPT_VIOLATION" "$TRACE" 2>/dev/null; then
+	pass "dmesg shows EPT VIOLATION (absent-GPA test ran)"
+elif dmesg | grep -q "EPT VIOLATION.*RESERVED"; then
+	pass "dmesg shows EPT violation with RESERVED classification"
+elif dmesg | grep -q "EPT VIOLATION"; then
+	pass "dmesg shows EPT VIOLATION (absent-GPA test ran)"
 else
-	log "  EPT violation message may not be present yet or classification differs"
-	if dmesg | grep -q "EPT VIOLATION"; then
-		pass "dmesg shows EPT VIOLATION (absent-GPA test ran)"
-	else
-		fail "no EPT VIOLATION in dmesg (absent-GPA test may not have run)"
-	fi
+	fail "no EPT VIOLATION in trace or dmesg (absent-GPA test may not have run)"
 fi
 
 # ---- Test 8: rmmod unloads cleanly ---------------------------------
