@@ -48,6 +48,7 @@
 #include <linux/gfp.h>
 #include <linux/mman.h>
 #include <linux/version.h>
+#include <linux/eventfd.h>
 
 #include "phantom.h"
 #include "interface.h"
@@ -58,6 +59,7 @@
 #include "hypercall.h"
 #include "debug.h"
 #include "compat.h"
+#include "pt_config.h"
 
 /* ------------------------------------------------------------------
  * Guest binary 1 (test_id=0): R/W test
@@ -1711,6 +1713,102 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		break;
 	}
 
+	case PHANTOM_IOCTL_PT_GET_EVENTFD: {
+		/*
+		 * PT_GET_EVENTFD — create an eventfd for PT iteration
+		 * notification and store a reference in state->pt.eventfd.
+		 *
+		 * After each iteration, phantom_pt_iteration_reset() signals
+		 * the eventfd (writes 1), unblocking userspace epoll/read.
+		 *
+		 * Kernel-internal pattern for creating an eventfd from kernel
+		 * module code (Linux 5.x / 6.x):
+		 *   1. eventfd_ctx_fdget(fd) — but we need an fd first.
+		 *   2. Use eventfd_file_create() + get_unused_fd_flags() to
+		 *      create the fd in the current process's file table.
+		 *
+		 * eventfd_file_create() is not exported; the standard
+		 * kernel-space approach is to use do_eventfd() (available in
+		 * recent kernels) or to use the ksys_eventfd2() wrapper.
+		 *
+		 * On Linux 6.8+, the correct approach is:
+		 *   struct file *f = eventfd_file_create(0, EFD_CLOEXEC);
+		 *   efd = get_unused_fd_flags(O_CLOEXEC);
+		 *   fd_install(efd, f);
+		 *   ctx = eventfd_ctx_fileget(f);
+		 *
+		 * Since eventfd_file_create may not be available as a symbol,
+		 * we use the exported eventfd_ctx_fdget() after creating the
+		 * eventfd via sys_eventfd2 indirectly.
+		 *
+		 * Simplest correct approach: anon_inode_getfd + eventfd_ctx.
+		 * We accept an existing fd from userspace (passed via arg),
+		 * get the ctx, and store it.  Userspace creates the eventfd
+		 * and passes the fd number to this ioctl.
+		 *
+		 * This is the standard KVM approach for irqfd registration.
+		 */
+		struct phantom_vmx_cpu_state *state;
+		struct eventfd_ctx *ctx;
+		int target_cpu = -1;
+		int cpu_iter;
+		int user_fd;
+
+		/*
+		 * arg is the eventfd file descriptor created by userspace
+		 * via eventfd(0, EFD_CLOEXEC).  We get the ctx from it.
+		 */
+		user_fd = (int)arg;
+
+		for_each_cpu(cpu_iter, pdev->vmx_cpumask) {
+			target_cpu = cpu_iter;
+			break;
+		}
+
+		if (target_cpu < 0) {
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+		if (!state->pt.pt_enabled) {
+			pr_err("phantom: PT_GET_EVENTFD: Intel PT not "
+			       "available on CPU%d\n", target_cpu);
+			ret = -EINVAL;
+			break;
+		}
+
+		/*
+		 * Get the eventfd_ctx from the userspace-provided fd.
+		 * eventfd_ctx_fdget() increments the context refcount and
+		 * verifies the fd refers to an eventfd file.
+		 * We hold this reference until pt_teardown or the next
+		 * PT_GET_EVENTFD call.
+		 */
+		ctx = eventfd_ctx_fdget(user_fd);
+		if (IS_ERR(ctx)) {
+			pr_err("phantom: PT_GET_EVENTFD: fd %d is not "
+			       "an eventfd\n", user_fd);
+			ret = PTR_ERR(ctx);
+			break;
+		}
+
+		/* Release any previous eventfd reference */
+		if (state->pt.eventfd) {
+			eventfd_ctx_put(state->pt.eventfd);
+			state->pt.eventfd = NULL;
+		}
+
+		state->pt.eventfd = ctx;
+
+		pr_info("phantom: CPU%d: PT eventfd registered (user_fd=%d)\n",
+			target_cpu, user_fd);
+
+		ret = 0;
+		break;
+	}
+
 	default:
 		ret = -ENOTTY;
 		break;
@@ -1720,20 +1818,70 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 }
 
 /* ------------------------------------------------------------------
- * mmap support — map shared_mem to userspace.
+ * mmap support — map shared_mem and PT ToPA buffers to userspace.
  *
- * Offset 0: struct phantom_shared_mem (payload[64KB] + status + crash).
+ * Three regions are supported, selected by the mmap offset:
  *
- * The shared memory was allocated as a physically contiguous page block
- * by phantom_vmcs_setup() using alloc_pages_node(order).  We use
- * remap_pfn_range() to map it into the VMA.
+ *   PHANTOM_MMAP_SHARED_MEM (0x00000):
+ *     struct phantom_shared_mem (payload[64KB] + status + crash_addr).
+ *     Allocated by phantom_vmcs_setup() as a contiguous page block.
+ *     Userspace writes payload[] before RUN_ITERATION; kernel writes
+ *     status and crash_addr after each iteration.
  *
- * Userspace writes payload[], sets payload_len, then calls RUN_ITERATION.
- * Kernel writes status and crash_addr after each iteration completes.
+ *   PHANTOM_MMAP_TOPA_BUF_A (0x10000):
+ *     PT output buffer slot 0 (PHANTOM_PT_PAGES_PER_SLOT × 4KB).
+ *     Mapped page by page via vm_insert_page().
  *
- * The VMA must fit within the shared_mem allocation.  We reject any
- * mapping that would exceed it.
+ *   PHANTOM_MMAP_TOPA_BUF_B (0x20000):
+ *     PT output buffer slot 1 (same layout as slot 0).
+ *
+ * The mmap offset (vma->vm_pgoff << PAGE_SHIFT) must exactly match
+ * one of these constants.  Any other offset returns -EINVAL.
  * ------------------------------------------------------------------ */
+
+static int phantom_mmap_topa(struct vm_area_struct *vma,
+			     struct phantom_pt_state *pt, int slot)
+{
+	unsigned long size = vma->vm_end - vma->vm_start;
+	unsigned long topa_size = (unsigned long)pt->topa_page_count[slot] *
+				  PAGE_SIZE;
+	unsigned long addr = vma->vm_start;
+	int i;
+	int err;
+
+	if (!pt->pt_enabled || !pt->topa_page_count[slot])
+		return -EINVAL;
+
+	if (size > topa_size)
+		return -EINVAL;
+
+	/*
+	 * Map each PT output page individually using vm_insert_page().
+	 * The pages are not necessarily physically contiguous, so we
+	 * cannot use remap_pfn_range() with a single base PFN.
+	 *
+	 * vm_insert_page() requires VM_MIXEDMAP (set before the loop).
+	 * Pages must have page_count >= 1 (they do — freshly allocated).
+	 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP |
+		     VM_MIXEDMAP);
+#else
+	vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP | VM_MIXEDMAP;
+#endif
+
+	for (i = 0; i < pt->topa_page_count[slot] &&
+	     addr < vma->vm_end; i++, addr += PAGE_SIZE) {
+		err = vm_insert_page(vma, addr, pt->topa_pages[slot][i]);
+		if (err) {
+			pr_err("phantom: mmap ToPA slot%d page%d failed: %d\n",
+			       slot, i, err);
+			return err;
+		}
+	}
+
+	return 0;
+}
 
 static int phantom_mmap(struct file *filp, struct vm_area_struct *vma)
 {
@@ -1741,6 +1889,7 @@ static int phantom_mmap(struct file *filp, struct vm_area_struct *vma)
 	struct phantom_vmx_cpu_state *state;
 	int target_cpu = -1;
 	int cpu;
+	unsigned long offset;
 	unsigned long size;
 	unsigned long pfn;
 
@@ -1758,30 +1907,57 @@ static int phantom_mmap(struct file *filp, struct vm_area_struct *vma)
 
 	state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
 
-	if (!state->pages_allocated || !state->shared_mem_pages)
-		return -EINVAL;
-
-	size = vma->vm_end - vma->vm_start;
-	if (size > (PAGE_SIZE << state->shared_mem_order))
+	if (!state->pages_allocated)
 		return -EINVAL;
 
 	/*
-	 * Mark the VMA as shared (IO-mapped) so the kernel does not try to
-	 * swap it out.  Mark as not-dumpable (no core dumps of fuzzer state).
-	 *
-	 * Linux 6.3+ requires vm_flags_set() instead of direct assignment.
-	 * Earlier kernels use direct assignment.
+	 * Use the mmap page offset to select which region to map.
+	 * vma->vm_pgoff is in pages; convert to bytes for comparison.
 	 */
+	offset = vma->vm_pgoff << PAGE_SHIFT;
+	size   = vma->vm_end - vma->vm_start;
+
+	if (offset == PHANTOM_MMAP_SHARED_MEM) {
+		/*
+		 * Map the shared memory region (payload + status + crash).
+		 * Uses remap_pfn_range() — contiguous physical allocation.
+		 */
+		if (!state->shared_mem_pages)
+			return -EINVAL;
+
+		if (size > (PAGE_SIZE << state->shared_mem_order))
+			return -EINVAL;
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-	vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
+		vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
 #else
-	vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
+		vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
 #endif
 
-	pfn = page_to_pfn(state->shared_mem_pages);
+		pfn = page_to_pfn(state->shared_mem_pages);
+		return remap_pfn_range(vma, vma->vm_start, pfn, size,
+				       vma->vm_page_prot);
 
-	return remap_pfn_range(vma, vma->vm_start, pfn, size,
-			       vma->vm_page_prot);
+	} else if (offset == PHANTOM_MMAP_TOPA_BUF_A) {
+		/*
+		 * Map PT output buffer slot 0 (double-buffer buffer A).
+		 * Pages are mapped individually via vm_insert_page().
+		 */
+		return phantom_mmap_topa(vma, &state->pt, 0);
+
+	} else if (offset == PHANTOM_MMAP_TOPA_BUF_B) {
+		/*
+		 * Map PT output buffer slot 1 (double-buffer buffer B).
+		 */
+		return phantom_mmap_topa(vma, &state->pt, 1);
+
+	} else {
+		pr_err("phantom: mmap: unknown offset 0x%lx "
+		       "(expected 0x%lx, 0x%lx, or 0x%lx)\n",
+		       offset, PHANTOM_MMAP_SHARED_MEM,
+		       PHANTOM_MMAP_TOPA_BUF_A, PHANTOM_MMAP_TOPA_BUF_B);
+		return -EINVAL;
+	}
 }
 
 static const struct file_operations phantom_fops = {
