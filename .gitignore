@@ -7,3 +7,4 @@ CLAUDE.md
 .tmp_versions/
 Module.symvers
 modules.order
+__pycache__/
