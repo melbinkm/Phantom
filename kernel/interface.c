@@ -1809,6 +1809,313 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		break;
 	}
 
+	/* ----------------------------------------------------------
+	 * Task 2.3: Production ioctl API
+	 * ---------------------------------------------------------- */
+
+	case PHANTOM_CREATE_VM: {
+		/*
+		 * PHANTOM_CREATE_VM — initialise a VM instance.
+		 *
+		 * Phantom is currently single-instance (one VM per module
+		 * load).  Validate pinned_cpu, call vmcs_setup(), return
+		 * instance_id=0.
+		 */
+		struct phantom_create_args args;
+		struct phantom_vmx_cpu_state *state;
+		int target_cpu = -1;
+		int cpu;
+
+		if (copy_from_user(&args, (void __user *)arg, sizeof(args))) {
+			ret = -EFAULT;
+			break;
+		}
+
+		/* Find the requested CPU in the VMX cpumask */
+		for_each_cpu(cpu, pdev->vmx_cpumask) {
+			if (args.pinned_cpu == 0 || (u32)cpu == args.pinned_cpu) {
+				target_cpu = cpu;
+				break;
+			}
+		}
+
+		if (target_cpu < 0) {
+			/* pinned_cpu not in VMX cpumask — fall back to first */
+			for_each_cpu(cpu, pdev->vmx_cpumask) {
+				target_cpu = cpu;
+				break;
+			}
+		}
+
+		if (target_cpu < 0) {
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+		if (!state->vcpu_thread) {
+			pr_err("phantom: CREATE_VM: vCPU thread not running\n");
+			ret = -ENXIO;
+			break;
+		}
+
+		ret = phantom_vmcs_setup(state);
+		if (ret) {
+			pr_err("phantom: CREATE_VM: vmcs_setup failed: %ld\n",
+			       ret);
+			break;
+		}
+
+		args.instance_id = 0;
+		if (copy_to_user((void __user *)arg, &args, sizeof(args)))
+			ret = -EFAULT;
+		break;
+	}
+
+	case PHANTOM_LOAD_TARGET: {
+		/*
+		 * PHANTOM_LOAD_TARGET — copy binary from userspace into
+		 * the payload shared-memory buffer at the given GPA offset.
+		 *
+		 * For the current single-instance design this writes into
+		 * the shared_mem payload area.  Userspace is expected to
+		 * call PHANTOM_RUN_ITERATION immediately after.
+		 */
+		struct phantom_load_args args;
+		struct phantom_vmx_cpu_state *state;
+		struct phantom_shared_mem *sm;
+		int target_cpu = -1;
+		int cpu;
+
+		if (copy_from_user(&args, (void __user *)arg, sizeof(args))) {
+			ret = -EFAULT;
+			break;
+		}
+
+		if (args.size > PHANTOM_PAYLOAD_MAX) {
+			ret = -EINVAL;
+			break;
+		}
+
+		for_each_cpu(cpu, pdev->vmx_cpumask) {
+			target_cpu = cpu;
+			break;
+		}
+
+		if (target_cpu < 0) {
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+		if (!state->shared_mem) {
+			pr_err("phantom: LOAD_TARGET: shared_mem not allocated "
+			       "(call CREATE_VM first)\n");
+			ret = -ENXIO;
+			break;
+		}
+
+		sm = (struct phantom_shared_mem *)state->shared_mem;
+
+		if (copy_from_user(sm->payload,
+				   (void __user *)(uintptr_t)args.userspace_ptr,
+				   (size_t)args.size)) {
+			ret = -EFAULT;
+			break;
+		}
+
+		sm->payload_len = (u32)args.size;
+		break;
+	}
+
+	case PHANTOM_SET_SNAPSHOT: {
+		/*
+		 * PHANTOM_SET_SNAPSHOT — alias for PHANTOM_IOCTL_SNAPSHOT_CREATE.
+		 *
+		 * Captures current guest state as the snapshot point and
+		 * marks all RAM EPT pages read-only for CoW protection.
+		 * Must be called after at least one VMLAUNCH (RUN_GUEST
+		 * with test_id=8 or kAFL ACQUIRE hypercall).
+		 */
+		int target_cpu = -1;
+		struct phantom_vmx_cpu_state *state;
+		int cpu;
+
+		for_each_cpu(cpu, pdev->vmx_cpumask) {
+			target_cpu = cpu;
+			break;
+		}
+
+		if (target_cpu < 0) {
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+		if (!state->pages_allocated || !state->vmcs_configured) {
+			pr_err("phantom: SET_SNAPSHOT: not ready "
+			       "(pages=%d vmcs=%d)\n",
+			       state->pages_allocated,
+			       state->vmcs_configured);
+			ret = -EINVAL;
+			break;
+		}
+
+		if (!state->vcpu_thread) {
+			ret = -ENXIO;
+			break;
+		}
+
+		state->vcpu_run_request = 4;
+		smp_store_release(&state->vcpu_work_ready, true);
+		wait_for_completion(&state->vcpu_run_done);
+
+		if (state->vcpu_run_result < 0) {
+			ret = state->vcpu_run_result;
+		} else {
+			state->snap_taken = true;
+			pr_info("phantom: CPU%d: SET_SNAPSHOT done "
+				"(rip=0x%llx)\n",
+				target_cpu, state->snap.rip);
+		}
+		break;
+	}
+
+	case PHANTOM_RUN_ITERATION: {
+		/*
+		 * PHANTOM_RUN_ITERATION (new API) — run one fuzzing iteration.
+		 *
+		 * Accepts a struct phantom_run_args2 with an explicit
+		 * payload pointer and size.  Copies payload into shared_mem,
+		 * then runs one iteration via vcpu_run_request=6.
+		 */
+		struct phantom_run_args2 args2;
+		struct phantom_vmx_cpu_state *state;
+		struct phantom_shared_mem *sm;
+		int target_cpu = -1;
+		int cpu;
+
+		if (copy_from_user(&args2, (void __user *)arg, sizeof(args2))) {
+			ret = -EFAULT;
+			break;
+		}
+
+		if (args2.payload_size > PHANTOM_PAYLOAD_MAX) {
+			ret = -EINVAL;
+			break;
+		}
+
+		for_each_cpu(cpu, pdev->vmx_cpumask) {
+			target_cpu = cpu;
+			break;
+		}
+
+		if (target_cpu < 0) {
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+		if (!state->pages_allocated) {
+			ret = -ENXIO;
+			break;
+		}
+
+		if (!state->snap_acquired) {
+			ret = -EINVAL;
+			break;
+		}
+
+		if (!state->vcpu_thread) {
+			ret = -ENXIO;
+			break;
+		}
+
+		sm = (struct phantom_shared_mem *)state->shared_mem;
+
+		/* Copy payload from userspace into shared memory */
+		if (args2.payload_size && args2.payload_ptr) {
+			if (copy_from_user(sm->payload,
+				(void __user *)(uintptr_t)args2.payload_ptr,
+				(size_t)args2.payload_size)) {
+				ret = -EFAULT;
+				break;
+			}
+		}
+
+		sm->payload_len = args2.payload_size;
+
+		state->run_result      = PHANTOM_RESULT_OK;
+		state->run_result_data = 0;
+		state->crash_addr      = 0;
+		state->snap_continue   = true;
+		state->vcpu_run_request = 6;
+
+		smp_store_release(&state->vcpu_work_ready, true);
+		wait_for_completion(&state->vcpu_run_done);
+
+		if (state->vcpu_run_result < 0) {
+			ret = state->vcpu_run_result;
+			break;
+		}
+
+		/* Fill out result fields */
+		args2.result      = (u32)state->run_result;
+		args2.exit_reason = state->exit_reason & 0xFFFF;
+		args2.checksum    = state->run_result_data;
+
+		if (copy_to_user((void __user *)arg, &args2, sizeof(args2)))
+			ret = -EFAULT;
+		break;
+	}
+
+	case PHANTOM_GET_STATUS: {
+		/*
+		 * PHANTOM_GET_STATUS — return current instance status.
+		 */
+		struct phantom_status st;
+		struct phantom_vmx_cpu_state *state;
+		int target_cpu = -1;
+		int cpu;
+
+		for_each_cpu(cpu, pdev->vmx_cpumask) {
+			target_cpu = cpu;
+			break;
+		}
+
+		if (target_cpu < 0) {
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+		memset(&st, 0, sizeof(st));
+		st.result      = (u32)state->run_result;
+		st.exit_reason = state->exit_reason & 0xFFFF;
+		st.crash_addr  = state->crash_addr;
+		st.checksum    = state->run_result_data;
+		st.iterations  = 0; /* not tracked yet */
+
+		if (copy_to_user((void __user *)arg, &st, sizeof(st)))
+			ret = -EFAULT;
+		break;
+	}
+
+	case PHANTOM_DESTROY_VM:
+		/*
+		 * PHANTOM_DESTROY_VM — no-op for now.
+		 *
+		 * Cleanup happens when the /dev/phantom fd is closed or
+		 * the module is unloaded.  Return 0 to indicate success.
+		 */
+		ret = 0;
+		break;
+
 	default:
 		ret = -ENOTTY;
 		break;
@@ -1818,25 +2125,32 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 }
 
 /* ------------------------------------------------------------------
- * mmap support — map shared_mem and PT ToPA buffers to userspace.
+ * mmap support — map shared_mem, coverage bitmap, and PT ToPA buffers.
  *
- * Three regions are supported, selected by the mmap offset:
+ * Five regions are supported, selected by the mmap offset:
  *
- *   PHANTOM_MMAP_SHARED_MEM (0x00000):
+ *   PHANTOM_MMAP_PAYLOAD / PHANTOM_MMAP_SHARED_MEM (0x00000):
  *     struct phantom_shared_mem (payload[64KB] + status + crash_addr).
- *     Allocated by phantom_vmcs_setup() as a contiguous page block.
- *     Userspace writes payload[] before RUN_ITERATION; kernel writes
- *     status and crash_addr after each iteration.
+ *     Mapped RW — userspace writes payload[] before RUN_ITERATION.
  *
- *   PHANTOM_MMAP_TOPA_BUF_A (0x10000):
- *     PT output buffer slot 0 (PHANTOM_PT_PAGES_PER_SLOT × 4KB).
- *     Mapped page by page via vm_insert_page().
+ *   PHANTOM_MMAP_BITMAP (0x10000):
+ *     AFL++ coverage bitmap (Phase 3; currently maps shared_mem RO
+ *     as a placeholder until bitmap has its own allocation).
+ *     Mapped RO — VM_WRITE cleared.
  *
- *   PHANTOM_MMAP_TOPA_BUF_B (0x20000):
- *     PT output buffer slot 1 (same layout as slot 0).
+ *   PHANTOM_MMAP_TOPA_BUF_A (0x20000):
+ *     PT output buffer slot 0.  Mapped RO via vm_insert_page().
+ *     Legacy offset 0x10000 also accepted for backwards compatibility.
  *
- * The mmap offset (vma->vm_pgoff << PAGE_SHIFT) must exactly match
- * one of these constants.  Any other offset returns -EINVAL.
+ *   PHANTOM_MMAP_TOPA_BUF_B (0x30000):
+ *     PT output buffer slot 1.  Mapped RO via vm_insert_page().
+ *     Legacy offset 0x20000 also accepted for backwards compatibility.
+ *
+ *   PHANTOM_MMAP_STATUS (0x40000):
+ *     Read-only status page (first page of shared_mem, RO view).
+ *     Mapped RO — VM_WRITE cleared.
+ *
+ * Any other offset returns -EINVAL.
  * ------------------------------------------------------------------ */
 
 static int phantom_mmap_topa(struct vm_area_struct *vma,
@@ -1866,8 +2180,10 @@ static int phantom_mmap_topa(struct vm_area_struct *vma,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 	vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP |
 		     VM_MIXEDMAP);
+	vm_flags_clear(vma, VM_WRITE);
 #else
 	vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP | VM_MIXEDMAP;
+	vma->vm_flags &= ~VM_WRITE;
 #endif
 
 	for (i = 0; i < pt->topa_page_count[slot] &&
@@ -1881,6 +2197,39 @@ static int phantom_mmap_topa(struct vm_area_struct *vma,
 	}
 
 	return 0;
+}
+
+/*
+ * phantom_mmap_shared_ro - Map the shared_mem region read-only.
+ *
+ * Used for PHANTOM_MMAP_BITMAP and PHANTOM_MMAP_STATUS — both expose
+ * a read-only view of the shared memory pages.  VM_WRITE is cleared
+ * before calling remap_pfn_range so userspace gets a read-only mapping.
+ */
+static int phantom_mmap_shared_ro(struct vm_area_struct *vma,
+				  struct phantom_vmx_cpu_state *state,
+				  unsigned long max_size)
+{
+	unsigned long size = vma->vm_end - vma->vm_start;
+	unsigned long pfn;
+
+	if (!state->shared_mem_pages)
+		return -EINVAL;
+
+	if (size > max_size)
+		return -EINVAL;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
+	vm_flags_clear(vma, VM_WRITE);
+#else
+	vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
+	vma->vm_flags &= ~VM_WRITE;
+#endif
+
+	pfn = page_to_pfn(state->shared_mem_pages);
+	return remap_pfn_range(vma, vma->vm_start, pfn, size,
+			       vma->vm_page_prot);
 }
 
 static int phantom_mmap(struct file *filp, struct vm_area_struct *vma)
@@ -1917,10 +2266,14 @@ static int phantom_mmap(struct file *filp, struct vm_area_struct *vma)
 	offset = vma->vm_pgoff << PAGE_SHIFT;
 	size   = vma->vm_end - vma->vm_start;
 
-	if (offset == PHANTOM_MMAP_SHARED_MEM) {
+	if (offset == PHANTOM_MMAP_PAYLOAD) {
 		/*
-		 * Map the shared memory region (payload + status + crash).
-		 * Uses remap_pfn_range() — contiguous physical allocation.
+		 * PHANTOM_MMAP_PAYLOAD (0x00000) — payload buffer, RW.
+		 * Alias: PHANTOM_MMAP_SHARED_MEM.
+		 *
+		 * Maps struct phantom_shared_mem in full.
+		 * Userspace writes payload[] before each RUN_ITERATION.
+		 * VM_WRITE is kept (default).
 		 */
 		if (!state->shared_mem_pages)
 			return -EINVAL;
@@ -1938,24 +2291,60 @@ static int phantom_mmap(struct file *filp, struct vm_area_struct *vma)
 		return remap_pfn_range(vma, vma->vm_start, pfn, size,
 				       vma->vm_page_prot);
 
+	} else if (offset == PHANTOM_MMAP_BITMAP) {
+		/*
+		 * PHANTOM_MMAP_BITMAP (0x10000) — coverage bitmap, RO.
+		 *
+		 * Phase 3 will allocate a dedicated 64KB bitmap buffer.
+		 * For now, map the shared_mem region read-only as a stub
+		 * so that userspace can map this offset without error.
+		 * Size is limited to PHANTOM_PAYLOAD_MAX (64KB).
+		 *
+		 * Legacy: old TOPA_BUF_A offset (0x10000) is handled here.
+		 * If PT is enabled and the caller maps 0x10000 expecting
+		 * the PT buffer (task 2.2 behaviour), try topa slot 0.
+		 * Determine by checking whether PT is active.
+		 */
+		if (state->pt.pt_enabled && state->pt.topa_page_count[0]) {
+			/*
+			 * Legacy path: task 2.2 test binaries map 0x10000
+			 * to get PT buffer A.  Honour that for backwards
+			 * compatibility.
+			 */
+			return phantom_mmap_topa(vma, &state->pt, 0);
+		}
+		return phantom_mmap_shared_ro(vma, state, PHANTOM_PAYLOAD_MAX);
+
 	} else if (offset == PHANTOM_MMAP_TOPA_BUF_A) {
 		/*
-		 * Map PT output buffer slot 0 (double-buffer buffer A).
-		 * Pages are mapped individually via vm_insert_page().
+		 * PHANTOM_MMAP_TOPA_BUF_A (0x20000) — PT buffer A, RO.
+		 * Also handles legacy offset PHANTOM_MMAP_TOPA_BUF_B_LEGACY
+		 * (0x20000 was old TOPA_BUF_B in task 2.2).
 		 */
 		return phantom_mmap_topa(vma, &state->pt, 0);
 
 	} else if (offset == PHANTOM_MMAP_TOPA_BUF_B) {
 		/*
-		 * Map PT output buffer slot 1 (double-buffer buffer B).
+		 * PHANTOM_MMAP_TOPA_BUF_B (0x30000) — PT buffer B, RO.
 		 */
 		return phantom_mmap_topa(vma, &state->pt, 1);
 
+	} else if (offset == PHANTOM_MMAP_STATUS) {
+		/*
+		 * PHANTOM_MMAP_STATUS (0x40000) — status struct, RO.
+		 *
+		 * Maps one page of shared_mem read-only.  Userspace can
+		 * poll the status word without calling GET_RESULT ioctl.
+		 */
+		return phantom_mmap_shared_ro(vma, state, PAGE_SIZE);
+
 	} else {
-		pr_err("phantom: mmap: unknown offset 0x%lx "
-		       "(expected 0x%lx, 0x%lx, or 0x%lx)\n",
-		       offset, PHANTOM_MMAP_SHARED_MEM,
-		       PHANTOM_MMAP_TOPA_BUF_A, PHANTOM_MMAP_TOPA_BUF_B);
+		pr_err("phantom: mmap: invalid offset 0x%lx "
+		       "(valid: 0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx)\n",
+		       offset,
+		       PHANTOM_MMAP_PAYLOAD, PHANTOM_MMAP_BITMAP,
+		       PHANTOM_MMAP_TOPA_BUF_A, PHANTOM_MMAP_TOPA_BUF_B,
+		       PHANTOM_MMAP_STATUS);
 		return -EINVAL;
 	}
 }

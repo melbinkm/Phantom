@@ -48,7 +48,8 @@
 
 #define PHANTOM_IOC_MAGIC		'P'
 
-#define PHANTOM_VERSION_EXPECTED	0x00020200U
+/* Accept any 2.x version — version bumps with each task */
+#define PHANTOM_VERSION_MIN		0x00020200U
 
 /* Result codes */
 #define PHANTOM_RESULT_OK		0
@@ -355,13 +356,14 @@ int main(void)
 		close(fd);
 		return 1;
 	}
-	if (ver != PHANTOM_VERSION_EXPECTED) {
-		printf("FAIL  version: expected 0x%08x got 0x%08x\n",
-		       PHANTOM_VERSION_EXPECTED, ver);
+	if (ver < PHANTOM_VERSION_MIN) {
+		printf("FAIL  version: expected >= 0x%08x got 0x%08x\n",
+		       PHANTOM_VERSION_MIN, ver);
 		close(fd);
 		return 1;
 	}
-	printf("INFO  version: 0x%08x OK\n", ver);
+	printf("INFO  version: 0x%08x OK (>= 0x%08x)\n", ver,
+	       PHANTOM_VERSION_MIN);
 
 	/* Boot the guest with kAFL harness (test_id=8) to set up snapshot */
 	memset(&run_args, 0, sizeof(run_args));
