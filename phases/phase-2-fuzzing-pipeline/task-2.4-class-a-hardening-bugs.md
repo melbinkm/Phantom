@@ -1,20 +1,91 @@
-# Task 2.4: Class A Hardening + First Bug Campaign
+# Task 2.4: Multi-Core Scaling + Class A Hardening + First Bug Campaign
 
 > **Phase:** Fuzzing Pipeline | **Week(s):** 19–20 | **Depends on:** [Task 2.3](task-2.3-userspace-interface-frontend.md)
 
 ## Objective
 
-Harden the complete fuzzing loop (timeout handling, edge case recovery, EPT isolation verification), profile and optimize the hot path, and find the first real bug in a Class A target.
+Enable multi-core parallel fuzzing (4× throughput on i7-6700), harden the complete fuzzing loop (timeout handling, edge case recovery, EPT isolation verification), profile and optimize the hot path, and find the first real bug in a Class A target.
+
+## Implementation Order
+
+**IMPORTANT: implement in this order — multi-core first, then hardening, then bug campaigns.**
+Multi-core is implemented first so that all subsequent testing (hardening, bug campaigns) runs at full 4-core throughput.
 
 ## What to Build
 
+- **[FIRST] Multi-core parallel fuzzing**: load `phantom.ko` with `cores=0,1,2,3`; add `-j N` flag to `afl-phantom` to spawn N independent AFL++ instances each bound to a separate core via `PHANTOM_CREATE_VM(pinned_cpu=N)`, using AFL++ `-M master -S slaveN` with a shared output directory for corpus sharing; add `--cores 0,1,2,3` flag to `kafl-bridge` to run N parallel processes; create `scripts/phantom-multi.sh` launcher; verify ~4× exec/sec vs single-core baseline; the kernel already supports this (`phantom_parse_cores_param`, per-core `phantom_vmx_cpu_state`) — this is purely userspace coordination work
 - Performance profiling and optimisation: profile hot path with `rdtsc` instrumentation, identify top 3 bottlenecks and optimise them, produce per-component microbenchmark breakdown (restore latency, VM exit latency, input injection latency)
 - Timeout handling: VMX preemption timer per Section 2.5, configurable timeout budget per target class
 - Edge case hardening: guest stack overflow → EPT violation on guard page → report as `PHANTOM_RESULT_CRASH`; guest infinite loop → preemption timer timeout → `PHANTOM_RESULT_TIMEOUT`; PT buffer overflow → PMI handler → mark iteration as `PHANTOM_COVERAGE_DISCARDED`; pool exhaustion → abort iteration, log warning, instance remains usable
 - EPT isolation test: create two VM instances simultaneously using `PHANTOM_CREATE_VM`; write a distinctive value into instance A's guest memory; verify instance B cannot read that value — this must be verified here in Phase 2 before any multi-core work begins in Phase 3 (per §6.5 security requirements)
-- Bug campaigns on Class A targets: libxml2 XML parser, OpenSSL certificate parsing, libpng/libjpeg-turbo image decoding, DNS packet parser; document all crashes, assess severity
+- Bug campaigns on Class A targets (run at full multi-core throughput): libxml2 XML parser, OpenSSL certificate parsing, libpng/libjpeg-turbo image decoding, DNS packet parser; document all crashes, assess severity
 
 ## Implementation Guidance
+
+### Multi-Core Scaling (DO THIS FIRST)
+
+The kernel side is already complete. `phantom_parse_cores_param()` parses `cores=0,1,2,3`,
+spins up one vCPU thread per core, and `PHANTOM_CREATE_VM(pinned_cpu=N)` binds an instance
+to that core. Each core has fully independent VMCS + EPT + snapshot — zero locking on the
+hot path, so throughput scales linearly.
+
+**Step 1: Load with all 4 physical cores**
+
+```bash
+insmod phantom.ko cores=0,1,2,3
+# Expect: "phantom: loaded, VMX active on 4 core(s)"
+```
+
+**Step 2: Add `-j N` to afl-phantom (`userspace/afl-phantom/afl_phantom.c`)**
+
+```c
+/* For each core i in [0, N): */
+int phantom_fd = open("/dev/phantom", O_RDWR);
+struct phantom_create_args ca = { .pinned_cpu = i };
+ioctl(phantom_fd, PHANTOM_CREATE_VM, &ca);
+/* Then run AFL++ fork-server on this fd */
+```
+
+AFL++ multi-instance corpus sharing:
+```bash
+# Terminal 0 (master):
+afl-fuzz -i corpus/ -o out/ -M master -- ./afl-phantom --phantom-fd 0
+# Terminal 1-3 (secondaries):
+afl-fuzz -i corpus/ -o out/ -S slave1 -- ./afl-phantom --phantom-fd 1
+afl-fuzz -i corpus/ -o out/ -S slave2 -- ./afl-phantom --phantom-fd 2
+afl-fuzz -i corpus/ -o out/ -S slave3 -- ./afl-phantom --phantom-fd 3
+```
+
+**Step 3: Add `--cores` to kafl-bridge (`userspace/kafl-bridge/phantom_bridge.py`)**
+
+```python
+# --cores 0,1,2,3 spawns multiprocessing.Process per core
+# Each process opens /dev/phantom independently and calls CREATE_VM(pinned_cpu=N)
+```
+
+**Step 4: `scripts/phantom-multi.sh` launcher**
+
+```bash
+#!/usr/bin/env bash
+# Usage: phantom-multi.sh --cores 4 --corpus corpus/ --output out/
+# Loads phantom.ko with cores=0,...,N-1, starts N afl-fuzz instances
+```
+
+**Step 5: Verify ~4× throughput**
+
+```bash
+# Single core baseline
+python3 kafl-bridge/phantom_bridge.py --max-iterations 10000 --cores 0
+# Multi-core
+python3 kafl-bridge/phantom_bridge.py --max-iterations 10000 --cores 0,1,2,3
+# Expect: ~4× exec/sec improvement
+```
+
+**Test: `tests/test_2_4_multicore.sh`**
+1. `insmod phantom.ko cores=0,1,2,3` — expect "VMX active on 4 core(s)"
+2. Run kafl-bridge `--cores 0,1,2,3` for 1000 iterations — no errors
+3. Measure exec/sec vs single-core — verify ≥3.5× ratio (allow for OS overhead)
+4. EPT isolation: CREATE_VM on CPU 0 and CPU 1 simultaneously, verify cross-instance memory isolation
 
 ### VMX Preemption Timer Setup (§2.5)
 
@@ -170,12 +241,13 @@ struct phantom_timeout_config {
 
 ## Tests to Run
 
+- **Multi-core**: `insmod phantom.ko cores=0,1,2,3` loads with 4 vCPU threads; kafl-bridge `--cores 0,1,2,3` achieves ≥3.5× exec/sec vs single-core baseline
 - EPT isolation: instance A write is not visible to instance B (pass = instance B reads original unmodified value, confirming independent EPT hierarchies; test runs here in Phase 2 per §6.5)
 - At least 1 real crash found in an unmodified real-world target (pass = crash input confirmed to trigger in unmodified binary outside Phantom)
 - VMX preemption timer fires for a guest infinite loop (pass = `PHANTOM_RESULT_TIMEOUT` returned within the configured window)
 - Guest stack overflow reported as crash with crash address logged (pass = `PHANTOM_RESULT_CRASH` returned, address in log)
 - PT overflow marked as `PHANTOM_COVERAGE_DISCARDED` and iteration continues to completion (pass = status flag set, execution reaches RELEASE or timeout)
-- Class A throughput > 50k exec/sec on at least one real parser target (pass = measured exec/sec exceeds 50,000)
+- Class A throughput > 50k exec/sec per core on at least one real parser target (pass = measured exec/sec exceeds 50,000 per core, ~200k total across 4 cores)
 
 ## Deliverables
 
