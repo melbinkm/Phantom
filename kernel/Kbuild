@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Kbuild — kernel object rules for phantom.ko
+#
+
+obj-m := phantom.o
+
+phantom-objs := \
+	phantom_main.o \
+	vmx_core.o \
+	interface.o \
+	debug.o
+
+# Enable debug assertions and trace_printk during development.
+# Remove -DPHANTOM_DEBUG for production builds.
+ccflags-y := -DPHANTOM_DEBUG -Wall -Werror
