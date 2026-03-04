@@ -27,8 +27,9 @@
  * Task 1.6 baseline: version 1.6.0 = 0x00010600
  * Task 1.8 baseline: version 1.8.0 = 0x00010800
  * Task 2.1 baseline: version 2.1.0 = 0x00020100
+ * Task 2.2 baseline: version 2.2.0 = 0x00020200
  * ------------------------------------------------------------------ */
-#define PHANTOM_VERSION		0x00020100U
+#define PHANTOM_VERSION		0x00020200U
 
 /* ------------------------------------------------------------------
  * ioctl command numbers
@@ -247,6 +248,75 @@ struct phantom_iter_result {
  */
 #define PHANTOM_IOCTL_GET_RESULT \
 	_IOR(PHANTOM_IOCTL_MAGIC, 21, struct phantom_iter_result)
+
+/*
+ * ------------------------------------------------------------------
+ * Task 2.2: Intel PT coverage — mmap offsets and PT eventfd ioctl
+ * ------------------------------------------------------------------
+ *
+ * /dev/phantom mmap offset constants.
+ *
+ * mmap() uses the page offset (vma->vm_pgoff << PAGE_SHIFT) to select
+ * which region to map:
+ *
+ *   PHANTOM_MMAP_SHARED_MEM (0x00000): struct phantom_shared_mem
+ *     Payload[64KB] + status u32 + crash_addr u64.
+ *     Size: sizeof(struct phantom_shared_mem) rounded to page order.
+ *
+ *   PHANTOM_MMAP_TOPA_BUF_A (0x10000): PT output buffer slot 0
+ *     PHANTOM_PT_PAGES_PER_SLOT × 4KB of PT packet data.
+ *     Written by hardware during guest execution.
+ *     Valid byte count available after PT_GET_EVENTFD notification.
+ *
+ *   PHANTOM_MMAP_TOPA_BUF_B (0x20000): PT output buffer slot 1
+ *     Same layout as slot 0 — the double-buffer alternate.
+ *
+ * The mmap offset must match one of these constants exactly (not a
+ * range).  Any other offset returns -EINVAL.
+ */
+#define PHANTOM_MMAP_SHARED_MEM		0x00000UL
+#define PHANTOM_MMAP_TOPA_BUF_A		0x10000UL
+#define PHANTOM_MMAP_TOPA_BUF_B		0x20000UL
+
+/*
+ * PHANTOM_IOCTL_PT_GET_EVENTFD — get eventfd for PT iteration notification.
+ *
+ * Creates an eventfd in the calling process's file descriptor table and
+ * stores a reference to it in state->pt.eventfd.  After each fuzzing
+ * iteration, the kernel writes 1 to the eventfd to notify the userspace
+ * PT decoder that a new trace buffer is ready.
+ *
+ * Userspace should epoll() on this fd for EPOLLIN events.
+ *
+ * Returns the eventfd file descriptor number on success (non-negative).
+ * Returns -ENXIO if device not initialised.
+ * Returns -EINVAL if PT is not available on this system.
+ * Returns -EEXIST if an eventfd is already registered (call again after
+ *   module reload to replace it).
+ *
+ * The eventfd is automatically released when the /dev/phantom fd is
+ * closed or the module is unloaded.
+ */
+#define PHANTOM_IOCTL_PT_GET_EVENTFD	_IO(PHANTOM_IOCTL_MAGIC, 13)
+
+/*
+ * struct phantom_pt_status — written to eventfd notification data area.
+ *
+ * After each iteration, the kernel signals the eventfd.  Userspace
+ * reads which buffer is ready and the byte count from this struct,
+ * which is stored in the shared_mem region at a fixed offset.
+ *
+ * byte_count:    Number of PT bytes written in the completed iteration.
+ *               0 if PT is disabled or iteration produced no trace.
+ * buffer_index:  Index of the buffer containing the completed trace.
+ *               0 = TOPA_BUF_A, 1 = TOPA_BUF_B.
+ *               The next iteration will write to the other buffer.
+ */
+struct phantom_pt_status {
+	__u64 byte_count;
+	__u32 buffer_index;
+	__u32 _pad;
+};
 
 /*
  * Reserved for future phases:

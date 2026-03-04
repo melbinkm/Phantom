@@ -54,6 +54,7 @@
 #include "nmi.h"
 #include "debug.h"
 #include "memory.h"
+#include "pt_config.h"
 
 /* Per-CPU VMX state — one entry per physical CPU */
 DEFINE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);
@@ -1238,11 +1239,22 @@ int phantom_vmcs_configure_fields(struct phantom_vmx_cpu_state *state)
 	/* INVEPT after initial setup */
 	__invept_single(eptp);
 
+	/*
+	 * Task 2.2: Configure VMCS PT-in-VMX controls.
+	 *
+	 * Must run after control fields are set (phantom_vmcs_setup_controls)
+	 * because phantom_pt_configure_vmcs() reads and modifies the current
+	 * VM-entry and VM-exit control VMCS fields.
+	 *
+	 * Non-fatal: if PT is disabled, this is a no-op.
+	 */
+	phantom_pt_configure_vmcs(state);
+
 	state->launched = false;
 	state->vmcs_configured = true;
 
-	pr_info("phantom: CPU%d: VMCS configured (eptp=0x%llx)\n",
-		cpu, eptp);
+	pr_info("phantom: CPU%d: VMCS configured (eptp=0x%llx, pt=%s)\n",
+		cpu, eptp, state->pt.pt_enabled ? "enabled" : "disabled");
 	return 0;
 }
 
@@ -1538,6 +1550,31 @@ static int phantom_vcpu_fn(void *data)
 	 * during VMX init, fixing the second-load crash.
 	 */
 	state->vcpu_init_result = phantom_vcpu_init_on_cpu(state);
+
+	/*
+	 * Task 2.2: Initialise Intel PT after VMXON.
+	 *
+	 * PT init must run on this CPU (vCPU thread) after VMXON because:
+	 *   - RTIT MSR writes require VMX-root mode or at least the correct
+	 *     physical CPU context.
+	 *   - NUMA-local page allocation via cpu_to_node(state->cpu).
+	 *   - PT-in-VMX check reads MSR_IA32_VMX_TRUE_ENTRY/EXIT_CTLS, which
+	 *     are per-CPU.
+	 *
+	 * Non-fatal: if PT init fails, pt.pt_enabled=false and the module
+	 * continues without coverage (PT is optional, not required).
+	 *
+	 * Only attempt PT init if VMXON succeeded (vmx_active=true).
+	 */
+	if (!state->vcpu_init_result && state->vmx_active) {
+		int pt_ret = phantom_pt_init(state);
+
+		if (pt_ret)
+			pr_warn("phantom: CPU%d: PT init failed %d "
+				"(coverage disabled)\n",
+				state->cpu, pt_ret);
+	}
+
 	complete(&state->vcpu_init_done);
 
 	if (state->vcpu_init_result) {
@@ -1754,8 +1791,38 @@ static int phantom_vcpu_fn(void *data)
 			state->cow_iteration++;
 		}
 
+		/*
+		 * Task 2.2: Arm PT for the next VM entry.
+		 *
+		 * When pt_in_vmx=true: writes TraceEn=1 to VMCS RTIT_CTL
+		 *   guest-state field so PT starts automatically on VM entry.
+		 * When pt_in_vmx=false: writes RTIT_CTL MSR directly (fallback).
+		 *
+		 * Hot-path safe: no printk, no allocation, just VMWRITE or
+		 * WRMSR.  Must happen BEFORE phantom_run_guest() executes the
+		 * VMLAUNCH/VMRESUME instruction.
+		 */
+		phantom_pt_iteration_start(state);
+
 		/* Run the guest — pinned to state->cpu */
 		state->vcpu_run_result = phantom_run_guest(state);
+
+		/*
+		 * Task 2.2: Finalise PT after VM exit (6-step MSR sequence).
+		 *
+		 * phantom_pt_iteration_reset() runs AFTER VM exit (PT has
+		 * stopped — cleared by VM_EXIT_CLEAR control or manually).
+		 * It reads the byte count, signals the eventfd, resets MSRs,
+		 * and swaps the double-buffer.
+		 *
+		 * Must run BEFORE phantom_cow_abort_iteration() (order does
+		 * not matter for correctness, but doing PT reset first allows
+		 * userspace decoder to start concurrently with our CoW restore).
+		 *
+		 * Hot-path safe: eventfd_signal() uses spinlock (OK in
+		 * non-interrupt context), WRMSR/VMWRITE are cheap.
+		 */
+		phantom_pt_iteration_reset(state);
 
 		/*
 		 * Task 1.4: After each guest run, restore the snapshot.
@@ -1822,6 +1889,17 @@ do_stop:
 	 * kthread_stop() returns.  By that point, both VMCLEAR and VMXOFF
 	 * have completed and no CPU references the VMCS page.
 	 */
+	/*
+	 * Task 2.2: Tear down Intel PT before VMXOFF.
+	 *
+	 * phantom_pt_teardown() disables RTIT_CTL.TraceEn, frees ToPA pages,
+	 * and releases the eventfd reference.  Must run before VMXOFF so we
+	 * are still in VMX-root mode and can write RTIT MSRs.
+	 *
+	 * Non-fatal: if pt_enabled=false, this is a no-op.
+	 */
+	phantom_pt_teardown(state);
+
 	if (state->vmx_active) {
 		/*
 		 * Step 1: VMCLEAR — marks VMCS as inactive and not-current.

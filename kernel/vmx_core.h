@@ -20,6 +20,7 @@
 #include "ept_cow.h"
 #include "snapshot.h"
 #include "interface.h"
+#include "pt_config.h"
 
 /* ------------------------------------------------------------------
  * MSR constants — only defined if the running kernel headers omit them
@@ -672,6 +673,19 @@ struct phantom_vmx_cpu_state {
 	void			 *shared_mem;
 	struct page		 *shared_mem_pages;
 	unsigned int		  shared_mem_order;
+
+	/*
+	 * Task 2.2: Intel PT double-buffer state.
+	 *
+	 * Placed at END of struct to preserve all field offsets used by
+	 * the assembly trampoline (guest_regs, launched, host_rsp etc.
+	 * must remain at the same offsets as prior tasks).
+	 *
+	 * Initialised by phantom_pt_init() from the vCPU thread after
+	 * VMXON + VMCS setup.  Torn down by phantom_pt_teardown() in the
+	 * do_stop path before VMXOFF.
+	 */
+	struct phantom_pt_state	  pt;
 };
 
 DECLARE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);
