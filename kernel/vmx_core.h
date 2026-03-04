@@ -12,6 +12,8 @@
 #include <linux/types.h>
 #include <linux/percpu.h>
 #include <linux/mm_types.h>
+#include <linux/completion.h>
+#include <linux/kthread.h>
 #include <asm/msr-index.h>
 
 /* ------------------------------------------------------------------
@@ -243,39 +245,96 @@
 
 /* ------------------------------------------------------------------
  * VMCS control field bit definitions
+ *
+ * Use #ifndef guards to avoid clashing with <asm/vmx.h> which defines
+ * most of these with identical names.  The kernel header takes priority
+ * when included; our definitions are only active if the kernel omits them.
  * ------------------------------------------------------------------ */
 
 /* Pin-based execution controls */
+#ifndef PIN_BASED_EXT_INT_EXITING
 #define PIN_BASED_EXT_INT_EXITING	BIT(0)
+#endif
+#ifndef PIN_BASED_NMI_EXITING
 #define PIN_BASED_NMI_EXITING		BIT(3)
+#endif
+#ifndef PIN_BASED_VIRTUAL_NMIS
 #define PIN_BASED_VIRTUAL_NMIS		BIT(5)
+#endif
+#ifndef PIN_BASED_PREEMPT_TIMER
 #define PIN_BASED_PREEMPT_TIMER		BIT(6)
+#endif
 
 /* Primary proc-based execution controls */
+#ifndef CPU_BASED_HLT_EXITING
 #define CPU_BASED_HLT_EXITING		BIT(7)
+#endif
+/* The kernel uses CPU_BASED_UNCOND_IO_EXITING (UNCOND not UNCONDITIONAL) */
+#if !defined(CPU_BASED_UNCONDITIONAL_IO) && \
+    !defined(CPU_BASED_UNCOND_IO_EXITING)
 #define CPU_BASED_UNCONDITIONAL_IO	BIT(24)
+#elif defined(CPU_BASED_UNCOND_IO_EXITING) && \
+      !defined(CPU_BASED_UNCONDITIONAL_IO)
+#define CPU_BASED_UNCONDITIONAL_IO	CPU_BASED_UNCOND_IO_EXITING
+#endif
+#ifndef CPU_BASED_USE_MSR_BITMAPS
 #define CPU_BASED_USE_MSR_BITMAPS	BIT(28)
+#endif
+/* The kernel 6.8+ uses CPU_BASED_ACTIVATE_SECONDARY_CONTROLS for bit 31 */
+#if !defined(CPU_BASED_SECONDARY_ENABLE) && \
+    !defined(CPU_BASED_ACTIVATE_SECONDARY_CONTROLS)
 #define CPU_BASED_SECONDARY_ENABLE	BIT(31)
+#elif defined(CPU_BASED_ACTIVATE_SECONDARY_CONTROLS) && \
+      !defined(CPU_BASED_SECONDARY_ENABLE)
+#define CPU_BASED_SECONDARY_ENABLE	CPU_BASED_ACTIVATE_SECONDARY_CONTROLS
+#endif
 
 /* Secondary proc-based execution controls */
+#ifndef SECONDARY_EXEC_ENABLE_EPT
 #define SECONDARY_EXEC_ENABLE_EPT	BIT(1)
+#endif
+#ifndef SECONDARY_EXEC_ENABLE_VPID
 #define SECONDARY_EXEC_ENABLE_VPID	BIT(5)
+#endif
 
 /* VM-exit controls */
+#ifndef VM_EXIT_HOST_ADDR_SPACE_SIZE
 #define VM_EXIT_HOST_ADDR_SPACE_SIZE	BIT(9)
+#endif
+/* The kernel uses VM_EXIT_ACK_INTR_ON_EXIT (note: INTR not INT) */
+#if !defined(VM_EXIT_ACK_INT_ON_EXIT) && !defined(VM_EXIT_ACK_INTR_ON_EXIT)
 #define VM_EXIT_ACK_INT_ON_EXIT		BIT(15)
+#elif defined(VM_EXIT_ACK_INTR_ON_EXIT) && !defined(VM_EXIT_ACK_INT_ON_EXIT)
+#define VM_EXIT_ACK_INT_ON_EXIT		VM_EXIT_ACK_INTR_ON_EXIT
+#endif
+#ifndef VM_EXIT_SAVE_IA32_PAT
 #define VM_EXIT_SAVE_IA32_PAT		BIT(18)
+#endif
+#ifndef VM_EXIT_LOAD_IA32_PAT
 #define VM_EXIT_LOAD_IA32_PAT		BIT(19)
+#endif
+#ifndef VM_EXIT_SAVE_IA32_EFER
 #define VM_EXIT_SAVE_IA32_EFER		BIT(20)
+#endif
+#ifndef VM_EXIT_LOAD_IA32_EFER
 #define VM_EXIT_LOAD_IA32_EFER		BIT(21)
+#endif
 
 /* VM-entry controls */
+#ifndef VM_ENTRY_IA32E_MODE
 #define VM_ENTRY_IA32E_MODE		BIT(9)
+#endif
+#ifndef VM_ENTRY_LOAD_IA32_PAT
 #define VM_ENTRY_LOAD_IA32_PAT		BIT(14)
+#endif
+#ifndef VM_ENTRY_LOAD_IA32_EFER
 #define VM_ENTRY_LOAD_IA32_EFER		BIT(15)
+#endif
 
 /* Segment access rights: unusable bit */
+#ifndef VMX_SEGMENT_AR_UNUSABLE
 #define VMX_SEGMENT_AR_UNUSABLE		BIT(16)
+#endif
 
 /* ------------------------------------------------------------------
  * EPT constants
@@ -361,8 +420,43 @@ struct phantom_vmx_cpu_state {
 	int			 run_result;
 	u64			 run_result_data;   /* checksum from guest */
 	bool			 launched;
-	bool			 vmcs_configured;
+	bool			 pages_allocated;   /* pages alloc'd (process ctx) */
+	bool			 vmcs_configured;   /* VMCS fields written (CPU ctx) */
 	u64			 host_rsp;          /* saved by trampoline */
+
+	/*
+	 * Dedicated vCPU kernel thread (pinned to this CPU).
+	 * The ioctl hands work to this thread via completions to avoid
+	 * the IPI mechanism which breaks KVM nested VMX state on re-entry.
+	 *
+	 * Thread stop protocol:
+	 *   kthread_stop() is safe in both phases:
+	 *   - Phase 1 (before VMLAUNCH): RESCHEDULE IPI is safe.
+	 *   - Phase 2 (after VMLAUNCH): thread is TASK_RUNNING (busy-wait),
+	 *     so wake_up_process() is a no-op — no RESCHEDULE IPI sent.
+	 *   The thread polls kthread_should_stop(), runs VMCLEAR + VMXOFF,
+	 *   then returns.  kthread_stop() waits for the return.
+	 *   phantom_vmxoff_all() skips the SMP call for this CPU because
+	 *   vmx_active == false (VMXOFF already ran in thread).
+	 */
+	struct task_struct	*vcpu_thread;
+	struct completion	 vcpu_run_start;  /* ioctl → thread: 1st run */
+	struct completion	 vcpu_run_done;   /* thread → ioctl: done */
+	int			 vcpu_run_request; /* 1=run, 2=reset, 0=exit */
+	int			 vcpu_run_result;  /* thread's run result */
+	/*
+	 * vcpu_work_ready: IPI-free wakeup for runs after the first VMLAUNCH.
+	 *
+	 * After the first VMLAUNCH, KVM L0's nested VMX tracking is "dirty"
+	 * even after the guest exits.  Any RESCHEDULE IPI (e.g., from
+	 * complete()) sent to CPU0 while this state is active causes a triple
+	 * fault.  We avoid IPIs entirely by busy-waiting on this flag.
+	 *
+	 * Set by the ioctl handler (no IPI) after the first VMLAUNCH.
+	 * Read by the vCPU thread via cpu_relax() busy-wait.
+	 * Protected by smp_store_release / smp_load_acquire barriers.
+	 */
+	bool			 vcpu_work_ready;  /* set by ioctl (no IPI) */
 };
 
 DECLARE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);
@@ -450,18 +544,66 @@ int phantom_vmcs_alloc_all(const struct cpumask *cpumask);
 void phantom_vmcs_free_all(const struct cpumask *cpumask);
 
 /* Task 1.2: VMCS population and guest execution */
+
+/**
+ * phantom_vmcs_setup - Allocate and initialise all guest/EPT pages.
+ *
+ * MUST be called from process context (GFP_KERNEL allocation).
+ * Safe to call multiple times — idempotent once pages_allocated is set.
+ * Does NOT write any VMCS fields; call phantom_vmcs_configure_fields()
+ * on the target CPU afterwards.
+ */
 int phantom_vmcs_setup(struct phantom_vmx_cpu_state *state);
+
+/**
+ * phantom_vmcs_configure_fields - Write VMCS control and state fields.
+ *
+ * MUST be called on the target CPU (VMCS must be current via VMPTRLD).
+ * Safe in interrupt context — no sleeping allocations.
+ * Idempotent once vmcs_configured is set.
+ */
+int phantom_vmcs_configure_fields(struct phantom_vmx_cpu_state *state);
+
 void phantom_vmcs_teardown(struct phantom_vmx_cpu_state *state);
 
 /**
  * phantom_run_guest - Enter guest and run until VM exit.
  * @state: Per-CPU VMX state with VMCS configured.
  *
- * Runs on the target CPU (caller must ensure this via
- * smp_call_function_single or preemption disable).
+ * Runs on the target CPU (caller must ensure this via the vCPU thread).
  * Returns 0 on expected exit (VMCALL result available),
  * negative errno on VM-entry failure.
  */
 int phantom_run_guest(struct phantom_vmx_cpu_state *state);
+
+/**
+ * phantom_vcpu_thread_start - Start the per-CPU vCPU kernel thread.
+ * @state: Per-CPU VMX state for the target CPU.
+ *
+ * Creates a kernel thread pinned to state->cpu.  The thread waits for
+ * work signals via vcpu_run_start completion and executes guest runs.
+ * Returns 0 on success, negative errno on failure.
+ */
+int phantom_vcpu_thread_start(struct phantom_vmx_cpu_state *state);
+
+/**
+ * phantom_vcpu_thread_stop - Stop and destroy the per-CPU vCPU thread.
+ * @state: Per-CPU VMX state for the target CPU.
+ *
+ * Calls kthread_stop().  Safe in both phases: no RESCHEDULE IPI is sent
+ * after VMLAUNCH because the thread is TASK_RUNNING (busy-waiting).
+ */
+void phantom_vcpu_thread_stop(struct phantom_vmx_cpu_state *state);
+
+/**
+ * phantom_vm_exit_return - VM exit landing pad (HOST_RIP target).
+ *
+ * This function is jumped to (not called) by the CPU hardware on VM exit.
+ * It saves guest GPRs, restores host callee-saved registers, and returns
+ * 0 to the caller of phantom_vmlaunch_trampoline.
+ *
+ * Declared __visible to prevent the compiler from removing it.
+ */
+__visible void phantom_vm_exit_return(void);
 
 #endif /* PHANTOM_VMX_CORE_H */

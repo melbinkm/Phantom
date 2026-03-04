@@ -10,12 +10,27 @@
  *   - Dispatch PHANTOM_IOCTL_RUN_GUEST (task 1.2)
  *
  * The RUN_GUEST ioctl:
- *   1. Loads the trivial guest binary (trivial_guest.bin) into the
- *      guest code page via copy_from_user / embedded binary
- *   2. Populates the guest data page with a known test pattern
- *   3. Calls phantom_vmcs_setup() on the target CPU
- *   4. Calls phantom_run_guest() via smp_call_function_single()
- *   5. Copies result back to userspace
+ *   1. Calls phantom_vmcs_setup() — allocates all pages (process context,
+ *      GFP_KERNEL OK).  Idempotent; no-op after first call.
+ *   2. Prepares guest memory (binary + data pattern).
+ *   3. Resets guest VMCS state for relaunches (not first run).
+ *   4. Signals the per-CPU vCPU kernel thread to run the guest.
+ *   5. Waits for the vCPU thread to complete.
+ *   6. Copies result back to userspace.
+ *
+ * Why use a dedicated vCPU kernel thread:
+ *   smp_call_function_single delivers the callback with local IRQs
+ *   disabled.  In a nested KVM environment (L0=KVM, L1=phantom,
+ *   L2=guest), after the first VMLAUNCH/VMRESUME cycle KVM's internal
+ *   state for the target vCPU does not properly deliver generic IPIs
+ *   on subsequent smp_call_function_single calls — causing an infinite
+ *   wait.  Task migration via set_cpus_allowed_ptr+schedule() causes
+ *   immediate kernel panics in nested VMX context.
+ *
+ *   A dedicated kernel thread pinned to the target CPU is the correct
+ *   production design (used by KVM itself for vCPU execution).  The
+ *   thread runs as a normal schedulable task; the scheduler places it
+ *   on the pinned CPU without triggering the nested VMX IPI issue.
  */
 
 #include <linux/module.h>
@@ -29,6 +44,8 @@
 #include <linux/smp.h>
 #include <linux/cpumask.h>
 #include <linux/string.h>
+#include <linux/mm.h>
+#include <linux/gfp.h>
 
 #include "phantom.h"
 #include "interface.h"
@@ -36,80 +53,46 @@
 #include "compat.h"
 
 /* ------------------------------------------------------------------
- * Guest binary — trivial_guest.bin embedded as a byte array.
+ * Guest binary — trivial_guest machine code embedded as byte array.
  *
- * This is the compiled flat binary produced by guest/Makefile.
- * The kernel loads it into the guest code page at GPA 0x10000.
+ * This is the hand-assembled equivalent of guest/trivial_guest.S:
  *
- * For the kernel module build, we include a pre-built binary.
- * If the binary is not present, we fall back to an inline HLT loop.
- * ------------------------------------------------------------------ */
-
-/*
- * Minimal inline guest: GET_HOST_DATA → read 512 u64s → XOR fold →
- * SUBMIT_RESULT → HLT loop.
- *
- * Opcode sequence (assembled for GPA 0x10000, but position-independent
- * since all branches are relative):
- *
- *   xor  %rax, %rax        ; hc_nr = 0 (GET_HOST_DATA)
- *   vmcall                 ; host sets RBX = data_gpa
- *   xor  %rcx, %rcx        ; counter = 0
- *   xor  %rdx, %rdx        ; checksum = 0
+ *   xor  %rax, %rax         ; RAX = 0 (GET_HOST_DATA hypercall)
+ *   vmcall                  ; host sets RBX = data buffer GPA
+ *   xor  %rcx, %rcx         ; counter = 0
+ *   xor  %rdx, %rdx         ; accumulator = 0
  * .loop:
- *   mov  (%rbx,%rcx,8), %rax
- *   xor  %rax, %rdx
- *   inc  %rcx
- *   cmp  $512, %rcx
+ *   mov  (%rbx,%rcx,8),%rax ; load data[rcx]
+ *   xor  %rax, %rdx         ; acc ^= data[rcx]
+ *   inc  %rcx               ; rcx++
+ *   cmp  $512, %rcx         ; if rcx < 512, continue
  *   jl   .loop
- *   mov  %rdx, %rbx        ; checksum → RBX
- *   mov  $1, %rax           ; hc_nr = 1 (SUBMIT_RESULT)
- *   vmcall
+ *   mov  %rdx, %rbx         ; RBX = checksum
+ *   mov  $1, %rax            ; RAX = 1 (SUBMIT_RESULT hypercall)
+ *   vmcall                  ; host records RBX
  * .halt:
  *   hlt
  *   jmp  .halt
- */
-static const u8 phantom_trivial_guest_bin[] = {
-	/* xor %rax, %rax */        0x48, 0x31, 0xC0,
-	/* vmcall */                 0x0F, 0x01, 0xC1,
-	/* xor %rcx, %rcx */        0x48, 0x31, 0xC9,
-	/* xor %rdx, %rdx */        0x48, 0x31, 0xD2,
-	/* .loop: */
-	/* mov (%rbx,%rcx,8),%rax */0x48, 0x8B, 0x04, 0xCB,
-	/* xor %rax, %rdx */        0x48, 0x31, 0xC2,
-	/* inc %rcx */               0x48, 0xFF, 0xC1,
-	/* cmp $512, %rcx */        0x48, 0x81, 0xF9, 0x00, 0x02, 0x00, 0x00,
-	/* jl .loop (-16 bytes) */  0x7C, 0xF0,
-	/* mov %rdx, %rbx */        0x48, 0x89, 0xD3,
-	/* mov $1, %rax */          0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,
-	/* vmcall */                 0x0F, 0x01, 0xC1,
-	/* .halt: hlt */            0xF4,
-	/* jmp .halt (-2 bytes) */  0xEB, 0xFD,
-};
-
-/* ------------------------------------------------------------------
- * Work struct for smp_call_function_single guest execution
  * ------------------------------------------------------------------ */
-
-struct phantom_run_work {
-	struct phantom_vmx_cpu_state *state;
-	int result;
+static const u8 phantom_trivial_guest_bin[] = {
+	/* xor %rax, %rax */              0x48, 0x31, 0xC0,
+	/* vmcall */                       0x0F, 0x01, 0xC1,
+	/* xor %rcx, %rcx */              0x48, 0x31, 0xC9,
+	/* xor %rdx, %rdx */              0x48, 0x31, 0xD2,
+	/* .loop: */
+	/* mov (%rbx,%rcx,8), %rax */     0x48, 0x8B, 0x04, 0xCB,
+	/* xor %rax, %rdx */              0x48, 0x31, 0xC2,
+	/* inc %rcx */                     0x48, 0xFF, 0xC1,
+	/* cmp $512, %rcx */              0x48, 0x81, 0xF9,
+	                                   0x00, 0x02, 0x00, 0x00,
+	/* jl .loop  (offset = -19) */   0x7C, 0xED,
+	/* mov %rdx, %rbx */              0x48, 0x89, 0xD3,
+	/* mov $1, %rax */                0x48, 0xC7, 0xC0,
+	                                   0x01, 0x00, 0x00, 0x00,
+	/* vmcall */                       0x0F, 0x01, 0xC1,
+	/* hlt */                          0xF4,
+	/* jmp .halt  (offset = -2) */   0xEB, 0xFD,
 };
-
-static void phantom_run_guest_on_cpu(void *data)
-{
-	struct phantom_run_work *work = data;
-	struct phantom_vmx_cpu_state *state = work->state;
-	int ret;
-
-	ret = phantom_vmcs_setup(state);
-	if (ret) {
-		work->result = ret;
-		return;
-	}
-
-	work->result = phantom_run_guest(state);
-}
 
 /* ------------------------------------------------------------------
  * File operations
@@ -156,9 +139,8 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 	case PHANTOM_IOCTL_RUN_GUEST: {
 		struct phantom_run_args args;
 		struct phantom_vmx_cpu_state *state;
-		struct phantom_run_work work;
-		u64 *data_page;
 		int target_cpu;
+		u64 *dp;
 		int i;
 
 		if (copy_from_user(&args, (void __user *)arg, sizeof(args))) {
@@ -171,108 +153,135 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			break;
 		}
 
-		/* Find the target CPU — use cpu=0 by default */
+		/* Find the target CPU — first CPU in vmx_cpumask by default */
 		target_cpu = -1;
 		{
 			int cpu;
 
 			for_each_cpu(cpu, pdev->vmx_cpumask) {
-				if (args.cpu == 0 || (int)args.cpu == cpu) {
-					target_cpu = cpu;
-					break;
-				}
+				target_cpu = cpu;
+				break; /* use first CPU always for now */
 			}
 		}
 
 		if (target_cpu < 0) {
-			pr_err("phantom: RUN_GUEST: no valid target CPU\n");
+			pr_err("phantom: RUN_GUEST: no VMX CPU available\n");
 			ret = -ENODEV;
 			break;
 		}
 
 		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
 
-		/*
-		 * Load the trivial guest binary into the guest code page.
-		 * The page was already allocated by phantom_vmcs_setup if
-		 * vmcs_configured is set, but we need to set it up first.
-		 *
-		 * phantom_vmcs_setup handles allocation; we need the code
-		 * page populated before calling phantom_run_guest.
-		 * Strategy: call setup, then load binary.
-		 *
-		 * Since setup allocates pages but vmcs_configured may already
-		 * be true (idempotent), we need to handle both paths.
-		 */
-		if (!state->vmcs_configured) {
-			/* Setup will be called inside phantom_run_guest_on_cpu */
-			/* But we need the page allocated first to copy binary */
-			int node = cpu_to_node(target_cpu);
-
-			state->guest_code_page = alloc_pages_node(
-				node, GFP_KERNEL | __GFP_ZERO, 0);
-			if (!state->guest_code_page) {
-				ret = -ENOMEM;
-				break;
-			}
-
-			/* Copy trivial guest binary to code page */
-			memcpy(page_address(state->guest_code_page),
-			       phantom_trivial_guest_bin,
-			       sizeof(phantom_trivial_guest_bin));
-
-			/* Allocate data page for test pattern */
-			state->guest_data_page = alloc_pages_node(
-				node, GFP_KERNEL | __GFP_ZERO, 0);
-			if (!state->guest_data_page) {
-				__free_page(state->guest_code_page);
-				state->guest_code_page = NULL;
-				ret = -ENOMEM;
-				break;
-			}
-
-			/* Fill data page with test pattern */
-			data_page = (u64 *)page_address(state->guest_data_page);
-			for (i = 0; i < 512; i++)
-				data_page[i] = (u64)(i + 1) * 0x1234567890ABCDEFull;
-		} else {
-			/*
-			 * VMCS already configured — reload guest code and
-			 * data pages (reset state for a fresh run).
-			 */
-			memcpy(page_address(state->guest_code_page),
-			       phantom_trivial_guest_bin,
-			       sizeof(phantom_trivial_guest_bin));
-
-			data_page = (u64 *)page_address(state->guest_data_page);
-			for (i = 0; i < 512; i++)
-				data_page[i] = (u64)(i + 1) * 0x1234567890ABCDEFull;
-
-			/* Reset RIP/RSP for fresh execution */
-			state->launched = false;
-		}
-
-		/* Run guest on target CPU */
-		work.state  = state;
-		work.result = 0;
-
-		smp_call_function_single(target_cpu,
-					 phantom_run_guest_on_cpu,
-					 &work, 1);
-
-		if (work.result < 0) {
-			ret = work.result;
+		if (!state->vcpu_thread) {
+			pr_err("phantom: RUN_GUEST: vCPU thread not running\n");
+			ret = -ENXIO;
 			break;
 		}
 
 		/*
-		 * Reset guest RIP and RSP in VMCS for next run.
-		 * This requires being on the target CPU.
+		 * Phase A: Allocate pages in process context (GFP_KERNEL safe).
+		 * Idempotent; phantom_vmcs_setup() returns 0 if already done.
+		 */
+		ret = phantom_vmcs_setup(state);
+		if (ret) {
+			pr_err("phantom: RUN_GUEST: vmcs_setup failed: %ld\n",
+			       ret);
+			break;
+		}
+
+		/*
+		 * Phase B: Prepare guest memory.
+		 *
+		 * This runs in IOCTL process context (any CPU), which is fine:
+		 * we're writing to physical pages, not VMCS fields.
+		 * The vCPU thread handles all VMCS operations.
 		 */
 
-		/* Populate output args */
+		/* Load guest binary into code page (always refresh) */
+		memcpy(page_address(state->guest_code_page),
+		       phantom_trivial_guest_bin,
+		       sizeof(phantom_trivial_guest_bin));
+
+		/* Fill data page with known test pattern:
+		 *   data[i] = (i+1) * 0x1234567890ABCDEFull
+		 */
+		dp = (u64 *)page_address(state->guest_data_page);
+		for (i = 0; i < 512; i++)
+			dp[i] = (u64)(i + 1) * 0x1234567890ABCDEFull;
+
+		/*
+		 * Phase C: Prepare guest-state reset for relaunches.
+		 *
+		 * On first setup, phantom_vmcs_configure_fields() initialises
+		 * RIP/RSP/RFLAGS correctly.  On subsequent runs, we signal
+		 * the vCPU thread to reset those fields before VMLAUNCH
+		 * (vcpu_run_request bit 1 = "reset needed").
+		 *
+		 * Always clear the per-run result state here.
+		 */
+		state->run_result      = 0;
+		state->run_result_data = 0;
+		memset(&state->guest_regs, 0, sizeof(state->guest_regs));
+
+		if (!state->vmcs_configured) {
+			/* First run — configure_fields sets initial values */
+			state->vcpu_run_request = 1; /* run only */
+		} else {
+			/* Re-launch — thread must reset RIP/RSP/RFLAGS */
+			state->vcpu_run_request = 3; /* run | reset */
+		}
+
+		/*
+		 * Phase D: Signal the vCPU thread to run the guest and wait
+		 * for it to complete.
+		 *
+		 * The vCPU thread is a kernel thread pinned to target_cpu.
+		 * It runs phantom_vmcs_configure_fields() (idempotent) and
+		 * then phantom_run_guest() — all on the correct CPU where the
+		 * VMCS is current.
+		 *
+		 * Nested KVM IPI safety:
+		 *
+		 *   After the first VMLAUNCH, KVM L0's nested VMX tracking
+		 *   for target_cpu is "dirty" even after the guest exits.
+		 *   Any RESCHEDULE IPI sent to target_cpu in this state
+		 *   causes a triple fault.  complete() sends RESCHEDULE IPI.
+		 *
+		 *   On the FIRST run: the vCPU thread is sleeping on
+		 *   vcpu_run_start completion (Phase 1 in phantom_vcpu_fn).
+		 *   complete() is safe — no VMLAUNCH has occurred yet.
+		 *
+		 *   On SUBSEQUENT runs: the vCPU thread is busy-waiting on
+		 *   vcpu_work_ready (Phase 2 in phantom_vcpu_fn).  We set the
+		 *   flag via smp_store_release (no IPI) and the thread polls
+		 *   it via smp_load_acquire in its cpu_relax() busy-wait loop.
+		 */
+		if (!state->vmcs_configured) {
+			/* First run: thread is sleeping, safe to use complete */
+			complete(&state->vcpu_run_start);
+		} else {
+			/*
+			 * Subsequent run: thread is busy-waiting.
+			 * smp_store_release pairs with smp_load_acquire in
+			 * phantom_vcpu_fn to ensure the run_request update
+			 * is visible before vcpu_work_ready is seen as true.
+			 */
+			smp_store_release(&state->vcpu_work_ready, true);
+		}
+
+		/* Wait for the vCPU thread to finish the guest run */
+		wait_for_completion(&state->vcpu_run_done);
+
+		if (state->vcpu_run_result < 0) {
+			pr_err("phantom: RUN_GUEST execution failed: %d\n",
+			       state->vcpu_run_result);
+			ret = state->vcpu_run_result;
+			break;
+		}
+
+		/* Populate output fields */
 		args.result      = state->run_result_data;
-		args.exit_reason = state->exit_reason;
+		args.exit_reason = state->exit_reason & 0xFFFF;
 
 		if (copy_to_user((void __user *)arg, &args, sizeof(args)))
 			ret = -EFAULT;

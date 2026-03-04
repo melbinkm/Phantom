@@ -232,6 +232,43 @@ static int __init phantom_init(void)
 		goto fail_vmxon;
 	}
 
+	/*
+	 * Step 8b: Start per-CPU vCPU kernel threads.
+	 *
+	 * Each vCPU thread is pinned to its target CPU and waits for work
+	 * signals from the ioctl handler.  This avoids the smp_call_function
+	 * IPI mechanism which breaks KVM nested VMX state on repeated calls.
+	 */
+	{
+		int cpu;
+
+		for_each_cpu(cpu, pdev->vmx_cpumask) {
+			struct phantom_vmx_cpu_state *state;
+
+			state = per_cpu_ptr(&phantom_vmx_state, cpu);
+			ret = phantom_vcpu_thread_start(state);
+			if (ret) {
+				pr_err("phantom: CPU%d: vCPU thread start "
+				       "failed: %d\n", cpu, ret);
+				/* Stop already-started threads */
+				{
+					int c;
+
+					for_each_cpu(c, pdev->vmx_cpumask) {
+						struct phantom_vmx_cpu_state *s;
+
+						if (c == cpu)
+							break;
+						s = per_cpu_ptr(&phantom_vmx_state,
+								c);
+						phantom_vcpu_thread_stop(s);
+					}
+				}
+				goto fail_vmcs_alloc;
+			}
+		}
+	}
+
 	pdev->nr_vmx_cores = cpumask_weight(pdev->vmx_cpumask);
 
 	/* Step 9: mark as fully initialised */
@@ -241,6 +278,8 @@ static int __init phantom_init(void)
 		pdev->nr_vmx_cores);
 	return 0;
 
+fail_vmcs_alloc:
+	phantom_vmcs_free_all(pdev->vmx_cpumask);
 fail_vmxon:
 	phantom_vmxoff_all(pdev->vmx_cpumask);
 fail_chardev:
@@ -264,7 +303,45 @@ static void __exit phantom_exit(void)
 
 	pdev->initialized = false;
 
-	/* Tear down VMCS guest execution resources first */
+	/*
+	 * Shutdown order (reverse of init):
+	 *
+	 * 1. VMCLEAR the VMCS on each target CPU.  This must happen while the
+	 *    EPT and guest pages are still valid — the processor may reference
+	 *    them internally during the VMCLEAR operation.  VMCLEAR also marks
+	 *    the VMCS as "not current", preventing any further VM entries.
+	 *
+	 * 2. Free the VMCS region page (after VMCLEAR has completed).
+	 *
+	 * 3. Free EPT and guest memory pages (after the VMCS no longer
+	 *    references them as an "active" VMCS).
+	 *
+	 * 4. VMXOFF to exit VMX root mode.
+	 *
+	 * This ordering ensures we never free pages that the CPU might still
+	 * reference through EPT or VMCS internal state.
+	 */
+	/* Stop vCPU threads before touching VMCS state */
+	pr_info("phantom: exit: step 0 vcpu threads\n");
+	{
+		int cpu;
+
+		for_each_cpu(cpu, pdev->vmx_cpumask) {
+			struct phantom_vmx_cpu_state *state;
+
+			state = per_cpu_ptr(&phantom_vmx_state, cpu);
+			phantom_vcpu_thread_stop(state);
+		}
+	}
+	pr_info("phantom: exit: step 0 done\n");
+
+	pr_info("phantom: exit: step 1 VMCS free all\n");
+	/* VMCLEAR + VMXOFF already done by vCPU thread in step 0 */
+	phantom_vmcs_free_all(pdev->vmx_cpumask);
+	pr_info("phantom: exit: step 1 done\n");
+
+	/* Now safe to free EPT and guest pages */
+	pr_info("phantom: exit: step 2 teardown\n");
 	{
 		int cpu;
 
@@ -275,9 +352,11 @@ static void __exit phantom_exit(void)
 			phantom_vmcs_teardown(state);
 		}
 	}
+	pr_info("phantom: exit: step 2 done\n");
 
-	phantom_vmcs_free_all(pdev->vmx_cpumask);
+	pr_info("phantom: exit: step 3 VMXOFF\n");
 	phantom_vmxoff_all(pdev->vmx_cpumask);
+	pr_info("phantom: exit: step 3 done\n");
 	phantom_chardev_unregister(pdev);
 	phantom_debug_exit();
 	free_cpumask_var(pdev->vmx_cpumask);
