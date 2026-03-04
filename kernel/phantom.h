@@ -32,17 +32,19 @@
 /* ------------------------------------------------------------------
  * Iteration result codes (non-negative — returned to userspace)
  *
- * PHANTOM_RESULT_OK        — iteration completed normally via RELEASE hypercall
- * PHANTOM_RESULT_CRASH     — guest fault / triple fault detected
- * PHANTOM_RESULT_TIMEOUT   — VMX preemption timer expired
- * PHANTOM_RESULT_KASAN     — guest KASAN violation
- * PHANTOM_RESULT_PANIC     — guest panic hypercall received
+ * PHANTOM_RESULT_OK              — iteration completed normally (RELEASE)
+ * PHANTOM_RESULT_CRASH           — guest fault / triple fault detected
+ * PHANTOM_RESULT_TIMEOUT         — VMX preemption timer expired
+ * PHANTOM_RESULT_KASAN           — guest KASAN violation
+ * PHANTOM_RESULT_PANIC           — guest panic hypercall received
+ * PHANTOM_RESULT_HYPERCALL_ERROR — invalid/malformed hypercall from guest
  * ------------------------------------------------------------------ */
 #define PHANTOM_RESULT_OK		0
 #define PHANTOM_RESULT_CRASH		1
 #define PHANTOM_RESULT_TIMEOUT		2
 #define PHANTOM_RESULT_KASAN		3
 #define PHANTOM_RESULT_PANIC		4
+#define PHANTOM_RESULT_HYPERCALL_ERROR	5
 
 /* ------------------------------------------------------------------
  * Error codes (negative — returned from ioctl or internal functions)
