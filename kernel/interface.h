@@ -20,8 +20,9 @@
 /* ------------------------------------------------------------------
  * Version encoding: 0xMMmmpp  (Major . minor . patch)
  * Task 1.2 baseline: version 1.2.0 = 0x00010200
+ * Task 1.3 baseline: version 1.3.0 = 0x00010300
  * ------------------------------------------------------------------ */
-#define PHANTOM_VERSION		0x00010200U
+#define PHANTOM_VERSION		0x00010300U
 
 /* ------------------------------------------------------------------
  * ioctl command numbers
@@ -34,19 +35,23 @@
 #define PHANTOM_IOCTL_GET_VERSION	_IOR(PHANTOM_IOCTL_MAGIC, 0, __u32)
 
 /*
- * PHANTOM_IOCTL_RUN_GUEST — load trivial guest binary, run it, return result.
+ * PHANTOM_IOCTL_RUN_GUEST — load guest binary, run it, return result.
  *
  * Userspace fills in:
  *   cpu      — target CPU index (0 = first VMX CPU)
- *   reserved — must be 0
+ *   reserved — test_id: 0 = R/W checksum test, 1 = absent-GPA test
  *
  * Kernel fills in on return:
  *   result      — checksum value returned by guest via SUBMIT_RESULT
  *   exit_reason — final VM exit reason code
+ *
+ * For test_id=1 (absent-GPA test):
+ *   result      = 0 (no checksum)
+ *   exit_reason = 48 (EPT violation, VMX_EXIT_EPT_VIOLATION)
  */
 struct phantom_run_args {
 	__u32 cpu;          /* IN: CPU index (0 = default)            */
-	__u32 reserved;     /* IN: must be 0                          */
+	__u32 reserved;     /* IN: test_id (0=RW test, 1=absent-GPA)  */
 	__u64 result;       /* OUT: checksum from guest SUBMIT_RESULT */
 	__u32 exit_reason;  /* OUT: final VM exit reason              */
 	__u32 padding;      /* struct alignment padding               */
@@ -54,6 +59,14 @@ struct phantom_run_args {
 
 #define PHANTOM_IOCTL_RUN_GUEST		_IOWR(PHANTOM_IOCTL_MAGIC, 1, \
 					      struct phantom_run_args)
+
+/*
+ * PHANTOM_IOCTL_DEBUG_DUMP_EPT — walk the EPT and emit trace_printk output.
+ *
+ * No arguments.  Output goes to /sys/kernel/debug/tracing/trace.
+ * Returns 0 on success, -EINVAL if pages not allocated.
+ */
+#define PHANTOM_IOCTL_DEBUG_DUMP_EPT	_IO(PHANTOM_IOCTL_MAGIC, 6)
 
 /*
  * Reserved for future phases:

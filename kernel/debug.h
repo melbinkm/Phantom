@@ -7,12 +7,19 @@
  *
  * VMCS dump and field validator are defined in debug.c and are only
  * called from slow-path contexts (module init, unexpected VM exit).
+ *
+ * EPT walker (phantom_walk_ept / phantom_debug_dump_ept) uses
+ * trace_printk to output GPA→HPA mappings without printk overhead.
  */
 #ifndef PHANTOM_DEBUG_H
 #define PHANTOM_DEBUG_H
 
 #include <linux/types.h>
 #include <linux/compiler.h>
+
+/* Forward declarations to avoid circular includes */
+struct phantom_ept_state;
+struct phantom_vmx_cpu_state;
 
 /* ------------------------------------------------------------------
  * Hot-path trace macros — active only when PHANTOM_DEBUG is defined.
@@ -89,5 +96,26 @@ int phantom_debug_init(void);
  * phantom_debug_exit - Tear down debug subsystem.
  */
 void phantom_debug_exit(void);
+
+/**
+ * phantom_walk_ept - Walk the 4-level EPT and emit mappings via trace_printk.
+ * @ept: EPT state to walk.
+ *
+ * Traverses all levels of the EPT and prints each mapped GPA range,
+ * its HPA, permissions, and memory type.  Output goes to the trace
+ * ring buffer — read via /sys/kernel/debug/tracing/trace.
+ *
+ * Slow-path only.  Must NOT be called from a VM-exit handler.
+ */
+void phantom_walk_ept(struct phantom_ept_state *ept);
+
+/**
+ * phantom_debug_dump_ept - Wrapper: dump EPT for a given VMX CPU state.
+ * @state: Per-CPU VMX state (must have pages_allocated set).
+ *
+ * Calls phantom_walk_ept() on state->ept.
+ * Returns 0 on success, -EINVAL if pages not allocated.
+ */
+int phantom_debug_dump_ept(struct phantom_vmx_cpu_state *state);
 
 #endif /* PHANTOM_DEBUG_H */

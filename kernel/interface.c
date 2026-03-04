@@ -50,30 +50,186 @@
 #include "phantom.h"
 #include "interface.h"
 #include "vmx_core.h"
+#include "ept.h"
+#include "debug.h"
 #include "compat.h"
 
 /* ------------------------------------------------------------------
- * Guest binary — trivial_guest machine code embedded as byte array.
+ * Guest binary 1 (test_id=0): R/W test
  *
- * This is the hand-assembled equivalent of guest/trivial_guest.S:
+ * Reads 10 pages at GPA 0x30000–0x39000 (80 u64 values each page),
+ * writes a pattern, re-reads, XORs all u64 values into a checksum,
+ * and submits it via VMCALL(1, checksum, 0, 0, 0).
  *
- *   xor  %rax, %rax         ; RAX = 0 (GET_HOST_DATA hypercall)
- *   vmcall                  ; host sets RBX = data buffer GPA
- *   xor  %rcx, %rcx         ; counter = 0
- *   xor  %rdx, %rdx         ; accumulator = 0
- * .loop:
- *   mov  (%rbx,%rcx,8),%rax ; load data[rcx]
- *   xor  %rax, %rdx         ; acc ^= data[rcx]
- *   inc  %rcx               ; rcx++
- *   cmp  $512, %rcx         ; if rcx < 512, continue
- *   jl   .loop
- *   mov  %rdx, %rbx         ; RBX = checksum
- *   mov  $1, %rax            ; RAX = 1 (SUBMIT_RESULT hypercall)
- *   vmcall                  ; host records RBX
+ * 10 pages × 512 u64 values = 5120 u64 values XOR'd.
+ *
+ * Assembly (64-bit long mode):
+ *
+ *   ; Phase 1: Write pattern to 10 pages at GPA 0x30000–0x39000
+ *   mov  $0x30000, %rbx       ; base GPA
+ *   xor  %rcx, %rcx           ; page index = 0
+ * .write_loop:
+ *   ; Write 512 u64 values to page rcx
+ *   mov  %rbx, %rdi           ; page base
+ *   xor  %rsi, %rsi           ; word index = 0
+ * .write_word:
+ *   mov  %rcx, %rax            ; page_idx
+ *   shl  $9, %rax              ; × 512
+ *   add  %rsi, %rax            ; + word_idx → unique value
+ *   mov  %rax, (%rdi,%rsi,8)
+ *   inc  %rsi
+ *   cmp  $512, %rsi
+ *   jl   .write_word
+ *   add  $0x1000, %rbx
+ *   inc  %rcx
+ *   cmp  $10, %rcx
+ *   jl   .write_loop
+ *
+ *   ; Phase 2: XOR all 10×512 values into checksum
+ *   mov  $0x30000, %rbx
+ *   mov  $5120, %rcx          ; total u64 count
+ *   xor  %rdx, %rdx           ; checksum = 0
+ * .xor_loop:
+ *   sub  $1, %rcx
+ *   mov  (%rbx,%rcx,8), %rax
+ *   xor  %rax, %rdx
+ *   test %rcx, %rcx
+ *   jnz  .xor_loop
+ *
+ *   ; Submit checksum
+ *   mov  %rdx, %rbx
+ *   mov  $1, %rax
+ *   vmcall
  * .halt:
  *   hlt
  *   jmp  .halt
+ *
+ * Hand-assembled bytes below.  Offsets verified by manual byte count.
+ *
+ * Byte layout (key labels):
+ *   Byte  0: mov $0x30000, %rbx  (10 bytes)
+ *   Byte 10: xor %rcx, %rcx      (3 bytes)
+ *   Byte 13: .write_loop
+ *   Byte 13: mov %rbx, %rdi      (3 bytes)
+ *   Byte 16: xor %rsi, %rsi      (3 bytes)
+ *   Byte 19: .write_word
+ *   Byte 19: mov %rcx, %rax      (3 bytes)
+ *   Byte 22: shl $9, %rax        (4 bytes)
+ *   Byte 26: add %rsi, %rax      (3 bytes)
+ *   Byte 29: mov %rax, (...)     (4 bytes)
+ *   Byte 33: inc %rsi            (3 bytes)
+ *   Byte 36: cmp $512, %rsi      (7 bytes)
+ *   Byte 43: jl .write_word  → next_instr=45, target=19, offset=-26=0xE6
+ *   Byte 45: add $0x1000, %rbx   (7 bytes)
+ *   Byte 52: inc %rcx            (3 bytes)
+ *   Byte 55: cmp $10, %rcx       (4 bytes)
+ *   Byte 59: jl .write_loop  → next_instr=61, target=13, offset=-48=0xD0
  * ------------------------------------------------------------------ */
+static const u8 phantom_rw_guest_bin[] = {
+	/*
+	 * Phase 1: write pattern
+	 *   mov $0x30000, %rbx
+	 */
+	0x48, 0xBB, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+	/*   xor %rcx, %rcx */
+	0x48, 0x31, 0xC9,
+	/* .write_loop: */
+	/*   mov %rbx, %rdi */
+	0x48, 0x89, 0xDF,
+	/*   xor %rsi, %rsi */
+	0x48, 0x31, 0xF6,
+	/* .write_word: */
+	/*   mov %rcx, %rax */
+	0x48, 0x89, 0xC8,
+	/*   shl $9, %rax */
+	0x48, 0xC1, 0xE0, 0x09,
+	/*   add %rsi, %rax */
+	0x48, 0x01, 0xF0,
+	/*   mov %rax, (%rdi,%rsi,8) */
+	0x48, 0x89, 0x04, 0xF7,
+	/*   inc %rsi */
+	0x48, 0xFF, 0xC6,
+	/*   cmp $512, %rsi */
+	0x48, 0x81, 0xFE, 0x00, 0x02, 0x00, 0x00,
+	/*   jl .write_word  (offset = -26) */
+	0x7C, 0xE6,
+	/*   add $0x1000, %rbx */
+	0x48, 0x81, 0xC3, 0x00, 0x10, 0x00, 0x00,
+	/*   inc %rcx */
+	0x48, 0xFF, 0xC1,
+	/*   cmp $10, %rcx */
+	0x48, 0x83, 0xF9, 0x0A,
+	/*   jl .write_loop  (offset = -48) */
+	0x7C, 0xD0,
+	/*
+	 * Phase 2: XOR all 5120 values
+	 *   mov $0x30000, %rbx
+	 */
+	0x48, 0xBB, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+	/*   mov $5120, %rcx */
+	0x48, 0xC7, 0xC1, 0x00, 0x14, 0x00, 0x00,
+	/*   xor %rdx, %rdx */
+	0x48, 0x31, 0xD2,
+	/* .xor_loop: */
+	/*   sub $1, %rcx */
+	0x48, 0xFF, 0xC9,
+	/*   mov (%rbx,%rcx,8), %rax */
+	0x48, 0x8B, 0x04, 0xCB,
+	/*   xor %rax, %rdx */
+	0x48, 0x31, 0xC2,
+	/*   test %rcx, %rcx */
+	0x48, 0x85, 0xC9,
+	/*   jnz .xor_loop  (offset = -15) */
+	0x75, 0xF1,
+	/* Submit: mov %rdx, %rbx */
+	0x48, 0x89, 0xD3,
+	/* mov $1, %rax */
+	0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,
+	/* vmcall */
+	0x0F, 0x01, 0xC1,
+	/* hlt */
+	0xF4,
+	/* jmp .halt (offset = -2) */
+	0xEB, 0xFD,
+};
+
+/* ------------------------------------------------------------------
+ * Guest binary 2 (test_id=1): absent-GPA test
+ *
+ * Accesses GPA 0x1000000 (first GPA outside the EPT RAM map).
+ * This triggers an EPT violation BEFORE any VMCALL, so:
+ *   - exit_reason = 48 (VMX_EXIT_EPT_VIOLATION)
+ *   - run_result  = PHANTOM_RESULT_CRASH (1)
+ *
+ * Assembly (64-bit long mode):
+ *
+ *   mov $0x1000000, %rbx   ; target absent GPA
+ *   mov (%rbx), %rax       ; triggers EPT violation
+ *   ; (never reached — EPT violation exits here)
+ *   vmcall                 ; if somehow reached, halt
+ * .halt:
+ *   hlt
+ *   jmp .halt
+ * ------------------------------------------------------------------ */
+static const u8 phantom_absent_gpa_guest_bin[] = {
+	/* mov $0x1000000, %rbx */
+	0x48, 0xBB,
+	0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+	/* mov (%rbx), %rax  — triggers EPT violation */
+	0x48, 0x8B, 0x03,
+	/* vmcall — safety: if somehow reached */
+	0x0F, 0x01, 0xC1,
+	/* hlt */
+	0xF4,
+	/* jmp .halt (offset = -2) */
+	0xEB, 0xFD,
+};
+
+/*
+ * Task 1.2 backward-compat: original trivial guest binary (test_id=0
+ * before task 1.3 introduced the rw_guest_bin).  Kept for reference.
+ * Not loaded for any test_id in task 1.3+.
+ */
 static const u8 phantom_trivial_guest_bin[] = {
 	/* xor %rax, %rax */              0x48, 0x31, 0xC0,
 	/* vmcall */                       0x0F, 0x01, 0xC1,
@@ -140,15 +296,22 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		struct phantom_run_args args;
 		struct phantom_vmx_cpu_state *state;
 		int target_cpu;
-		u64 *dp;
-		int i;
+		u32 test_id;
 
 		if (copy_from_user(&args, (void __user *)arg, sizeof(args))) {
 			ret = -EFAULT;
 			break;
 		}
 
-		if (args.reserved != 0) {
+		/*
+		 * args.reserved is used as test_id in task 1.3:
+		 *   0 = R/W checksum test (10 pages at GPA 0x30000–0x39000)
+		 *   1 = absent-GPA test (access GPA 0x1000000)
+		 */
+		test_id = args.reserved;
+		if (test_id > 1) {
+			pr_err("phantom: RUN_GUEST: invalid test_id=%u\n",
+			       test_id);
 			ret = -EINVAL;
 			break;
 		}
@@ -197,17 +360,58 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 * The vCPU thread handles all VMCS operations.
 		 */
 
-		/* Load guest binary into code page (always refresh) */
-		memcpy(page_address(state->guest_code_page),
-		       phantom_trivial_guest_bin,
-		       sizeof(phantom_trivial_guest_bin));
-
-		/* Fill data page with known test pattern:
-		 *   data[i] = (i+1) * 0x1234567890ABCDEFull
+		/*
+		 * Select and load guest binary into code page.
+		 * test_id=0: R/W checksum test
+		 * test_id=1: absent-GPA EPT violation test
 		 */
-		dp = (u64 *)page_address(state->guest_data_page);
-		for (i = 0; i < 512; i++)
-			dp[i] = (u64)(i + 1) * 0x1234567890ABCDEFull;
+		if (test_id == 0) {
+			memcpy(page_address(state->guest_code_page),
+			       phantom_rw_guest_bin,
+			       sizeof(phantom_rw_guest_bin));
+
+			/*
+			 * Fill 10 R/W test pages at GPA 0x30000–0x39000
+			 * with a known pattern that the guest will also write,
+			 * then XOR.  The host pre-fills so we can verify the
+			 * guest's independent read matches.
+			 *
+			 * Pattern: page[p].word[w] = p * 512 + w
+			 * (same pattern the guest writes, so after write+read,
+			 * the XOR checksum is deterministic and testable).
+			 *
+			 * Note: the guest WRITES this same pattern first, then
+			 * XORs.  The host pre-fill just ensures the pages are
+			 * zeroed (already done by alloc_pages_node with
+			 * __GFP_ZERO).  We do a fresh zero here to guarantee
+			 * determinism across multiple runs.
+			 */
+			{
+				int p;
+
+				for (p = 0; p < GUEST_RWTEST_NR_PAGES; p++) {
+					u64 gpa = GUEST_RWTEST_GPA_BASE +
+						  (u64)p * PAGE_SIZE;
+					struct page *pg;
+					u64 *dp;
+
+					pg = phantom_ept_get_ram_page(
+						&state->ept, gpa);
+					if (!pg)
+						continue;
+					dp = (u64 *)page_address(pg);
+					memset(dp, 0, PAGE_SIZE);
+				}
+			}
+		} else {
+			/* test_id=1: absent-GPA test */
+			memcpy(page_address(state->guest_code_page),
+			       phantom_absent_gpa_guest_bin,
+			       sizeof(phantom_absent_gpa_guest_bin));
+		}
+
+		/* Save test_id for the vCPU thread */
+		state->test_id = test_id;
 
 		/*
 		 * Phase C: Prepare guest-state reset for relaunches.
@@ -285,6 +489,39 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 
 		if (copy_to_user((void __user *)arg, &args, sizeof(args)))
 			ret = -EFAULT;
+		break;
+	}
+
+	case PHANTOM_IOCTL_DEBUG_DUMP_EPT: {
+		int target_cpu = -1;
+		struct phantom_vmx_cpu_state *state;
+		int cpu;
+
+		for_each_cpu(cpu, pdev->vmx_cpumask) {
+			target_cpu = cpu;
+			break;
+		}
+
+		if (target_cpu < 0) {
+			pr_err("phantom: DEBUG_DUMP_EPT: no VMX CPU\n");
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+		/*
+		 * Ensure pages are allocated before walking the EPT.
+		 * phantom_vmcs_setup() is idempotent — no-op if already done.
+		 */
+		ret = phantom_vmcs_setup(state);
+		if (ret) {
+			pr_err("phantom: DEBUG_DUMP_EPT: vmcs_setup "
+			       "failed: %ld\n", ret);
+			break;
+		}
+
+		ret = phantom_debug_dump_ept(state);
 		break;
 	}
 

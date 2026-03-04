@@ -16,6 +16,8 @@
 #include <linux/kthread.h>
 #include <asm/msr-index.h>
 
+#include "ept.h"
+
 /* ------------------------------------------------------------------
  * MSR constants — only defined if the running kernel headers omit them
  * ------------------------------------------------------------------ */
@@ -337,24 +339,8 @@
 #endif
 
 /* ------------------------------------------------------------------
- * EPT constants
+ * EPT constants and GPA definitions are in ept.h (included above).
  * ------------------------------------------------------------------ */
-#define EPT_PTE_READ			(1ULL << 0)
-#define EPT_PTE_WRITE			(1ULL << 1)
-#define EPT_PTE_EXEC			(1ULL << 2)
-#define EPT_PTE_MEMTYPE_WB		(6ULL << 3)
-#define EPT_PTE_PS			(1ULL << 7)  /* 2MB large page */
-
-#define EPTP_MEMTYPE_WB			(6ULL << 0)
-#define EPTP_PAGEWALK_4			(3ULL << 3)  /* 4-level walk */
-
-/* Guest physical address of the trivial guest code */
-#define GUEST_CODE_GPA			0x10000ULL
-#define GUEST_STACK_GPA			0x11000ULL
-#define GUEST_DATA_GPA			0x12000ULL
-#define GUEST_PML4_GPA			0x13000ULL
-#define GUEST_PDPT_GPA			0x14000ULL
-#define GUEST_PD_GPA			0x15000ULL
 
 /* ------------------------------------------------------------------
  * Guest register file (saved/restored around VM entry/exit)
@@ -498,6 +484,28 @@ struct phantom_vmx_cpu_state {
 	 */
 	bool			 vcpu_stop_requested; /* flag: request stop (no IPI) */
 	struct completion	 vcpu_stopped;        /* thread → stop: VMX done */
+
+	/*
+	 * Task 1.3: Proper 4-level EPT state.
+	 *
+	 * Placed at END of struct to preserve all offsets used by the
+	 * assembly trampoline (guest_regs, launched, host_rsp etc. must
+	 * remain at the same offsets as task 1.2).
+	 *
+	 * The old ept_pml4/ept_pdpt/ept_pd/ept_pt convenience fields and
+	 * guest_*_page fields are kept above for backward compatibility;
+	 * they are initialised from ept.ram_pages[] in phantom_vmcs_setup().
+	 */
+	struct phantom_ept_state ept;
+
+	/*
+	 * test_id: selects which guest binary to run.
+	 *   0 = R/W test (10 pages, compute checksum)
+	 *   1 = absent-GPA test (access GPA 0x1000000 → EPT violation)
+	 *
+	 * Set by the ioctl handler from args.reserved before each run.
+	 */
+	u32			 test_id;
 };
 
 DECLARE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);
