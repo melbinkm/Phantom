@@ -58,6 +58,14 @@
 #define PHANTOM_ERROR_NOT_INITIALIZED	(-ENXIO)
 
 /* ------------------------------------------------------------------
+ * Guest memory layout constants (must match libxml2_harness.c)
+ * ------------------------------------------------------------------ */
+/* Heap base: just above the 64KB payload buffer at 0x600000 */
+#define PHANTOM_GUEST_HEAP_BASE  0x610000UL
+/* Heap limit: leave top 64KB of 16MB EPT RAM free */
+#define PHANTOM_GUEST_HEAP_LIMIT 0xFF0000UL
+
+/* ------------------------------------------------------------------
  * Module parameters (declared in phantom_main.c, extern here)
  * ------------------------------------------------------------------ */
 

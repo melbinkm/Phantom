@@ -216,11 +216,6 @@ int phantom_snapshot_create(struct phantom_vmx_cpu_state *state)
 
 	snap->valid = true;
 
-#ifdef PHANTOM_DEBUG
-	trace_printk("PHANTOM SNAPSHOT_CREATE cpu=%d rip=0x%llx rsp=0x%llx "
-		     "cr3=0x%llx\n",
-		     state->cpu, snap->rip, snap->rsp, snap->cr3);
-#endif
 
 	return 0;
 }
@@ -462,6 +457,15 @@ int phantom_snapshot_restore(struct phantom_vmx_cpu_state *state)
 		     state->perf_last.xrstor_cycles,
 		     state->perf_last.total_cycles);
 #endif
+
+	/*
+	 * Reset the kernel-side guest heap pointer so each iteration starts
+	 * with a clean bump allocator.  The guest's static _heap_ptr is
+	 * reset by the EPT CoW restore above (the page containing it is
+	 * reverted to the snapshot value).  guest_heap_ptr mirrors this for
+	 * syscalls handled by the #UD intercept.
+	 */
+	state->guest_heap_ptr = PHANTOM_GUEST_HEAP_BASE;
 
 	return 0;
 	/* Caller does VMRESUME */

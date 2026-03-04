@@ -687,6 +687,23 @@ struct phantom_vmx_cpu_state {
 	 * do_stop path before VMXOFF.
 	 */
 	struct phantom_pt_state	  pt;
+
+	/*
+	 * Task 2.4: Kernel-side guest heap tracker.
+	 *
+	 * The bare-metal guest has no OS and therefore no syscall handler.
+	 * EFER_SCE is cleared so 'syscall' raises #UD.  The #UD exit handler
+	 * intercepts 'syscall' (0F 05) and implements a minimal subset:
+	 *   SYS_brk  (12) — extend heap via bump pointer
+	 *   SYS_mmap  (9) — anonymous mmap via bump pointer
+	 *   SYS_munmap(11) — no-op
+	 *   SYS_write  (1) — silently succeed (drop stderr)
+	 *
+	 * guest_heap_ptr is reset to PHANTOM_GUEST_HEAP_BASE on every
+	 * snapshot restore so that each iteration gets a clean heap.
+	 * Range: [PHANTOM_GUEST_HEAP_BASE, PHANTOM_GUEST_HEAP_LIMIT).
+	 */
+	u64			  guest_heap_ptr;
 };
 
 DECLARE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);

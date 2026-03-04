@@ -243,10 +243,13 @@ static int handle_acquire(struct phantom_vmx_cpu_state *state)
 
 	if (!state->snap_acquired) {
 		/*
-		 * First ACQUIRE: create the snapshot.
-		 * phantom_snapshot_create() saves all GPRs, VMCS fields,
-		 * XSAVE, and marks all RAM EPT pages read-only.
+		 * First ACQUIRE: initialise the kernel-side guest heap pointer
+		 * to HEAP_BASE before creating the snapshot.  This value will
+		 * be restored on every subsequent snapshot_restore() so each
+		 * fuzzing iteration starts with a clean bump allocator.
 		 */
+		state->guest_heap_ptr = PHANTOM_GUEST_HEAP_BASE;
+
 		ret = phantom_snapshot_create(state);
 		if (ret) {
 			state->run_result = PHANTOM_RESULT_HYPERCALL_ERROR;

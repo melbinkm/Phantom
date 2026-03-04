@@ -749,9 +749,14 @@ static int phantom_vmcs_setup_guest_state(void)
 	/* DR7 = 0x400 (standard reset value) */
 	phantom_vmcs_write64(VMCS_GUEST_DR7, 0x400ULL);
 
-	/* EFER: LME + LMA + SCE */
+	/* EFER: LME + LMA only — SCE (syscall enable) is intentionally cleared.
+	 * The bare guest has no OS and no LSTAR handler.  If musl emits a
+	 * syscall instruction it must fault as #UD (invalid opcode) so the
+	 * exception handler can report it rather than jumping to LSTAR=0 and
+	 * executing arbitrary payload bytes as code.
+	 */
 	phantom_vmcs_write64(VMCS_GUEST_IA32_EFER,
-			     EFER_LME | EFER_LMA | EFER_SCE);
+			     EFER_LME | EFER_LMA);
 
 	/* RFLAGS: bit 1 (reserved, must be 1) */
 	phantom_vmcs_write64(VMCS_GUEST_RFLAGS, 0x2ULL);
@@ -2205,8 +2210,112 @@ static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 			if (info & BIT(11))
 				ec = phantom_vmcs_read32(VMCS_RO_EXIT_INTR_EC);
 
-			pr_err("phantom: CPU%d: EXCEPTION vec=%u "
-			       "info=0x%08x ec=0x%x RIP=0x%llx\n",
+			/*
+			 * #UD (vec=6) intercept for bare-metal guest syscalls.
+			 *
+			 * EFER_SCE is cleared so 'syscall' (0F 05) raises #UD
+			 * instead of jumping to the unset LSTAR.  We implement
+			 * the minimal Linux syscall ABI the musl allocator needs:
+			 *
+			 *   SYS_write  (1)  — silently succeed (drop stdout/stderr)
+			 *   SYS_mmap   (9)  — anonymous mmap via bump allocator
+			 *   SYS_munmap (11) — no-op
+			 *   SYS_brk    (12) — extend heap via bump pointer
+			 *   SYS_mprotect(10) — no-op (ignore page permissions)
+			 *
+			 * guest_heap_ptr lives in the kernel and is reset to
+			 * PHANTOM_GUEST_HEAP_BASE on every snapshot restore so
+			 * each fuzzing iteration starts with a clean heap.
+			 */
+			if (vec == 6) {
+				/* Read 2 instruction bytes from guest GPA */
+				struct page *pg;
+				u8 *kva;
+				u8 b0 = 0, b1 = 0;
+
+				pg = phantom_ept_get_ram_page(&state->ept,
+							      guest_rip);
+				if (pg) {
+					kva = (u8 *)page_address(pg) +
+					      (guest_rip & (PAGE_SIZE - 1));
+					b0 = kva[0];
+					/*
+					 * Safe only if the second byte is on
+					 * the same page (true for all but the
+					 * very last byte of a page — extremely
+					 * unlikely for a 'syscall' instruction).
+					 */
+					if ((guest_rip & (PAGE_SIZE - 1)) <
+					    (PAGE_SIZE - 1))
+						b1 = kva[1];
+				}
+
+				if (b0 == 0x0F && b1 == 0x05) {
+					/* It's a 'syscall' — handle it */
+					u64 nr  = state->guest_regs.rax;
+					u64 a1  = state->guest_regs.rdi;
+					u64 a2  = state->guest_regs.rsi;
+					u64 res = (u64)(s64)-38; /* -ENOSYS */
+
+					switch (nr) {
+					case 1: /* SYS_write */
+						res = state->guest_regs.rdx;
+						break;
+
+					case 9: { /* SYS_mmap */
+						u64 flags = state->guest_regs.r10;
+						s32 fd    = (s32)state->guest_regs.r8;
+
+						/* Only anonymous mmap */
+						if (fd == -1 &&
+						    (flags & 0x20 /* MAP_ANONYMOUS */)) {
+							u64 len = (a2 + 15ULL) & ~15ULL;
+
+							if (state->guest_heap_ptr + len <=
+							    PHANTOM_GUEST_HEAP_LIMIT) {
+								res = state->guest_heap_ptr;
+								state->guest_heap_ptr += len;
+							} else {
+								res = (u64)-1; /* MAP_FAILED */
+							}
+						} else {
+							res = (u64)-1; /* MAP_FAILED */
+						}
+						break;
+					}
+
+					case 10: /* SYS_mprotect — no-op */
+						res = 0;
+						break;
+
+					case 11: /* SYS_munmap — no-op */
+						res = 0;
+						break;
+
+					case 12: /* SYS_brk */
+						if (a1 == 0) {
+							res = state->guest_heap_ptr;
+						} else if (a1 >= PHANTOM_GUEST_HEAP_BASE &&
+							   a1 <= PHANTOM_GUEST_HEAP_LIMIT) {
+							state->guest_heap_ptr = a1;
+							res = a1;
+						} else {
+							/* Failed: return current brk */
+							res = state->guest_heap_ptr;
+						}
+						break;
+					}
+
+					state->guest_regs.rax = res;
+					/* Advance RIP past 'syscall' (2 bytes) */
+					phantom_vmcs_write64(VMCS_GUEST_RIP,
+							     guest_rip + 2);
+					return 0; /* continue guest */
+				}
+				/* Not a syscall — fall through to crash */
+			}
+
+			pr_err("phantom: CPU%d: EXCEPTION vec=%u info=0x%08x ec=0x%x RIP=0x%llx\n",
 			       state->cpu, vec, info, ec, guest_rip);
 			/*
 			 * Encode diagnostics in run_result_data so userspace
@@ -2773,9 +2882,6 @@ int phantom_run_guest(struct phantom_vmx_cpu_state *state)
 
 	state->run_result      = 0;
 	state->run_result_data = 0;
-
-	pr_info("phantom: CPU%d: entering guest loop (launched=%d)\n",
-		state->cpu, (int)state->launched);
 
 	PHANTOM_TRACE_VM_ENTRY(state->cpu);
 

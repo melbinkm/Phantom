@@ -1058,9 +1058,10 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 *   6 = mixed 2MB + 4KB workload (10 writes, both regions)
 		 *   7 = snapshot/restore XMM test (task 1.6)
 		 *   9 = deliberate panic (ACQUIRE + PANIC(0xDEADBEEF))
+		 *  10 = external binary (PHANTOM_LOAD_TARGET, no code overwrite)
 		 */
 		test_id = args.reserved;
-		if (test_id > 9) {
+		if (test_id > 10) {
 			pr_err("phantom: RUN_GUEST: invalid test_id=%u\n",
 			       test_id);
 			ret = -EINVAL;
@@ -1297,7 +1298,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 				       phantom_hypercall_harness_bin,
 				       sizeof(phantom_hypercall_harness_bin));
 			}
-		} else {
+		} else if (test_id == 9) {
 			/*
 			 * test_id=9: deliberate panic test.
 			 *
@@ -1313,6 +1314,13 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			memcpy(page_address(state->guest_code_page),
 			       phantom_panic_guest_bin,
 			       sizeof(phantom_panic_guest_bin));
+		} else {
+			/*
+			 * test_id >= 10: external binary already loaded via
+			 * PHANTOM_LOAD_TARGET.  Do not overwrite guest_code_page.
+			 * The caller is responsible for loading the binary into
+			 * EPT RAM before issuing RUN_GUEST.
+			 */
 		}
 
 		/* Save test_id for the vCPU thread */
@@ -1939,16 +1947,23 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 
 	case PHANTOM_LOAD_TARGET: {
 		/*
-		 * PHANTOM_LOAD_TARGET — copy binary from userspace into
-		 * the payload shared-memory buffer at the given GPA offset.
+		 * PHANTOM_LOAD_TARGET — copy a binary from userspace into
+		 * guest EPT RAM at the specified GPA.
 		 *
-		 * For the current single-instance design this writes into
-		 * the shared_mem payload area.  Userspace is expected to
-		 * call PHANTOM_RUN_ITERATION immediately after.
+		 * args.gpa          — target guest physical address
+		 * args.userspace_ptr — source buffer in userspace
+		 * args.size          — byte count (may span multiple pages)
+		 *
+		 * The binary is written page by page using
+		 * phantom_ept_get_ram_page() so it works for arbitrarily
+		 * large binaries (up to 16MB EPT RAM).
+		 *
+		 * Legacy behaviour (gpa == 0): write into shared_mem->payload
+		 * (max PHANTOM_PAYLOAD_MAX bytes) for compatibility with the
+		 * task 2.3 payload-only interface.
 		 */
 		struct phantom_load_args args;
 		struct phantom_vmx_cpu_state *state;
-		struct phantom_shared_mem *sm;
 		int target_cpu;
 
 		if (copy_from_user(&args, (void __user *)arg, sizeof(args))) {
@@ -1956,13 +1971,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			break;
 		}
 
-		if (args.size > PHANTOM_PAYLOAD_MAX) {
-			ret = -EINVAL;
-			break;
-		}
-
 		target_cpu = phantom_file_cpu(fctx);
-
 		if (target_cpu < 0) {
 			ret = -ENODEV;
 			break;
@@ -1970,23 +1979,72 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 
 		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
 
-		if (!state->shared_mem) {
-			pr_err("phantom: LOAD_TARGET: shared_mem not allocated "
-			       "(call CREATE_VM first)\n");
-			ret = -ENXIO;
-			break;
+		if (args.gpa == 0) {
+			/* Legacy: write into shared_mem payload buffer */
+			struct phantom_shared_mem *sm;
+
+			if (args.size > PHANTOM_PAYLOAD_MAX) {
+				ret = -EINVAL;
+				break;
+			}
+			if (!state->shared_mem) {
+				ret = -ENXIO;
+				break;
+			}
+			sm = (struct phantom_shared_mem *)state->shared_mem;
+			if (copy_from_user(sm->payload,
+					   (void __user *)(uintptr_t)
+					   args.userspace_ptr,
+					   (size_t)args.size)) {
+				ret = -EFAULT;
+				break;
+			}
+			sm->payload_len = (u32)args.size;
+		} else {
+			/*
+			 * EPT RAM load: scatter the binary page by page.
+			 * Supports binaries larger than PHANTOM_PAYLOAD_MAX.
+			 */
+			u64 gpa = args.gpa;
+			u64 remaining = args.size;
+			u8 __user *uptr = (u8 __user *)(uintptr_t)
+						args.userspace_ptr;
+
+			if (gpa + remaining > PHANTOM_EPT_RAM_END) {
+				ret = -EINVAL;
+				break;
+			}
+
+			while (remaining > 0) {
+				struct page *pg;
+				u8 *kva;
+				u64 page_off = gpa & (PAGE_SIZE - 1);
+				u64 chunk = PAGE_SIZE - page_off;
+				u64 copy_len;
+
+				if (chunk > remaining)
+					chunk = remaining;
+				copy_len = chunk;
+
+				pg = phantom_ept_get_ram_page(&state->ept,
+							      gpa);
+				if (!pg) {
+					ret = -ERANGE;
+					break;
+				}
+
+				kva = (u8 *)page_address(pg) + page_off;
+				if (copy_from_user(kva, uptr,
+						   (size_t)copy_len)) {
+					ret = -EFAULT;
+					break;
+				}
+
+				gpa       += copy_len;
+				uptr      += copy_len;
+				remaining -= copy_len;
+			}
 		}
-
-		sm = (struct phantom_shared_mem *)state->shared_mem;
-
-		if (copy_from_user(sm->payload,
-				   (void __user *)(uintptr_t)args.userspace_ptr,
-				   (size_t)args.size)) {
-			ret = -EFAULT;
-			break;
-		}
-
-		sm->payload_len = (u32)args.size;
 		break;
 	}
 
@@ -2059,6 +2117,8 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		}
 
 		if (args2.payload_size > PHANTOM_PAYLOAD_MAX) {
+			pr_err("phantom: RUN_ITERATION: payload_size=%u > MAX=%u\n",
+			       args2.payload_size, PHANTOM_PAYLOAD_MAX);
 			ret = -EINVAL;
 			break;
 		}
@@ -2077,6 +2137,9 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		}
 
 		if (!state->snap_acquired) {
+			pr_err("phantom: RUN_ITERATION: snap_acquired=false "
+			       "cpu=%d pages=%d\n",
+			       target_cpu, state->pages_allocated);
 			ret = -EINVAL;
 			break;
 		}
