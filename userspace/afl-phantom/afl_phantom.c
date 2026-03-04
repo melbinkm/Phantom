@@ -16,6 +16,7 @@
 #include "afl_phantom.h"
 
 #include <getopt.h>
+#include <pthread.h>
 #include <time.h>
 #include <sys/time.h>
 
@@ -31,6 +32,28 @@ static void *afl_bitmap    = NULL;  /* AFL++ shm bitmap pointer         */
 /* Persistent-mode testcase pointers set by AFL++ */
 static uint8_t  *afl_testcase_buf = NULL;
 static uint32_t  afl_testcase_len = 0;
+
+/* Multi-core state (-j N) */
+#define PHANTOM_MAX_CORES 8
+
+struct core_state {
+	int      fd;
+	void    *payload_map;
+	void    *bitmap_map;
+	int      core_id;
+	uint32_t iterations;
+	uint32_t timeout_ms;
+	/* results */
+	uint64_t ok;
+	uint64_t crash;
+	uint64_t timeout_cnt;
+	uint64_t kasan;
+	uint64_t other;
+	double   exec_per_sec;
+};
+
+static struct core_state g_cores[PHANTOM_MAX_CORES];
+static int g_num_cores = 0;
 
 /* ------------------------------------------------------------------
  * Helpers
@@ -300,6 +323,209 @@ static void run_forkserver(void)
 }
 
 /* ------------------------------------------------------------------
+ * Multi-core helpers
+ * ------------------------------------------------------------------ */
+
+/*
+ * open_core - open /dev/phantom for a single core, create VM, mmap regions.
+ *
+ * Each core gets an independent fd so that the kernel can track per-instance
+ * state separately.  pinned_cpu=core_id binds the VM exit thread.
+ */
+static int open_core(struct core_state *cs)
+{
+	uint32_t ver;
+	struct phantom_create_args args;
+
+	cs->fd = open("/dev/phantom", O_RDWR);
+	if (cs->fd < 0) {
+		perror("open /dev/phantom (core)");
+		return -1;
+	}
+
+	if (phantom_get_version(cs->fd, &ver) < 0) {
+		perror("PHANTOM_IOCTL_GET_VERSION (core)");
+		close(cs->fd);
+		cs->fd = -1;
+		return -1;
+	}
+
+	memset(&args, 0, sizeof(args));
+	args.pinned_cpu    = (uint32_t)cs->core_id;
+	args.cow_pool_pages = 0;
+	args.topa_size_mb  = 0;
+	args.guest_mem_mb  = 0;
+
+	if (phantom_create_vm(cs->fd, &args) < 0) {
+		fprintf(stderr, "afl-phantom: CREATE_VM(core=%d) failed: %s\n",
+			cs->core_id, strerror(errno));
+		close(cs->fd);
+		cs->fd = -1;
+		return -1;
+	}
+
+	cs->payload_map = mmap(NULL, AFL_MAP_SIZE,
+			       PROT_READ | PROT_WRITE,
+			       MAP_SHARED, cs->fd, PHANTOM_MMAP_PAYLOAD);
+	if (cs->payload_map == MAP_FAILED) {
+		perror("mmap payload (core)");
+		close(cs->fd);
+		cs->fd = -1;
+		return -1;
+	}
+
+	cs->bitmap_map = mmap(NULL, AFL_MAP_SIZE,
+			      PROT_READ,
+			      MAP_SHARED, cs->fd, PHANTOM_MMAP_BITMAP);
+	if (cs->bitmap_map == MAP_FAILED) {
+		perror("mmap bitmap (core)");
+		munmap(cs->payload_map, AFL_MAP_SIZE);
+		close(cs->fd);
+		cs->fd = -1;
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * thread_worker - pthreads entry point for one core in multi-core test mode.
+ */
+static void *thread_worker(void *arg)
+{
+	struct core_state *cs = (struct core_state *)arg;
+	struct timespec t_start, t_end;
+	uint8_t *payload;
+	uint32_t i;
+	double elapsed_s;
+
+	/* Bootstrap: run built-in kAFL harness guest to ACQUIRE point */
+	{
+		struct phantom_run_args rg;
+		memset(&rg, 0, sizeof(rg));
+		rg.cpu     = (uint32_t)cs->core_id;
+		rg.reserved = 8;
+		if (ioctl(cs->fd, PHANTOM_IOCTL_RUN_GUEST, &rg) < 0) {
+			fprintf(stderr,
+				"afl-phantom: core %d: RUN_GUEST failed: %s\n",
+				cs->core_id, strerror(errno));
+		}
+	}
+
+	payload = calloc(1, AFL_MAP_SIZE);
+	if (!payload)
+		return NULL;
+
+	clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+	for (i = 0; i < cs->iterations; i++) {
+		struct phantom_run_args2 iter;
+
+		memset(&iter, 0, sizeof(iter));
+		iter.payload_ptr  = (uint64_t)(uintptr_t)payload;
+		iter.payload_size = 64;
+		iter.timeout_ms   = cs->timeout_ms;
+
+		if (phantom_run_iteration(cs->fd, &iter) < 0) {
+			cs->other++;
+			continue;
+		}
+
+		switch (iter.result) {
+		case PHANTOM_RESULT_OK:       cs->ok++;          break;
+		case PHANTOM_RESULT_CRASH:    cs->crash++;       break;
+		case PHANTOM_RESULT_TIMEOUT:  cs->timeout_cnt++; break;
+		case PHANTOM_RESULT_KASAN:    cs->kasan++;       break;
+		case PHANTOM_RESULT_PANIC:    cs->crash++;       break;
+		default:                      cs->other++;       break;
+		}
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &t_end);
+	elapsed_s = (t_end.tv_sec  - t_start.tv_sec) +
+		    (t_end.tv_nsec - t_start.tv_nsec) / 1e9;
+	cs->exec_per_sec = cs->iterations / elapsed_s;
+
+	free(payload);
+	return NULL;
+}
+
+/*
+ * run_multicore_test - run N threads in parallel (one per core).
+ *
+ * Called from standalone --test mode when -j N > 1.
+ */
+static void run_multicore_test(uint32_t iterations, uint32_t timeout_ms)
+{
+	pthread_t threads[PHANTOM_MAX_CORES];
+	uint64_t total_ok = 0, total_crash = 0, total_timeout = 0;
+	uint64_t total_kasan = 0, total_other = 0;
+	double total_exec_sec = 0.0;
+	int i;
+
+	for (i = 0; i < g_num_cores; i++) {
+		g_cores[i].iterations = iterations / g_num_cores;
+		g_cores[i].timeout_ms = timeout_ms;
+		g_cores[i].ok = g_cores[i].crash = 0;
+		g_cores[i].timeout_cnt = g_cores[i].kasan = 0;
+		g_cores[i].other = 0;
+	}
+
+	for (i = 0; i < g_num_cores; i++) {
+		if (pthread_create(&threads[i], NULL, thread_worker,
+				   &g_cores[i]) != 0) {
+			fprintf(stderr, "afl-phantom: pthread_create core %d: %s\n",
+				i, strerror(errno));
+		}
+	}
+
+	for (i = 0; i < g_num_cores; i++)
+		pthread_join(threads[i], NULL);
+
+	fprintf(stderr, "afl-phantom: multi-core results:\n");
+	for (i = 0; i < g_num_cores; i++) {
+		fprintf(stderr,
+			"  core %d: %.0f exec/sec | ok=%lu crash=%lu "
+			"timeout=%lu kasan=%lu other=%lu\n",
+			g_cores[i].core_id,
+			g_cores[i].exec_per_sec,
+			(unsigned long)g_cores[i].ok,
+			(unsigned long)g_cores[i].crash,
+			(unsigned long)g_cores[i].timeout_cnt,
+			(unsigned long)g_cores[i].kasan,
+			(unsigned long)g_cores[i].other);
+		total_ok      += g_cores[i].ok;
+		total_crash   += g_cores[i].crash;
+		total_timeout += g_cores[i].timeout_cnt;
+		total_kasan   += g_cores[i].kasan;
+		total_other   += g_cores[i].other;
+		total_exec_sec += g_cores[i].exec_per_sec;
+	}
+
+	fprintf(stderr,
+		"afl-phantom: aggregate: %.0f exec/sec | ok=%lu crash=%lu "
+		"timeout=%lu kasan=%lu other=%lu\n",
+		total_exec_sec,
+		(unsigned long)total_ok,
+		(unsigned long)total_crash,
+		(unsigned long)total_timeout,
+		(unsigned long)total_kasan,
+		(unsigned long)total_other);
+
+	if (total_ok + total_crash + total_timeout + total_kasan == iterations) {
+		fprintf(stderr, "afl-phantom: PASS (%u/%u)\n",
+			(uint32_t)(total_ok + total_crash +
+				   total_timeout + total_kasan),
+			iterations);
+		exit(0);
+	} else {
+		fprintf(stderr, "afl-phantom: FAIL (%lu/%u failed)\n",
+			(unsigned long)total_other, iterations);
+		exit(1);
+	}
+}
+
+/* ------------------------------------------------------------------
  * Standalone test mode
  * ------------------------------------------------------------------ */
 
@@ -312,7 +538,9 @@ static void usage(const char *prog)
 		"  --payload-file FILE     Use FILE as fuzz input (default: zero-fill)\n"
 		"  --payload-size N        Payload length in bytes (default: 64)\n"
 		"  --iterations N          Number of iterations (default: 100)\n"
-		"  --timeout-ms N          Per-iteration timeout (default: 1000)\n",
+		"  --timeout-ms N          Per-iteration timeout (default: 1000)\n"
+		"  -j N                    Open N phantom fds (cores 0..N-1), "
+		"run N threads in --test mode\n",
 		prog);
 	exit(1);
 }
@@ -434,6 +662,7 @@ static void run_standalone_test(const char *payload_file,
 int main(int argc, char *argv[])
 {
 	int test_mode    = 0;
+	int num_cores    = 0;  /* 0 = single-core (legacy path) */
 	const char *payload_file = NULL;
 	uint32_t payload_size    = 64;
 	uint32_t iterations      = 100;
@@ -450,10 +679,11 @@ int main(int argc, char *argv[])
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "tf:s:n:d:h",
+	while ((opt = getopt_long(argc, argv, "tj:f:s:n:d:h",
 				  longopts, NULL)) != -1) {
 		switch (opt) {
 		case 't': test_mode = 1;               break;
+		case 'j': num_cores = atoi(optarg);    break;
 		case 'f': payload_file = optarg;       break;
 		case 's': payload_size = atoi(optarg); break;
 		case 'n': iterations   = atoi(optarg); break;
@@ -463,6 +693,36 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	if (num_cores < 0 || num_cores > PHANTOM_MAX_CORES) {
+		fprintf(stderr, "afl-phantom: -j must be 1..%d\n",
+			PHANTOM_MAX_CORES);
+		exit(1);
+	}
+
+	/*
+	 * Multi-core mode (-j N > 1): open N independent fds, one per core.
+	 * In AFL++ fork-server mode only the first fd is used for the
+	 * fork-server loop.  Full multi-instance AFL++ is handled externally
+	 * via phantom-multi.sh.
+	 */
+	if (num_cores > 1 && test_mode) {
+		int i;
+
+		g_num_cores = num_cores;
+		for (i = 0; i < num_cores; i++) {
+			g_cores[i].core_id = i;
+			if (open_core(&g_cores[i]) < 0) {
+				fprintf(stderr,
+					"afl-phantom: failed to open core %d\n",
+					i);
+				exit(1);
+			}
+		}
+		run_multicore_test(iterations, timeout_ms);
+		/* run_multicore_test calls exit() */
+	}
+
+	/* Single-core path (default) */
 	open_phantom();
 	create_vm();
 	setup_mmap();
