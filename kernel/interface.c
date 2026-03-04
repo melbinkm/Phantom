@@ -1074,6 +1074,20 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 
 		/*
+		 * Re-prime detection: if RUN_GUEST is called with a different
+		 * test_id than the last run, the previous snapshot is stale.
+		 * Clear snap_acquired and snap_taken so the new binary is
+		 * loaded fresh and a new snapshot is taken on the next ACQUIRE.
+		 */
+		if (state->last_test_id != test_id) {
+			state->snap_acquired   = false;
+			state->snap_taken      = false;
+			state->snap_continue   = false;
+			state->iteration_active = false;
+			state->last_test_id    = test_id;
+		}
+
+		/*
 		 * Select and load guest binary into code page.
 		 * test_id=0: R/W checksum test
 		 * test_id=1: absent-GPA EPT violation test
