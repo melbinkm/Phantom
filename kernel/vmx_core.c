@@ -42,11 +42,14 @@
 #include <asm/msr-index.h>
 #include <asm/special_insns.h>
 #include <asm/linkage.h>       /* ASM_RET: retpoline-safe ret instruction */
+#include <asm/fpu/api.h>       /* kernel_fpu_begin / kernel_fpu_end */
+#include <asm/fpu/xcr.h>       /* xgetbv / XCR_XFEATURE_ENABLED_MASK */
 
 #include "phantom.h"
 #include "vmx_core.h"
 #include "ept.h"
 #include "ept_cow.h"
+#include "snapshot.h"
 #include "hypercall.h"
 #include "nmi.h"
 #include "debug.h"
@@ -729,8 +732,13 @@ static int phantom_vmcs_setup_guest_state(void)
 
 	/*
 	 * CR4: PAE required for 64-bit paging; apply fixed bits.
+	 * OSFXSR (bit 9): required so SSE/MMX instructions do not raise #UD.
+	 * OSXMMEXCPT (bit 10): enable OS-visible SIMD FP exception handling.
+	 * OSXSAVE (bit 18): enable XSAVE/XRSTOR in guest (needed for
+	 *   snapshot XSAVE to capture guest XMM/YMM state).
 	 */
-	cr4 = X86_CR4_PAE;
+	cr4 = X86_CR4_PAE | X86_CR4_OSFXSR | X86_CR4_OSXMMEXCPT |
+	      X86_CR4_OSXSAVE;
 	cr4 = (cr4 | cr4_fixed0) & cr4_fixed1;
 	phantom_vmcs_write64(VMCS_GUEST_CR4, cr4);
 
@@ -1039,10 +1047,72 @@ int phantom_vmcs_setup(struct phantom_vmx_cpu_state *state)
 	state->cow_iteration = 0;
 	state->cow_enabled   = true;
 
+	/*
+	 * Task 1.6: Allocate XSAVE area for snapshot/restore.
+	 *
+	 * Determine the XSAVE area size via CPUID.(EAX=0Dh,ECX=0).EBX —
+	 * this reports the size in bytes of the XSAVE area needed for all
+	 * state components that the CPU supports.
+	 *
+	 * We allocate xsave_area_size + 64 extra bytes so we can align
+	 * the buffer to a 64-byte boundary (required by XSAVE/XRSTOR).
+	 *
+	 * xcr0_supported: read XCR0 register (the host value) as the
+	 * EDX:EAX pair for xsave64/xrstor64.  We use the host XCR0
+	 * value — the "fixed XCR0 model" — so guest XSETBV calls are
+	 * trapped and rejected (handled elsewhere).
+	 *
+	 * A NULL xsave_area means XSAVE is not available or allocation
+	 * failed.  snapshot_create/restore skip the XSAVE step in that
+	 * case — the module still works, just without extended register
+	 * state in the snapshot (XMM test will fail on such hardware).
+	 */
+	{
+		u32 eax_cpuid, ebx_cpuid, ecx_cpuid, edx_cpuid;
+		u32 xsave_sz;
+		void *raw_buf;
+
+		cpuid_count(0x0D, 0, &eax_cpuid, &ebx_cpuid,
+			    &ecx_cpuid, &edx_cpuid);
+		xsave_sz = ebx_cpuid;
+		if (xsave_sz < 512)
+			xsave_sz = 512;  /* SSE-only fallback */
+
+		/* Round up to next 64-byte boundary */
+		xsave_sz = ALIGN(xsave_sz, 64);
+		state->xsave_area_size = xsave_sz;
+
+		raw_buf = kzalloc(xsave_sz + 64, GFP_KERNEL);
+		if (!raw_buf) {
+			pr_warn("phantom: CPU%d: XSAVE area alloc failed "
+				"(snapshot will skip FPU state)\n", cpu);
+			state->xsave_area         = NULL;
+			state->xsave_area_aligned = NULL;
+			state->xcr0_supported     = 0;
+		} else {
+			state->xsave_area = raw_buf;
+			state->xsave_area_aligned = PTR_ALIGN(raw_buf,
+							      (size_t)64);
+			/*
+			 * Read XCR0 to get the host's enabled features mask.
+			 * This must be done on the current CPU; in practice
+			 * all CPUs on the same package have identical XCR0.
+			 */
+			state->xcr0_supported =
+				xgetbv(XCR_XFEATURE_ENABLED_MASK);
+		}
+	}
+
+	memset(&state->snap, 0, sizeof(state->snap));
+	state->snap_taken    = false;
+	state->snap_continue = false;
+
 	state->pages_allocated = true;
 	pr_info("phantom: CPU%d: pages allocated (EPT: 8MB 2MB-pages + "
-		"8MB 4KB-pages, eptp=0x%llx, cow_pool=%u pages)\n",
-		cpu, state->ept.eptp, state->cow_pool.capacity);
+		"8MB 4KB-pages, eptp=0x%llx, cow_pool=%u pages, "
+		"xsave_sz=%u)\n",
+		cpu, state->ept.eptp, state->cow_pool.capacity,
+		state->xsave_area_size);
 	return 0;
 
 err_dirty_list:
@@ -1191,6 +1261,18 @@ void phantom_vmcs_teardown(struct phantom_vmx_cpu_state *state)
 	 */
 	phantom_split_list_free(&state->split_list);
 	state->dirty_overflow_count = 0;
+
+	/* Task 1.6: free XSAVE area and clear snapshot */
+	if (state->xsave_area) {
+		kfree(state->xsave_area);
+		state->xsave_area         = NULL;
+		state->xsave_area_aligned = NULL;
+	}
+	memset(&state->snap, 0, sizeof(state->snap));
+	state->snap_taken         = false;
+	state->snap_continue      = false;
+	state->xsave_area_size    = 0;
+	state->xcr0_supported     = 0;
 
 	state->pages_allocated = false;
 	state->vmcs_configured = false;
@@ -1494,7 +1576,35 @@ static int phantom_vcpu_fn(void *data)
 			smp_store_release(&state->vcpu_work_ready, false);
 		}
 
-		/* Check for valid run request */
+		/*
+		 * Task 1.6: Handle snapshot_create (request=4) and
+		 * snapshot_restore (request=5) as dedicated work items
+		 * that run on this CPU without launching the guest.
+		 *
+		 * These operations must execute on the vCPU thread because:
+		 *   - snapshot_create reads VMCS fields (requires current VMCS)
+		 *   - snapshot_restore writes VMCS fields + issues INVEPT
+		 *   - Both call phantom_ept_mark_all_ro() / walk dirty list
+		 *
+		 * After completing, they signal vcpu_run_done and loop back
+		 * to wait for the next request.  The ioctl handler picks up
+		 * vcpu_run_result to detect failure.
+		 */
+		if (state->vcpu_run_request == 4) {
+			/* snapshot_create on this CPU */
+			state->vcpu_run_result = phantom_snapshot_create(state);
+			complete(&state->vcpu_run_done);
+			continue;
+		}
+
+		if (state->vcpu_run_request == 5) {
+			/* snapshot_restore on this CPU */
+			state->vcpu_run_result = phantom_snapshot_restore(state);
+			complete(&state->vcpu_run_done);
+			continue;
+		}
+
+		/* Check for valid run request (bit 0 = "run guest") */
 		if ((state->vcpu_run_request & 1) == 0)
 			continue;
 
@@ -1515,8 +1625,18 @@ static int phantom_vcpu_fn(void *data)
 		 * Reset VMCS guest state for relaunches (bit 1 set).
 		 * On first run, configure_fields initialised everything.
 		 * On re-launch, reset RIP/RSP/RFLAGS for a clean restart.
+		 *
+		 * Exception: when snap_continue is true (task 1.6), do NOT
+		 * reset RIP/RSP/RFLAGS — snapshot_restore or snapshot_create
+		 * already wrote the correct values from the snapshot.
+		 *
+		 * snap_continue is set by the RUN_GUEST ioctl handler in
+		 * interface.c to true only when test_id==7 and snap_taken==true
+		 * (i.e., this is a phase-2 or post-restore continuation run).
+		 * For all other test_ids snap_continue is false, ensuring a
+		 * clean GUEST_CODE_GPA reset even after a snapshot cycle.
 		 */
-		if (state->vcpu_run_request & 2) {
+		if ((state->vcpu_run_request & 2) && !state->snap_continue) {
 			phantom_vmcs_write64(VMCS_GUEST_RIP, GUEST_CODE_GPA);
 			phantom_vmcs_write64(VMCS_GUEST_RSP,
 					     GUEST_STACK_GPA + 0xFF0ULL);
@@ -1527,6 +1647,13 @@ static int phantom_vcpu_fn(void *data)
 			 * Task 1.4: increment iteration counter.
 			 * phantom_cow_abort_iteration was already called after
 			 * the previous run, so the EPT is back in RO state.
+			 */
+			state->cow_iteration++;
+		} else if ((state->vcpu_run_request & 2) && state->snap_continue) {
+			/*
+			 * snap_continue: snapshot_restore already wrote the
+			 * correct VMCS guest state.  Just increment the
+			 * iteration counter.
 			 */
 			state->cow_iteration++;
 		}

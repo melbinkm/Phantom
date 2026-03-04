@@ -10,6 +10,7 @@ phantom-objs := \
 	vmx_core.o \
 	ept.o \
 	ept_cow.o \
+	snapshot.o \
 	memory.o \
 	interface.o \
 	debug.o \

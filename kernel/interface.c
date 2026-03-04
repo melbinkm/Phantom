@@ -52,6 +52,7 @@
 #include "vmx_core.h"
 #include "ept.h"
 #include "ept_cow.h"
+#include "snapshot.h"
 #include "debug.h"
 #include "compat.h"
 
@@ -565,6 +566,268 @@ static const u8 phantom_trivial_guest_bin[] = {
 };
 
 /* ------------------------------------------------------------------
+ * Guest binary 8 (test_id=7): snapshot/restore XMM test
+ *
+ * This binary is used to test that XSAVE/XRSTOR correctly saves and
+ * restores the extended register state (in particular XMM0) across
+ * a snapshot/restore cycle.
+ *
+ * Protocol:
+ *   Run 1 (before snapshot):
+ *     - Loads a distinctive pattern into XMM0:
+ *         low  64 bits = 0xDEADBEEFCAFEBABE
+ *         high 64 bits = 0x0123456789ABCDEF
+ *     - Writes a distinctive value to 5 pages at GPA 0x900000–0x904000
+ *       (so there is something in the dirty list for snapshot_restore
+ *       to clean up)
+ *     - Issues VMCALL(1, 0xAA) to signal "ready for snapshot"
+ *
+ *   The ioctl handler then:
+ *     - Calls SNAPSHOT_CREATE (marks EPT RO, saves state including XMM0)
+ *
+ *   Run 2 (from snapshot point onward):
+ *     - Guest continues from RIP after the VMCALL in Run 1
+ *     - Reads back XMM0 and checks both halves
+ *     - If XMM0 matches the pattern: issues VMCALL(1, 0xBB) — PASS
+ *     - If XMM0 does NOT match:      issues VMCALL(1, 0xCC) — FAIL
+ *
+ * Expected sequence from userspace:
+ *   1. RUN_GUEST(test_id=7) → result=0xAA (ready for snapshot)
+ *   2. SNAPSHOT_CREATE
+ *   3. RUN_GUEST(test_id=7, continuation) → result=0xBB (XMM match)
+ *   4. SNAPSHOT_RESTORE
+ *   5. RUN_GUEST continuation again → result=0xBB (deterministic)
+ *
+ * Assembly (64-bit long mode):
+ *
+ * Encoding note: SSE/XMM instructions use REX + 0F + ... prefixes.
+ * We hand-assemble the relevant instructions below.
+ *
+ *   ; Load XMM0 low half = 0xDEADBEEFCAFEBABE via movq xmm0, rax
+ *   mov $0xDEADBEEFCAFEBABE, %rax
+ *   movq %rax, %xmm0               ; 66 0F 6E C0
+ *
+ *   ; Load XMM0 high half = 0x0123456789ABCDEF via movq xmm1, rax
+ *   ; then use movlhps xmm0, xmm1  ; 0F 16 C1
+ *   mov $0x0123456789ABCDEF, %rax
+ *   movq %rax, %xmm1               ; 66 0F 6E C8
+ *   movlhps %xmm1, %xmm0          ; 0F 16 C1
+ *   (movlhps moves xmm1 low to xmm0 high)
+ *
+ *   ; Write to 5 pages at GPA 0x900000 to have dirty pages
+ *   mov $0x900000, %rbx
+ *   xor %rcx, %rcx
+ * .write_loop:
+ *   mov $0xCAFE, %rax
+ *   mov %rax, (%rbx)
+ *   add $0x1000, %rbx
+ *   inc %rcx
+ *   cmp $5, %rcx
+ *   jl .write_loop
+ *
+ *   ; Signal "ready for snapshot" via VMCALL(1, 0xAA)
+ *   mov $0xAA, %rbx
+ *   mov $1, %rax
+ *   vmcall
+ *
+ *   ; --- Snapshot has been taken at this point ---
+ *   ; On the NEXT run, execution resumes HERE (at this RIP).
+ *
+ *   ; Check XMM0 low half matches 0xDEADBEEFCAFEBABE
+ *   movq %xmm0, %rax               ; 66 0F 7E C0
+ *   mov $0xDEADBEEFCAFEBABE, %rbx
+ *   cmp %rbx, %rax
+ *   jne .xmm_fail
+ *
+ *   ; Check XMM0 high half via movhlps xmm1, xmm0 then movq xmm1, rax
+ *   movhlps %xmm0, %xmm1           ; 0F 12 C8
+ *   movq %xmm1, %rax               ; 66 0F 7E C8
+ *   mov $0x0123456789ABCDEF, %rbx
+ *   cmp %rbx, %rax
+ *   jne .xmm_fail
+ *
+ *   ; PASS: VMCALL(1, 0xBB)
+ *   mov $0xBB, %rbx
+ *   mov $1, %rax
+ *   vmcall
+ *   hlt
+ *   jmp .halt
+ *
+ * .xmm_fail:
+ *   ; FAIL: VMCALL(1, 0xCC)
+ *   mov $0xCC, %rbx
+ *   mov $1, %rax
+ *   vmcall
+ *   hlt
+ *   jmp .halt
+ *
+ * ------------------------------------------------------------------ */
+static const u8 phantom_snapshot_xmm_guest_bin[] = {
+	/*
+	 * Byte layout — offsets computed carefully for correct jumps:
+	 *
+	 * [0..9]    mov $0xDEADBEEFCAFEBABE, %rax   (10 bytes)
+	 * [10..14]  movq %rax, %xmm0                (5 bytes: 66 48 0F 6E C0)
+	 * [15..24]  mov $0x0123456789ABCDEF, %rax   (10 bytes)
+	 * [25..29]  movq %rax, %xmm1                (5 bytes: 66 48 0F 6E C8)
+	 * [30..32]  movlhps %xmm1, %xmm0            (3 bytes: 0F 16 C1)
+	 *
+	 * [33..42]  mov $0x900000, %rbx              (10 bytes)
+	 * [43..45]  xor %rcx, %rcx                  (3 bytes)
+	 * [46]      .write_loop:
+	 * [46..52]  mov $0xCAFE, %rax               (7 bytes)
+	 * [53..55]  mov %rax, (%rbx)                (3 bytes)
+	 * [56..62]  add $0x1000, %rbx               (7 bytes)
+	 * [63..65]  inc %rcx                        (3 bytes)
+	 * [66..69]  cmp $5, %rcx                    (4 bytes)
+	 * [70..71]  jl .write_loop  rel=-26=0xE6    (2 bytes)
+	 *
+	 * [72..78]  mov $0xAA, %rbx                 (7 bytes)
+	 * [79..85]  mov $1, %rax                    (7 bytes)
+	 * [86..88]  vmcall                           (3 bytes)
+	 *
+	 * === SNAPSHOT RIP = 89 ===
+	 *
+	 * [89..93]  movq %xmm0, %rax                (5 bytes: 66 48 0F 7E C0)
+	 * [94..103] mov $0xDEADBEEFCAFEBABE, %rbx   (10 bytes)
+	 * [104..106] cmp %rbx, %rax                 (3 bytes)
+	 * [107..108] jne .xmm_fail  rel=+43=0x2B    (2 bytes)
+	 *           next_instr = 109
+	 *
+	 * [109..111] movhlps %xmm0, %xmm1           (3 bytes: 0F 12 C8)
+	 * [112..116] movq %xmm1, %rax               (5 bytes: 66 48 0F 7E C8)
+	 * [117..126] mov $0x0123456789ABCDEF, %rbx  (10 bytes)
+	 * [127..129] cmp %rbx, %rax                 (3 bytes)
+	 * [130..131] jne .xmm_fail  rel=+20=0x14    (2 bytes)
+	 *           next_instr = 132
+	 *
+	 * [132..138] mov $0xBB, %rbx                (7 bytes)
+	 * [139..145] mov $1, %rax                   (7 bytes)
+	 * [146..148] vmcall                          (3 bytes)
+	 * [149]     hlt                              (1 byte)
+	 * [150..151] jmp .halt  rel=-2=0xFE         (2 bytes)
+	 *
+	 * .xmm_fail = 152:
+	 * [152..158] mov $0xCC, %rbx                (7 bytes)
+	 * [159..165] mov $1, %rax                   (7 bytes)
+	 * [166..168] vmcall                          (3 bytes)
+	 * [169]     hlt                              (1 byte)
+	 * [170..171] jmp .halt  rel=-2=0xFE         (2 bytes)
+	 *
+	 * Jump offset verification:
+	 *   jl  .write_loop:  target=46, next=72, rel=46-72=-26=0xE6
+	 *   jne .xmm_fail #1: target=152, next=109, rel=152-109=43=0x2B
+	 *   jne .xmm_fail #2: target=152, next=132, rel=152-132=20=0x14
+	 */
+
+	/* [0..9] mov $0xDEADBEEFCAFEBABE, %rax (REX.W B8 + 8-byte imm) */
+	0x48, 0xB8,
+	0xBE, 0xBA, 0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE,
+
+	/* [10..14] movq %rax, %xmm0  (66 REX.W 0F 6E /r, ModRM=C0) */
+	0x66, 0x48, 0x0F, 0x6E, 0xC0,
+
+	/* [15..24] mov $0x0123456789ABCDEF, %rax */
+	0x48, 0xB8,
+	0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01,
+
+	/* [25..29] movq %rax, %xmm1  (66 REX.W 0F 6E /r, ModRM=C8) */
+	0x66, 0x48, 0x0F, 0x6E, 0xC8,
+
+	/* [30..32] movlhps %xmm1, %xmm0  (0F 16 /r, ModRM=C1)
+	 * Moves xmm1[63:0] → xmm0[127:64] */
+	0x0F, 0x16, 0xC1,
+
+	/* [33..42] mov $0x900000, %rbx */
+	0x48, 0xBB,
+	0x00, 0x00, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+	/* [43..45] xor %rcx, %rcx */
+	0x48, 0x31, 0xC9,
+
+	/* .write_loop: [46] */
+	/* [46..52] mov $0xCAFE, %rax */
+	0x48, 0xC7, 0xC0, 0xFE, 0xCA, 0x00, 0x00,
+	/* [53..55] mov %rax, (%rbx) */
+	0x48, 0x89, 0x03,
+	/* [56..62] add $0x1000, %rbx */
+	0x48, 0x81, 0xC3, 0x00, 0x10, 0x00, 0x00,
+	/* [63..65] inc %rcx */
+	0x48, 0xFF, 0xC1,
+	/* [66..69] cmp $5, %rcx */
+	0x48, 0x83, 0xF9, 0x05,
+	/* [70..71] jl .write_loop  (next=72, target=46, rel=46-72=-26=0xE6) */
+	0x7C, 0xE6,
+
+	/* [72..78] mov $0xAA, %rbx */
+	0x48, 0xC7, 0xC3, 0xAA, 0x00, 0x00, 0x00,
+	/* [79..85] mov $1, %rax */
+	0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,
+	/* [86..88] vmcall */
+	0x0F, 0x01, 0xC1,
+
+	/*
+	 * === SNAPSHOT RIP = 89 ===
+	 * On the NEXT run, execution resumes at this byte offset
+	 * (GUEST_CODE_GPA + 89) because snapshot_create saved this RIP.
+	 */
+
+	/* [89..93] movq %xmm0, %rax  (66 REX.W 0F 7E /r, ModRM=C0) */
+	0x66, 0x48, 0x0F, 0x7E, 0xC0,
+
+	/* [94..103] mov $0xDEADBEEFCAFEBABE, %rbx */
+	0x48, 0xBB,
+	0xBE, 0xBA, 0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE,
+
+	/* [104..106] cmp %rbx, %rax */
+	0x48, 0x39, 0xD8,
+
+	/* [107..108] jne .xmm_fail  (next=109, target=152, rel=43=0x2B) */
+	0x75, 0x2B,
+
+	/* [109..111] movhlps %xmm0, %xmm1  (0F 12 /r, ModRM=C8)
+	 * Moves xmm0[127:64] → xmm1[63:0] */
+	0x0F, 0x12, 0xC8,
+
+	/* [112..116] movq %xmm1, %rax  (66 REX.W 0F 7E /r, ModRM=C8) */
+	0x66, 0x48, 0x0F, 0x7E, 0xC8,
+
+	/* [117..126] mov $0x0123456789ABCDEF, %rbx */
+	0x48, 0xBB,
+	0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01,
+
+	/* [127..129] cmp %rbx, %rax */
+	0x48, 0x39, 0xD8,
+
+	/* [130..131] jne .xmm_fail  (next=132, target=152, rel=20=0x14) */
+	0x75, 0x14,
+
+	/* PASS path: */
+	/* [132..138] mov $0xBB, %rbx */
+	0x48, 0xC7, 0xC3, 0xBB, 0x00, 0x00, 0x00,
+	/* [139..145] mov $1, %rax */
+	0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,
+	/* [146..148] vmcall */
+	0x0F, 0x01, 0xC1,
+	/* [149] hlt */
+	0xF4,
+	/* [150..151] jmp .halt  rel=-2 */
+	0xEB, 0xFD,
+
+	/* .xmm_fail = 152: */
+	/* [152..158] mov $0xCC, %rbx */
+	0x48, 0xC7, 0xC3, 0xCC, 0x00, 0x00, 0x00,
+	/* [159..165] mov $1, %rax */
+	0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,
+	/* [166..168] vmcall */
+	0x0F, 0x01, 0xC1,
+	/* [169] hlt */
+	0xF4,
+	/* [170..171] jmp .halt  rel=-2 */
+	0xEB, 0xFD,
+};
+
+/* ------------------------------------------------------------------
  * File operations
  * ------------------------------------------------------------------ */
 
@@ -626,9 +889,10 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 *   4 = MMIO CoW rejection test (write to LAPIC MMIO GPA)
 		 *   5 = 2MB split + CoW test (write to GPA 0x100000)
 		 *   6 = mixed 2MB + 4KB workload (10 writes, both regions)
+		 *   7 = snapshot/restore XMM test (task 1.6)
 		 */
 		test_id = args.reserved;
-		if (test_id > 6) {
+		if (test_id > 7) {
 			pr_err("phantom: RUN_GUEST: invalid test_id=%u\n",
 			       test_id);
 			ret = -EINVAL;
@@ -688,6 +952,19 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 * test_id=4: MMIO CoW rejection test
 		 * test_id=5: 2MB split + CoW (write to GPA 0x100000)
 		 * test_id=6: mixed 2MB + 4KB workload (10 writes)
+		 * test_id=7: snapshot/restore XMM test (task 1.6)
+		 *
+		 * Note for test_id=7: the binary has TWO phases.  On the
+		 * first run it reaches the VMCALL(1,0xAA) and exits.  The
+		 * userspace test then calls SNAPSHOT_CREATE (which saves
+		 * the VMCS RIP pointing AFTER the VMCALL instruction).
+		 * On subsequent runs the guest resumes from that saved RIP
+		 * and checks XMM0, issuing VMCALL(1,0xBB) on success.
+		 *
+		 * To support the two-phase behavior, test_id=7 does NOT
+		 * overwrite the code page on continuation runs (snap_taken
+		 * is true).  The snap_continue flag (set by SNAPSHOT_RESTORE)
+		 * controls whether the vCPU thread skips the RIP reset.
 		 */
 		if (test_id == 0) {
 			memcpy(page_address(state->guest_code_page),
@@ -789,7 +1066,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			memcpy(page_address(state->guest_code_page),
 			       phantom_2mb_split_guest_bin,
 			       sizeof(phantom_2mb_split_guest_bin));
-		} else {
+		} else if (test_id == 6) {
 			/*
 			 * test_id=6: mixed 2MB + 4KB workload.
 			 * Guest writes 10 words across both regions.
@@ -797,6 +1074,29 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			memcpy(page_address(state->guest_code_page),
 			       phantom_mixed_cow_guest_bin,
 			       sizeof(phantom_mixed_cow_guest_bin));
+		} else {
+			/*
+			 * test_id=7: snapshot/restore XMM test.
+			 *
+			 * Phase 1: guest loads XMM0, writes 5 pages,
+			 * issues VMCALL(1,0xAA) → exits with result=0xAA.
+			 * Userspace then calls SNAPSHOT_CREATE.
+			 *
+			 * Phase 2 (after snapshot): guest checks XMM0,
+			 * issues VMCALL(1,0xBB) on match or 0xCC on fail.
+			 *
+			 * We only load the binary on first use (when
+			 * snap_taken is false).  On subsequent runs after
+			 * SNAPSHOT_RESTORE, the guest code page is already
+			 * correct (it was written before the snapshot) and
+			 * the binary must NOT be overwritten (that would
+			 * lose the post-snapshot instructions).
+			 */
+			if (!state->snap_taken) {
+				memcpy(page_address(state->guest_code_page),
+				       phantom_snapshot_xmm_guest_bin,
+				       sizeof(phantom_snapshot_xmm_guest_bin));
+			}
 		}
 
 		/* Save test_id for the vCPU thread */
@@ -811,10 +1111,21 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 * (vcpu_run_request bit 1 = "reset needed").
 		 *
 		 * Always clear the per-run result state here.
+		 *
+		 * snap_continue: tells the vCPU thread whether to skip the
+		 * RIP/RSP/RFLAGS reset.  Set true only for test_id=7 when
+		 * a snapshot has been taken (phase 2 + all continuation runs
+		 * after SNAPSHOT_RESTORE).  False for all other test_ids and
+		 * for the very first test_id=7 run (phase 1, snap_taken=false).
+		 *
+		 * This must be set BEFORE signaling vcpu_work_ready so the
+		 * vCPU thread sees the correct value via the
+		 * smp_store_release / smp_load_acquire barrier pair.
 		 */
 		state->run_result      = 0;
 		state->run_result_data = 0;
 		memset(&state->guest_regs, 0, sizeof(state->guest_regs));
+		state->snap_continue   = (test_id == 7 && state->snap_taken);
 
 		if (!state->vmcs_configured) {
 			/* First run — configure_fields sets initial values */
@@ -982,6 +1293,119 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 
 		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
 		ret = phantom_debug_dump_dirty_overflow(state);
+		break;
+	}
+
+	case PHANTOM_IOCTL_SNAPSHOT_CREATE: {
+		int target_cpu = -1;
+		struct phantom_vmx_cpu_state *state;
+		int cpu;
+
+		for_each_cpu(cpu, pdev->vmx_cpumask) {
+			target_cpu = cpu;
+			break;
+		}
+
+		if (target_cpu < 0) {
+			pr_err("phantom: SNAPSHOT_CREATE: no VMX CPU\n");
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+		if (!state->pages_allocated) {
+			pr_err("phantom: SNAPSHOT_CREATE: pages not allocated\n");
+			ret = -EINVAL;
+			break;
+		}
+
+		if (!state->vmcs_configured) {
+			/*
+			 * VMCS not yet configured — cannot snapshot.
+			 * Caller must run RUN_GUEST first to get the guest
+			 * into a consistent state before snapshotting.
+			 */
+			pr_err("phantom: SNAPSHOT_CREATE: VMCS not configured "
+			       "(run RUN_GUEST first)\n");
+			ret = -EINVAL;
+			break;
+		}
+
+		if (!state->vcpu_thread) {
+			pr_err("phantom: SNAPSHOT_CREATE: vCPU thread not "
+			       "running\n");
+			ret = -ENXIO;
+			break;
+		}
+
+		/*
+		 * SNAPSHOT_CREATE must run on the vCPU thread (same CPU
+		 * where the VMCS is current) because it calls VMCS read
+		 * helpers and phantom_ept_mark_all_ro().
+		 *
+		 * vcpu_run_request = 4 means "run snapshot_create only".
+		 *
+		 * SNAPSHOT_CREATE is always called after the first RUN_GUEST,
+		 * so we are always in Phase 2 (vmlaunch_done = true) and the
+		 * IPI-free busy-wait path via smp_store_release is correct.
+		 */
+		state->vcpu_run_request = 4;
+		smp_store_release(&state->vcpu_work_ready, true);
+		wait_for_completion(&state->vcpu_run_done);
+
+		if (state->vcpu_run_result < 0) {
+			pr_err("phantom: SNAPSHOT_CREATE failed: %d\n",
+			       state->vcpu_run_result);
+			ret = state->vcpu_run_result;
+		} else {
+			state->snap_taken = true;
+			pr_info("phantom: CPU%d: snapshot created "
+				"(rip=0x%llx cr3=0x%llx)\n",
+				target_cpu,
+				state->snap.rip, state->snap.cr3);
+		}
+		break;
+	}
+
+	case PHANTOM_IOCTL_SNAPSHOT_RESTORE: {
+		int target_cpu = -1;
+		struct phantom_vmx_cpu_state *state;
+		int cpu;
+
+		for_each_cpu(cpu, pdev->vmx_cpumask) {
+			target_cpu = cpu;
+			break;
+		}
+
+		if (target_cpu < 0) {
+			pr_err("phantom: SNAPSHOT_RESTORE: no VMX CPU\n");
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+		if (!state->snap_taken || !state->snap.valid) {
+			pr_err("phantom: SNAPSHOT_RESTORE: no valid snapshot\n");
+			ret = -EINVAL;
+			break;
+		}
+
+		/*
+		 * Request the vCPU thread to execute snapshot_restore
+		 * on its own CPU (VMCS must be current).
+		 * vcpu_run_request = 5 means "run snapshot_restore only".
+		 */
+		state->vcpu_run_request = 5;
+		smp_store_release(&state->vcpu_work_ready, true);
+		wait_for_completion(&state->vcpu_run_done);
+
+		if (state->vcpu_run_result < 0) {
+			pr_err("phantom: SNAPSHOT_RESTORE failed: %d\n",
+			       state->vcpu_run_result);
+			ret = state->vcpu_run_result;
+		}
 		break;
 	}
 
