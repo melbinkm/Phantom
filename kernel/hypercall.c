@@ -305,13 +305,13 @@ static int handle_release(struct phantom_vmx_cpu_state *state)
 
 /*
  * handle_panic (0x11e):
- *   Guest detected a crash.  RBX = crash address.
+ *   Guest detected a crash.  RCX = crash address.
  *   Set result = CRASH, store crash_addr, restore snapshot.
  */
 static int handle_panic(struct phantom_vmx_cpu_state *state)
 {
 	state->run_result = PHANTOM_RESULT_CRASH;
-	state->crash_addr = state->guest_regs.rbx;
+	state->crash_addr = state->guest_regs.rcx;
 	state->iteration_active = false;
 
 	if (state->shared_mem) {

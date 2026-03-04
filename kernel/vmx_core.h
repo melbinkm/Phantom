@@ -670,6 +670,7 @@ struct phantom_vmx_cpu_state {
 	u64			  panic_handler_gpa;
 	bool			  iteration_active;
 	bool			  snap_acquired;
+	int			  last_test_id;	  /* last RUN_GUEST test_id, for re-prime detection */
 	void			 *shared_mem;
 	struct page		 *shared_mem_pages;
 	unsigned int		  shared_mem_order;
