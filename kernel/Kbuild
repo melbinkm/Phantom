@@ -8,6 +8,7 @@ obj-m := phantom.o
 phantom-objs := \
 	phantom_main.o \
 	vmx_core.o \
+	ept.o \
 	interface.o \
 	debug.o \
 	hypercall.o \

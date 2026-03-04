@@ -45,6 +45,7 @@
 
 #include "phantom.h"
 #include "vmx_core.h"
+#include "ept.h"
 #include "hypercall.h"
 #include "nmi.h"
 #include "debug.h"
@@ -443,101 +444,26 @@ void phantom_vmcs_free_all(const struct cpumask *cpumask)
 }
 
 /* ------------------------------------------------------------------
- * EPT construction
+ * EPT construction (task 1.3: delegated to ept.c)
  *
- * Build a minimal 4-level EPT covering GPAs 0x10000–0x15FFF.
- * Layout:
- *   EPT PML4[0] → EPT PDPT
- *   EPT PDPT[0] → EPT PD
- *   EPT PD[0]   → EPT PT  (4KB entries, not 2MB)
- *   EPT PT[16]  → code page  HPA  (R+X)
- *   EPT PT[17]  → stack page HPA  (R+W)
- *   EPT PT[18]  → data page  HPA  (R+W)
- *   EPT PT[19]  → PML4 page  HPA  (R+W)
- *   EPT PT[20]  → PDPT page  HPA  (R+W)
- *   EPT PT[21]  → PD page    HPA  (R+W)
- *
- * EPTP = EPT_PML4_phys | EPTP_MEMTYPE_WB | EPTP_PAGEWALK_4
+ * phantom_build_ept() is a thin wrapper that calls phantom_ept_build()
+ * from ept.c.  The full 16MB flat RAM EPT is built there.
  * ------------------------------------------------------------------ */
 
 static u64 phantom_build_ept(struct phantom_vmx_cpu_state *state)
 {
-	u64 *pml4, *pdpt, *pd, *pt;
-	u64 eptp;
-
-	pml4 = (u64 *)page_address(state->ept_pml4);
-	pdpt = (u64 *)page_address(state->ept_pdpt);
-	pd   = (u64 *)page_address(state->ept_pd);
-	pt   = (u64 *)page_address(state->ept_pt);
-
-	/* Zero all EPT pages */
-	memset(pml4, 0, PAGE_SIZE);
-	memset(pdpt, 0, PAGE_SIZE);
-	memset(pd,   0, PAGE_SIZE);
-	memset(pt,   0, PAGE_SIZE);
-
-	/*
-	 * EPT PML4[0] → PDPT (R+W+X, points to next level)
-	 * GPA bit[47:39] = 0 for our 0x10000–0x15FFF range.
-	 */
-	pml4[0] = page_to_phys(state->ept_pdpt) |
-		  EPT_PTE_READ | EPT_PTE_WRITE | EPT_PTE_EXEC;
-
-	/*
-	 * EPT PDPT[0] → PD (R+W+X)
-	 * GPA bit[38:30] = 0 for our range.
-	 */
-	pdpt[0] = page_to_phys(state->ept_pd) |
-		  EPT_PTE_READ | EPT_PTE_WRITE | EPT_PTE_EXEC;
-
-	/*
-	 * EPT PD[0] → PT (R+W+X, 4KB entries — bit 7 NOT set)
-	 * GPA bit[29:21] = 0 for our range.
-	 */
-	pd[0] = page_to_phys(state->ept_pt) |
-		EPT_PTE_READ | EPT_PTE_WRITE | EPT_PTE_EXEC;
-
-	/*
-	 * EPT PT: index = GPA[20:12]
-	 * GPA 0x10000 → index 16, 0x11000 → 17, ... 0x15000 → 21
-	 */
-
-	/* Entry 16: code page — read + execute (no write for integrity) */
-	pt[16] = page_to_phys(state->guest_code_page) |
-		 EPT_PTE_READ | EPT_PTE_EXEC | EPT_PTE_MEMTYPE_WB;
-
-	/* Entry 17: stack page — read + write */
-	pt[17] = page_to_phys(state->guest_stack_page) |
-		 EPT_PTE_READ | EPT_PTE_WRITE | EPT_PTE_MEMTYPE_WB;
-
-	/* Entry 18: data buffer page — read + write */
-	pt[18] = page_to_phys(state->guest_data_page) |
-		 EPT_PTE_READ | EPT_PTE_WRITE | EPT_PTE_MEMTYPE_WB;
-
-	/* Entry 19: guest PML4 page — read + write */
-	pt[19] = page_to_phys(state->guest_pml4_page) |
-		 EPT_PTE_READ | EPT_PTE_WRITE | EPT_PTE_MEMTYPE_WB;
-
-	/* Entry 20: guest PDPT page — read + write */
-	pt[20] = page_to_phys(state->guest_pdpt_page) |
-		 EPT_PTE_READ | EPT_PTE_WRITE | EPT_PTE_MEMTYPE_WB;
-
-	/* Entry 21: guest PD page — read + write */
-	pt[21] = page_to_phys(state->guest_pd_page) |
-		 EPT_PTE_READ | EPT_PTE_WRITE | EPT_PTE_MEMTYPE_WB;
-
-	/* EPTP: PML4 physical address | WB caching | 4-level walk */
-	eptp = page_to_phys(state->ept_pml4) |
-	       EPTP_MEMTYPE_WB | EPTP_PAGEWALK_4;
-
-	return eptp;
+	return phantom_ept_build(&state->ept);
 }
 
 /* ------------------------------------------------------------------
  * Guest page-table construction (IA-32e 4-level paging)
  *
- * The trivial guest runs in 64-bit mode with identity mapping:
- *   GVA 0–2MB maps to GPA 0–2MB via a 2MB large-page PD entry.
+ * The guest runs in 64-bit mode with identity mapping via 2MB large
+ * pages.  Task 1.3 expands the PD to 16 entries (0–32MB) so that
+ * GVAs beyond 16MB still resolve to valid GPAs via guest page tables,
+ * ensuring that accessing GPA 0x1000000 triggers an EPT violation
+ * (no EPT mapping) rather than a guest #PF (page not present in
+ * guest page tables).
  *
  * Layout:
  *   PML4 at GPA 0x13000 (guest_pml4_page):
@@ -545,7 +471,7 @@ static u64 phantom_build_ept(struct phantom_vmx_cpu_state *state)
  *   PDPT at GPA 0x14000 (guest_pdpt_page):
  *     entry[0] → PD (GPA 0x15000), R+W+P
  *   PD at GPA 0x15000 (guest_pd_page):
- *     entry[0] → 2MB large page, identity (GVA 0 → GPA 0), R+W+P+PS
+ *     entries[0..15] → 2MB identity large pages (GVA 0–32MB)
  *
  * Guest CR3 = GPA 0x13000
  * ------------------------------------------------------------------ */
@@ -555,11 +481,15 @@ static u64 phantom_build_ept(struct phantom_vmx_cpu_state *state)
 #define PAGE_ENTRY_US		BIT(2)   /* User/Supervisor */
 #define PAGE_ENTRY_PS		BIT(7)   /* Page Size (2MB in PD) */
 
+/* Number of 2MB PD entries: 16 entries × 2MB = 32MB coverage */
+#define GUEST_PD_NR_ENTRIES	16
+
 static void phantom_build_guest_pagetables(struct phantom_vmx_cpu_state *state)
 {
 	u64 *pml4 = (u64 *)page_address(state->guest_pml4_page);
 	u64 *pdpt = (u64 *)page_address(state->guest_pdpt_page);
 	u64 *pd   = (u64 *)page_address(state->guest_pd_page);
+	int i;
 
 	memset(pml4, 0, PAGE_SIZE);
 	memset(pdpt, 0, PAGE_SIZE);
@@ -572,12 +502,23 @@ static void phantom_build_guest_pagetables(struct phantom_vmx_cpu_state *state)
 	pdpt[0] = GUEST_PD_GPA | PAGE_ENTRY_P | PAGE_ENTRY_RW;
 
 	/*
-	 * PD[0] → 2MB identity page: GVA 0x00000000 → GPA 0x00000000
-	 * PS bit set for 2MB large page.
-	 * Physical address field for 2MB PDE is bits [51:21] = 0x000000
-	 * (identity mapping, GPA 0 → physical 0 from the guest's view).
+	 * PD[0..15] → 2MB identity pages: GVA i*2MB → GPA i*2MB
+	 *
+	 * This covers GVA 0–32MB (beyond the 16MB EPT RAM limit).
+	 * Accesses to GVA 0x1000000–0x1FFFFFF will resolve to
+	 * GPA 0x1000000–0x1FFFFFF via guest page tables, and then
+	 * hit an EPT violation (no EPT entry) rather than a #PF.
 	 */
-	pd[0] = 0x000000ULL | PAGE_ENTRY_P | PAGE_ENTRY_RW | PAGE_ENTRY_PS;
+	for (i = 0; i < GUEST_PD_NR_ENTRIES; i++) {
+		u64 gpa_base = (u64)i << 21;  /* i * 2MB */
+
+		/*
+		 * Physical address field for 2MB PDE: bits [51:21].
+		 * Identity mapping: GPA = GVA = physical base.
+		 */
+		pd[i] = gpa_base | PAGE_ENTRY_P | PAGE_ENTRY_RW |
+			PAGE_ENTRY_PS;
+	}
 }
 
 /* ------------------------------------------------------------------
@@ -991,43 +932,51 @@ int phantom_vmcs_setup(struct phantom_vmx_cpu_state *state)
 	state->msr_bitmap = alloc_pages_node(node, GFP_KERNEL | __GFP_ZERO, 0);
 	if (!state->msr_bitmap) { ret = -ENOMEM; goto err_msr_bitmap; }
 
-	/* Allocate EPT page tables */
-	state->ept_pml4 = alloc_pages_node(node, GFP_KERNEL | __GFP_ZERO, 0);
-	if (!state->ept_pml4) { ret = -ENOMEM; goto err_ept_pml4; }
+	/*
+	 * Allocate the full 16MB EPT + RAM backing pages via the EPT module.
+	 *
+	 * phantom_ept_alloc() handles: 1 PML4 + 1 PDPT + 1 PD + 8 PT pages
+	 * + 4096 RAM backing pages (16MB of guest memory).
+	 */
+	ret = phantom_ept_alloc(&state->ept, cpu);
+	if (ret)
+		goto err_ept;
 
-	state->ept_pdpt = alloc_pages_node(node, GFP_KERNEL | __GFP_ZERO, 0);
-	if (!state->ept_pdpt) { ret = -ENOMEM; goto err_ept_pdpt; }
+	/*
+	 * Set backward-compat convenience pointers to the EPT structure
+	 * pages and key guest memory pages.  These are used by code that
+	 * predates the ept.c module (e.g., phantom_build_guest_pagetables).
+	 */
+	state->ept_pml4 = state->ept.pml4;
+	state->ept_pdpt = state->ept.pdpt;
+	state->ept_pd   = state->ept.pd;
+	state->ept_pt   = state->ept.pt[0];  /* first PT page (GPA 0–2MB) */
 
-	state->ept_pd = alloc_pages_node(node, GFP_KERNEL | __GFP_ZERO, 0);
-	if (!state->ept_pd) { ret = -ENOMEM; goto err_ept_pd; }
+	/*
+	 * Guest page pointers: these specific GPAs must be in the EPT.
+	 * All are within the 0–16MB RAM range allocated by phantom_ept_alloc.
+	 */
+	state->guest_code_page  = phantom_ept_get_ram_page(&state->ept,
+							   GUEST_CODE_GPA);
+	state->guest_stack_page = phantom_ept_get_ram_page(&state->ept,
+							   GUEST_STACK_GPA);
+	state->guest_data_page  = phantom_ept_get_ram_page(&state->ept,
+							   GUEST_DATA_GPA);
+	state->guest_pml4_page  = phantom_ept_get_ram_page(&state->ept,
+							   GUEST_PML4_GPA);
+	state->guest_pdpt_page  = phantom_ept_get_ram_page(&state->ept,
+							   GUEST_PDPT_GPA);
+	state->guest_pd_page    = phantom_ept_get_ram_page(&state->ept,
+							   GUEST_PD_GPA);
 
-	state->ept_pt = alloc_pages_node(node, GFP_KERNEL | __GFP_ZERO, 0);
-	if (!state->ept_pt) { ret = -ENOMEM; goto err_ept_pt; }
-
-	/* Allocate guest memory pages */
-	state->guest_code_page = alloc_pages_node(node,
-						  GFP_KERNEL | __GFP_ZERO, 0);
-	if (!state->guest_code_page) { ret = -ENOMEM; goto err_guest_code; }
-
-	state->guest_stack_page = alloc_pages_node(node,
-						   GFP_KERNEL | __GFP_ZERO, 0);
-	if (!state->guest_stack_page) { ret = -ENOMEM; goto err_guest_stack; }
-
-	state->guest_data_page = alloc_pages_node(node,
-						  GFP_KERNEL | __GFP_ZERO, 0);
-	if (!state->guest_data_page) { ret = -ENOMEM; goto err_guest_data; }
-
-	state->guest_pml4_page = alloc_pages_node(node,
-						  GFP_KERNEL | __GFP_ZERO, 0);
-	if (!state->guest_pml4_page) { ret = -ENOMEM; goto err_guest_pml4; }
-
-	state->guest_pdpt_page = alloc_pages_node(node,
-						  GFP_KERNEL | __GFP_ZERO, 0);
-	if (!state->guest_pdpt_page) { ret = -ENOMEM; goto err_guest_pdpt; }
-
-	state->guest_pd_page = alloc_pages_node(node,
-						GFP_KERNEL | __GFP_ZERO, 0);
-	if (!state->guest_pd_page) { ret = -ENOMEM; goto err_guest_pd; }
+	if (!state->guest_code_page  || !state->guest_stack_page ||
+	    !state->guest_data_page  || !state->guest_pml4_page  ||
+	    !state->guest_pdpt_page  || !state->guest_pd_page) {
+		pr_err("phantom: CPU%d: guest page GPA out of EPT range\n",
+		       cpu);
+		ret = -EINVAL;
+		goto err_guest_pages;
+	}
 
 	/*
 	 * Build page tables while still in process context.
@@ -1035,40 +984,27 @@ int phantom_vmcs_setup(struct phantom_vmx_cpu_state *state)
 	 * so they are safe here.
 	 */
 	phantom_build_guest_pagetables(state);
-	phantom_build_ept(state); /* result (eptp) used in configure_fields */
+	phantom_build_ept(state); /* populates state->ept.eptp */
 
 	state->pages_allocated = true;
-	pr_info("phantom: CPU%d: pages allocated\n", cpu);
+	pr_info("phantom: CPU%d: pages allocated (EPT: 16MB RAM, "
+		"eptp=0x%llx)\n", cpu, state->ept.eptp);
 	return 0;
 
-err_guest_pd:
-	__free_page(state->guest_pdpt_page);
-	state->guest_pdpt_page = NULL;
-err_guest_pdpt:
-	__free_page(state->guest_pml4_page);
-	state->guest_pml4_page = NULL;
-err_guest_pml4:
-	__free_page(state->guest_data_page);
-	state->guest_data_page = NULL;
-err_guest_data:
-	__free_page(state->guest_stack_page);
+err_guest_pages:
+	phantom_ept_teardown(&state->ept);
+	/* Clear the convenience pointers that may now be stale */
+	state->ept_pml4        = NULL;
+	state->ept_pdpt        = NULL;
+	state->ept_pd          = NULL;
+	state->ept_pt          = NULL;
+	state->guest_code_page  = NULL;
 	state->guest_stack_page = NULL;
-err_guest_stack:
-	__free_page(state->guest_code_page);
-	state->guest_code_page = NULL;
-err_guest_code:
-	__free_page(state->ept_pt);
-	state->ept_pt = NULL;
-err_ept_pt:
-	__free_page(state->ept_pd);
-	state->ept_pd = NULL;
-err_ept_pd:
-	__free_page(state->ept_pdpt);
-	state->ept_pdpt = NULL;
-err_ept_pdpt:
-	__free_page(state->ept_pml4);
-	state->ept_pml4 = NULL;
-err_ept_pml4:
+	state->guest_data_page  = NULL;
+	state->guest_pml4_page  = NULL;
+	state->guest_pdpt_page  = NULL;
+	state->guest_pd_page    = NULL;
+err_ept:
 	__free_page(state->msr_bitmap);
 	state->msr_bitmap = NULL;
 err_msr_bitmap:
@@ -1108,12 +1044,12 @@ int phantom_vmcs_configure_fields(struct phantom_vmx_cpu_state *state)
 	use_true_ctls = !!(vmx_basic & VMX_BASIC_TRUE_CTLS);
 
 	/*
-	 * Rebuild EPT on this CPU to get the correct EPTP value.
-	 * The EPT page tables were built in phantom_vmcs_setup(); we call
-	 * phantom_build_ept() again to get the EPTP (it's idempotent — same
-	 * physical addresses → same result).
+	 * Use the EPTP computed by phantom_build_ept() in phantom_vmcs_setup().
+	 * The EPT structure pages are already built; eptp is cached in
+	 * state->ept.eptp.  Calling phantom_build_ept() again is idempotent
+	 * (same pages → same physical addresses → same EPTP value).
 	 */
-	eptp = phantom_build_ept(state);
+	eptp = state->ept.eptp;
 
 	/* Populate VMCS control fields */
 	ret = phantom_vmcs_setup_controls(state, use_true_ctls, eptp);
@@ -1155,21 +1091,28 @@ void phantom_vmcs_teardown(struct phantom_vmx_cpu_state *state)
 	if (!state->pages_allocated)
 		return;
 
-#define FREE_PAGE(p) do { if (p) { __free_page(p); (p) = NULL; } } while (0)
+	/*
+	 * Free all EPT structure pages + RAM backing pages via ept.c.
+	 * phantom_ept_teardown() is NULL-safe for partially-allocated state.
+	 */
+	phantom_ept_teardown(&state->ept);
 
-	FREE_PAGE(state->guest_pd_page);
-	FREE_PAGE(state->guest_pdpt_page);
-	FREE_PAGE(state->guest_pml4_page);
-	FREE_PAGE(state->guest_data_page);
-	FREE_PAGE(state->guest_stack_page);
-	FREE_PAGE(state->guest_code_page);
-	FREE_PAGE(state->ept_pt);
-	FREE_PAGE(state->ept_pd);
-	FREE_PAGE(state->ept_pdpt);
-	FREE_PAGE(state->ept_pml4);
-	FREE_PAGE(state->msr_bitmap);
+	/* Clear backward-compat convenience pointers (now dangling) */
+	state->ept_pml4        = NULL;
+	state->ept_pdpt        = NULL;
+	state->ept_pd          = NULL;
+	state->ept_pt          = NULL;
+	state->guest_code_page  = NULL;
+	state->guest_stack_page = NULL;
+	state->guest_data_page  = NULL;
+	state->guest_pml4_page  = NULL;
+	state->guest_pdpt_page  = NULL;
+	state->guest_pd_page    = NULL;
 
-#undef FREE_PAGE
+	if (state->msr_bitmap) {
+		__free_page(state->msr_bitmap);
+		state->msr_bitmap = NULL;
+	}
 
 	state->pages_allocated = false;
 	state->vmcs_configured = false;
@@ -1915,16 +1858,37 @@ static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 	}
 
 	case VMX_EXIT_EPT_VIOLATION: {
-		/*
-		 * EPT violation not expected in the trivial guest (all
-		 * needed pages are mapped).  Treat as crash.
-		 */
 		u64 gpa = phantom_vmcs_read64(VMCS_RO_GUEST_PHYS_ADDR);
 		u64 rip = phantom_vmcs_read64(VMCS_GUEST_RIP);
+		const struct phantom_gpa_region *rgn;
+		const char *type_str;
 
+		/*
+		 * Classify the faulting GPA for diagnostic logging.
+		 * Use trace_printk on hot path; pr_err on unexpected paths.
+		 */
+		rgn = phantom_ept_classify_gpa(gpa);
+		switch (rgn->type) {
+		case PHANTOM_GPA_RAM:
+			type_str = "RAM";
+			break;
+		case PHANTOM_GPA_MMIO:
+			type_str = "MMIO";
+			break;
+		default:
+			type_str = "RESERVED";
+			break;
+		}
+
+#ifdef PHANTOM_DEBUG
+		trace_printk("PHANTOM EPT_VIOLATION cpu=%d gpa=0x%llx "
+			     "rip=0x%llx qual=0x%llx type=%s\n",
+			     state->cpu, gpa, rip, qual, type_str);
+#endif
 		pr_err("phantom: CPU%d: EPT VIOLATION GPA=0x%llx "
-		       "RIP=0x%llx qual=0x%llx\n",
-		       state->cpu, gpa, rip, qual);
+		       "RIP=0x%llx qual=0x%llx type=%s\n",
+		       state->cpu, gpa, rip, qual, type_str);
+
 		state->run_result = 1; /* PHANTOM_RESULT_CRASH */
 		return 1;
 	}

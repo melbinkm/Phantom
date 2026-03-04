@@ -14,10 +14,14 @@
 #include <linux/module.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
+#include <linux/mm.h>
+#include <linux/mm_types.h>
 #include <asm/msr.h>
+#include <asm/io.h>
 
 #include "phantom.h"
 #include "vmx_core.h"
+#include "ept.h"
 #include "debug.h"
 
 /* ------------------------------------------------------------------
@@ -359,6 +363,199 @@ int phantom_validate_vmcs(void)
 }
 
 #endif /* PHANTOM_DEBUG */
+
+/* ------------------------------------------------------------------
+ * Debug subsystem init/exit
+ * ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------
+ * EPT walker / dumper
+ *
+ * Traverses the full 4-level EPT and emits each mapped region via
+ * trace_printk.  Slow-path only — must not be called from a VM-exit
+ * handler or any hot-path context.
+ * ------------------------------------------------------------------ */
+
+/*
+ * Memory type names for EPT leaf PTEs.
+ */
+static const char *ept_memtype_name(u64 pte)
+{
+	switch ((pte >> 3) & 7) {
+	case 0: return "UC";
+	case 1: return "WC";
+	case 4: return "WT";
+	case 5: return "WP";
+	case 6: return "WB";
+	default: return "??";
+	}
+}
+
+/*
+ * Permission string from leaf PTE bits [2:0].
+ */
+static void ept_perm_str(u64 pte, char out[4])
+{
+	out[0] = (pte & EPT_PTE_READ)  ? 'R' : '-';
+	out[1] = (pte & EPT_PTE_WRITE) ? 'W' : '-';
+	out[2] = (pte & EPT_PTE_EXEC)  ? 'X' : '-';
+	out[3] = '\0';
+}
+
+/**
+ * phantom_walk_ept - Walk the 4-level EPT and emit mappings via trace_printk.
+ * @ept: EPT state to walk.
+ *
+ * Traverses PML4 → PDPT → PD → PT and for each present leaf PTE emits
+ * a trace_printk line:
+ *   "EPT_MAP GPA=0x%012llx HPA=0x%012llx perm=%s memtype=%s"
+ *
+ * Absent (all-zero) PTEs are counted and printed in summary.
+ * Large-page PD entries (PS=1) are noted but not expanded.
+ */
+void phantom_walk_ept(struct phantom_ept_state *ept)
+{
+	u64 *pml4, *pdpt, *pd, *pt;
+	u64 pml4e, pdpte, pde, pte_val;
+	unsigned int i, j, k, l;
+	unsigned long mapped_count = 0;
+	unsigned long absent_count = 0;
+
+	if (!ept || !ept->pml4) {
+		trace_printk("phantom: EPT walker: ept state not allocated\n");
+		return;
+	}
+
+	trace_printk("PHANTOM EPT WALK START eptp=0x%llx\n", ept->eptp);
+
+	pml4 = (u64 *)page_address(ept->pml4);
+
+	for (i = 0; i < 512; i++) {
+		pml4e = pml4[i];
+		if (!(pml4e & EPT_PTE_READ))
+			continue;
+
+		pdpt = (u64 *)phys_to_virt(pml4e & EPT_PTE_HPA_MASK);
+
+		for (j = 0; j < 512; j++) {
+			pdpte = pdpt[j];
+			if (!(pdpte & EPT_PTE_READ))
+				continue;
+
+			/* 1GB large page (PS=1 in PDPT entry) */
+			if (pdpte & EPT_PTE_PS) {
+				u64 gpa = ((u64)i << 39) | ((u64)j << 30);
+				u64 hpa = pdpte & EPT_PTE_HPA_MASK;
+				char perm[4];
+
+				ept_perm_str(pdpte, perm);
+				trace_printk("EPT_MAP GPA=0x%012llx "
+					     "HPA=0x%012llx perm=%s "
+					     "memtype=%s size=1GB\n",
+					     gpa, hpa, perm,
+					     ept_memtype_name(pdpte));
+				mapped_count++;
+				continue;
+			}
+
+			pd = (u64 *)phys_to_virt(pdpte & EPT_PTE_HPA_MASK);
+
+			for (k = 0; k < 512; k++) {
+				pde = pd[k];
+				if (!(pde & EPT_PTE_READ)) {
+					absent_count++;
+					continue;
+				}
+
+				/* 2MB large page (PS=1 in PD entry) */
+				if (pde & EPT_PTE_PS) {
+					u64 gpa = ((u64)i << 39) |
+						  ((u64)j << 30) |
+						  ((u64)k << 21);
+					u64 hpa = pde & EPT_PTE_HPA_MASK;
+					char perm[4];
+
+					ept_perm_str(pde, perm);
+					trace_printk("EPT_MAP GPA=0x%012llx "
+						     "HPA=0x%012llx perm=%s "
+						     "memtype=%s size=2MB\n",
+						     gpa, hpa, perm,
+						     ept_memtype_name(pde));
+					mapped_count++;
+					continue;
+				}
+
+				pt = (u64 *)phys_to_virt(pde &
+							 EPT_PTE_HPA_MASK);
+
+				for (l = 0; l < 512; l++) {
+					pte_val = pt[l];
+					if (!(pte_val & EPT_PTE_READ)) {
+						absent_count++;
+						continue;
+					}
+
+					{
+						u64 gpa = ((u64)i << 39) |
+							  ((u64)j << 30) |
+							  ((u64)k << 21) |
+							  ((u64)l << 12);
+						u64 hpa = pte_val &
+							  EPT_PTE_HPA_MASK;
+						char perm[4];
+						const struct phantom_gpa_region
+							*rgn;
+						const char *rtype;
+
+						ept_perm_str(pte_val, perm);
+						rgn = phantom_ept_classify_gpa(
+							gpa);
+						switch (rgn->type) {
+						case PHANTOM_GPA_RAM:
+							rtype = "RAM";
+							break;
+						case PHANTOM_GPA_MMIO:
+							rtype = "MMIO";
+							break;
+						default:
+							rtype = "RSV";
+							break;
+						}
+
+						trace_printk(
+						    "EPT_MAP GPA=0x%012llx "
+						    "HPA=0x%012llx perm=%s "
+						    "memtype=%s type=%s\n",
+						    gpa, hpa, perm,
+						    ept_memtype_name(pte_val),
+						    rtype);
+						mapped_count++;
+					}
+				}
+			}
+		}
+	}
+
+	trace_printk("PHANTOM EPT WALK END mapped=%lu absent=%lu\n",
+		     mapped_count, absent_count);
+}
+
+/**
+ * phantom_debug_dump_ept - Dump EPT for a given VMX CPU state.
+ * @state: Per-CPU VMX state (must have pages_allocated set).
+ *
+ * Returns 0 on success, -EINVAL if pages not allocated.
+ */
+int phantom_debug_dump_ept(struct phantom_vmx_cpu_state *state)
+{
+	if (!state || !state->pages_allocated) {
+		pr_err("phantom: dump_ept: pages not allocated\n");
+		return -EINVAL;
+	}
+
+	phantom_walk_ept(&state->ept);
+	return 0;
+}
 
 /* ------------------------------------------------------------------
  * Debug subsystem init/exit
