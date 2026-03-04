@@ -9,17 +9,27 @@
  *   - phantom_ept_teardown: free all pages
  *   - phantom_ept_lookup_pte: 4-level walk returning leaf PTE pointer
  *   - phantom_ept_get_ram_page: index into backing pages array
+ *   - phantom_ept_get_pd_entry: walk to PD level, return PD entry ptr
+ *   - phantom_invept_single_context: single-context INVEPT helper
  *
- * EPT layout for task 1.3:
- *   RAM: GPA 0x00000000–0x00FFFFFF (16MB), 4KB pages, RWX + WB
+ * EPT layout for task 1.5 (mixed 2MB + 4KB):
+ *   First 8MB  (GPA 0x000000–0x7FFFFF): 4 × 2MB large pages (PS=1)
+ *   Second 8MB (GPA 0x800000–0xFFFFFF): 4KB pages (4 PT pages × 512)
  *   All other GPA ranges: absent (not-present, all-zero PTE)
  *
  * Critical correctness rules:
  *   - Non-leaf entries MUST have RWX bits set (else EPT misconfig #49)
- *   - Leaf RAM entries: EPT_PTE_READ | EPT_PTE_WRITE | EPT_PTE_EXEC |
- *     EPT_PTE_MEMTYPE_WB | HPA
+ *   - 2MB leaf: EPT_PTE_READ | EPT_PTE_EXEC | EPT_PTE_MEMTYPE_WB |
+ *     EPT_PTE_PS | 2MB-aligned HPA  (WRITE cleared for CoW snapshot)
+ *   - 4KB leaf RAM entries: EPT_PTE_READ | EPT_PTE_EXEC |
+ *     EPT_PTE_MEMTYPE_WB | HPA  (WRITE cleared for CoW snapshot)
  *   - Absent entries: all-zero (no bits set)
  *   - EPTP: PML4_phys | EPTP_MEMTYPE_WB | EPTP_PAGEWALK_4 (no A/D)
+ *
+ * INVEPT rules:
+ *   - 2MB→4KB split: INVEPT required (stale 2MB translations)
+ *   - 4KB RO→RW CoW fault: NO INVEPT (EPT violation invalidated GPA)
+ *   - Snapshot restore: one batched INVEPT after all PTE resets
  */
 
 #include <linux/module.h>
@@ -32,8 +42,11 @@
 #include <linux/string.h>
 #include <linux/slab.h>
 #include <asm/io.h>
+#include <asm/special_insns.h>
+#include <asm/processor-flags.h>
 
 #include "ept.h"
+#include "debug.h"
 
 /* ------------------------------------------------------------------
  * GPA region classification table
@@ -163,6 +176,8 @@ static inline unsigned int gpa_to_ram_idx(u64 gpa)
  *   2. EPT PDPT (1 page, zeroed)
  *   3. EPT PD   (1 page, zeroed)
  *   4. EPT PT pages (PHANTOM_EPT_NR_PT_PAGES pages, zeroed)
+ *      — only for the 4KB region (second 8MB, PD entries 4–7)
+ *      — the 2MB region (PD entries 0–3) uses large-page entries, no PT
  *   5. RAM backing pages (PHANTOM_EPT_RAM_PAGES pages, zeroed)
  *
  * Returns 0 on success, negative errno on failure.
@@ -188,7 +203,13 @@ int phantom_ept_alloc(struct phantom_ept_state *ept, int cpu)
 	ept->pd = alloc_pages_node(node, GFP_KERNEL | __GFP_ZERO, 0);
 	if (!ept->pd) { ret = -ENOMEM; goto err_pd; }
 
-	/* 4. PT pages */
+	/*
+	 * 4. PT pages — only for the 4KB region (second 8MB).
+	 *
+	 * PHANTOM_EPT_NR_PT_PAGES = 4, corresponding to PD entries 4–7.
+	 * The first 8MB (PD entries 0–3) uses 2MB large-page PD entries
+	 * with PS=1 and no PT page needed.
+	 */
 	for (i = 0; i < PHANTOM_EPT_NR_PT_PAGES; i++) {
 		ept->pt[i] = alloc_pages_node(node,
 					      GFP_KERNEL | __GFP_ZERO, 0);
@@ -213,23 +234,71 @@ int phantom_ept_alloc(struct phantom_ept_state *ept, int cpu)
 		goto err_ram_array;
 	}
 
-	/* 6. Allocate the RAM backing pages */
-	for (i = 0; i < PHANTOM_EPT_RAM_PAGES; i++) {
+	/*
+	 * 6a. Allocate the 2MB region backing pages as order-9 physically
+	 *     contiguous blocks.
+	 *
+	 * We need physically contiguous 2MB blocks so that the 2MB large-page
+	 * EPT entry (PS=1) maps a correctly-aligned, contiguous HPA range.
+	 * Individual 4KB alloc_pages_node() calls produce pages that are
+	 * 4KB-aligned but typically not 2MB-aligned or physically contiguous.
+	 *
+	 * alloc_pages_node(node, GFP_KERNEL | __GFP_ZERO, 9) allocates
+	 * 2^9 = 512 contiguous pages = 2MB, aligned to 2MB boundary.
+	 *
+	 * ram_pages[block_i * 512 + sub_i] = nth_page(block, sub_i)
+	 * for each of the PHANTOM_EPT_NR_2MB_ENTRIES blocks.
+	 */
+	for (i = 0; i < PHANTOM_EPT_NR_2MB_ENTRIES; i++) {
+		struct page *blk;
+		unsigned int sub;
+
+		blk = alloc_pages_node(node, GFP_KERNEL | __GFP_ZERO, 9);
+		if (!blk) {
+			ret = -ENOMEM;
+			goto err_ram_2mb;
+		}
+		ept->ram_2mb_blocks[i] = blk;
+
+		/* Populate ram_pages[] with individual sub-page pointers */
+		for (sub = 0; sub < 512; sub++) {
+			unsigned int idx = (unsigned int)i * 512 + sub;
+
+			ept->ram_pages[idx] = nth_page(blk, sub);
+		}
+	}
+
+	/*
+	 * 6b. Allocate the 4KB region backing pages individually.
+	 *
+	 * Indices PHANTOM_EPT_2MB_REGION_PAGES .. PHANTOM_EPT_RAM_PAGES-1
+	 * correspond to GPA 0x800000–0xFFFFFF (second 8MB).
+	 */
+	for (i = PHANTOM_EPT_2MB_REGION_PAGES; i < PHANTOM_EPT_RAM_PAGES;
+	     i++) {
 		ept->ram_pages[i] = alloc_pages_node(node,
 						     GFP_KERNEL | __GFP_ZERO,
 						     0);
 		if (!ept->ram_pages[i]) {
 			ret = -ENOMEM;
-			goto err_ram;
+			goto err_ram_4kb;
 		}
 	}
 
 	return 0;
 
-err_ram:
-	for (i = i - 1; i >= 0; i--) {
+err_ram_4kb:
+	for (i = i - 1; (int)i >= (int)PHANTOM_EPT_2MB_REGION_PAGES; i--) {
 		__free_page(ept->ram_pages[i]);
 		ept->ram_pages[i] = NULL;
+	}
+	i = PHANTOM_EPT_NR_2MB_ENTRIES;
+err_ram_2mb:
+	for (i = i - 1; (int)i >= 0; i--) {
+		if (ept->ram_2mb_blocks[i]) {
+			__free_pages(ept->ram_2mb_blocks[i], 9);
+			ept->ram_2mb_blocks[i] = NULL;
+		}
 	}
 	kvfree(ept->ram_pages);
 	ept->ram_pages = NULL;
@@ -254,20 +323,25 @@ err_pml4:
 EXPORT_SYMBOL_GPL(phantom_ept_alloc);
 
 /* ------------------------------------------------------------------
- * phantom_ept_build - Populate EPT page table entries
+ * phantom_ept_build - Populate EPT page table entries (mixed layout)
  *
  * GPA bit decomposition for 4-level EPT:
  *   [47:39] → PML4 index
  *   [38:30] → PDPT index
  *   [29:21] → PD index
- *   [20:12] → PT index
+ *   [20:12] → PT index  (4KB only)
  *   [11: 0] → page offset
  *
  * For 16MB RAM (GPAs 0x00000000–0x00FFFFFF):
  *   PML4 index = 0         (GPA[47:39] = 0)
  *   PDPT index = 0         (GPA[38:30] = 0)
  *   PD   index = 0–7       (GPA[29:21] = 0..7 for 8 × 2MB)
- *   PT   index = 0–511     (GPA[20:12] within each 2MB range)
+ *
+ * Task 1.5 mixed layout:
+ *   PD index 0–3: 2MB large-page entries (PS=1, RW+WB initially)
+ *     HPA = page_to_phys(ept->ram_2mb_blocks[i]) — 2MB-aligned
+ *     phantom_ept_mark_all_ro() clears WRITE bit before first VMLAUNCH
+ *   PD index 4–7: 4KB page entries pointing to PT pages
  * ------------------------------------------------------------------ */
 
 /**
@@ -277,8 +351,12 @@ EXPORT_SYMBOL_GPL(phantom_ept_alloc);
  * Populates:
  *   - PML4[0] → PDPT (RWX non-leaf)
  *   - PDPT[0] → PD   (RWX non-leaf)
- *   - PD[0..7] → PT[i] (RWX non-leaf, 4KB granularity)
- *   - PT[i][j] → RAM page (RWX + WB leaf, if within 16MB)
+ *   - PD[0..3]: 2MB large-page entries (PS=1, RE+WB, WRITE cleared for CoW)
+ *   - PD[4..7]: pointer to PT pages (RWX non-leaf)
+ *   - PT[i][j]: 4KB leaf entries (RWX+WB for second 8MB region)
+ *
+ * The 2MB large-page entries are RO (WRITE=0) so CoW logic works via
+ * phantom_split_2mb_page() on the first write fault.
  *
  * Returns the EPTP value, also stored in ept->eptp.
  */
@@ -299,41 +377,57 @@ u64 phantom_ept_build(struct phantom_ept_state *ept)
 
 	/*
 	 * PML4[0] → PDPT
-	 *
 	 * Non-leaf entry: RWX bits MUST be set.  Missing R bit = EPT misconfig.
 	 */
 	pml4[0] = page_to_phys(ept->pdpt) | EPT_PERM_RWX;
 
-	/*
-	 * PDPT[0] → PD
-	 */
+	/* PDPT[0] → PD */
 	pdpt[0] = page_to_phys(ept->pd) | EPT_PERM_RWX;
 
 	/*
-	 * PD[0..7] → PT[0..7]  (8 × 2MB = 16MB RAM)
+	 * PD entries 0–3: 2MB large-page entries (first 8MB, PS=1).
 	 *
-	 * Each PD entry covers a 2MB range.  Bit 7 (PS) is NOT set —
-	 * we use 4KB pages for full GPA-to-HPA granularity.
+	 * Each 2MB region is backed by a physically contiguous order-9 block
+	 * (ram_2mb_blocks[i]).  page_to_phys() of the first page of the block
+	 * gives the 2MB-aligned HPA, since alloc_pages(order=9) guarantees
+	 * 2^9 × 4KB = 2MB alignment.
+	 *
+	 * Permissions: READ | WRITE | EXEC | WB | PS
+	 * phantom_ept_mark_all_ro() will clear WRITE before first VMLAUNCH.
 	 */
-	for (pd_idx = 0; pd_idx < PHANTOM_EPT_NR_PD_ENTRIES; pd_idx++) {
-		memset(page_address(ept->pt[pd_idx]), 0, PAGE_SIZE);
-		pd[pd_idx] = page_to_phys(ept->pt[pd_idx]) | EPT_PERM_RWX;
+	for (pd_idx = 0; pd_idx < PHANTOM_EPT_NR_2MB_ENTRIES; pd_idx++) {
+		u64 hpa_2mb = page_to_phys(ept->ram_2mb_blocks[pd_idx]);
+
+		pd[pd_idx] = hpa_2mb | EPT_PTE_READ | EPT_PTE_WRITE |
+			     EPT_PTE_EXEC | EPT_PTE_MEMTYPE_WB | EPT_PTE_PS;
 	}
 
 	/*
-	 * PT entries: map each 4KB RAM page.
+	 * PD entries 4–7: non-leaf entries pointing to PT pages (4KB region).
 	 *
-	 * GPA index: pd_idx selects which 2MB region (PT page),
-	 * pt_idx selects the 4KB page within that region.
-	 *
-	 * RAM page index = pd_idx * 512 + pt_idx
-	 * (since PAGE_SIZE = 4096 = 1 << 12)
+	 * pt[i] corresponds to PD entry (PHANTOM_EPT_4KB_PD_START + i).
 	 */
-	for (pd_idx = 0; pd_idx < PHANTOM_EPT_NR_PD_ENTRIES; pd_idx++) {
+	for (pd_idx = 0; pd_idx < PHANTOM_EPT_NR_PT_PAGES; pd_idx++) {
+		int pde_idx = PHANTOM_EPT_4KB_PD_START + pd_idx;
+
+		memset(page_address(ept->pt[pd_idx]), 0, PAGE_SIZE);
+		pd[pde_idx] = page_to_phys(ept->pt[pd_idx]) | EPT_PERM_RWX;
+	}
+
+	/*
+	 * PT entries for 4KB region (PD entries 4–7):
+	 * Map each 4KB RAM page in the second 8MB (GPA 0x800000–0xFFFFFF).
+	 *
+	 * RAM page index for the second 8MB region starts at:
+	 *   PHANTOM_EPT_2MB_REGION_PAGES = PHANTOM_EPT_NR_2MB_ENTRIES * 512
+	 */
+	for (pd_idx = 0; pd_idx < PHANTOM_EPT_NR_PT_PAGES; pd_idx++) {
 		pt = (u64 *)page_address(ept->pt[pd_idx]);
 
 		for (pt_idx = 0; pt_idx < 512; pt_idx++) {
-			unsigned int ram_idx = pd_idx * 512 + pt_idx;
+			unsigned int ram_idx = PHANTOM_EPT_2MB_REGION_PAGES +
+					       (unsigned int)pd_idx * 512 +
+					       (unsigned int)pt_idx;
 			u64 hpa;
 
 			if (ram_idx >= PHANTOM_EPT_RAM_PAGES)
@@ -343,9 +437,8 @@ u64 phantom_ept_build(struct phantom_ept_state *ept)
 
 			/*
 			 * Leaf entry: RWX + WB memory type + HPA.
-			 *
-			 * For CoW this will eventually become RO (clear W bit)
-			 * at snapshot time.  For task 1.3 all pages are RWX.
+			 * For CoW this becomes RO at snapshot time via
+			 * phantom_ept_mark_all_ro().
 			 */
 			pt[pt_idx] = hpa | EPT_PTE_READ | EPT_PTE_WRITE |
 				     EPT_PTE_EXEC | EPT_PTE_MEMTYPE_WB;
@@ -369,22 +462,55 @@ EXPORT_SYMBOL_GPL(phantom_ept_build);
  * @ept: EPT state to tear down.
  *
  * NULL-safe: skips any page pointer that is NULL (handles partial alloc).
+ *
+ * Frees: ram_pages array + individual ram_pages, PT pages (4KB region),
+ * PD, PDPT, PML4.
+ * Does NOT free split-list PT pages — those are owned by phantom_split_list
+ * and freed via phantom_split_list_free().
  */
 void phantom_ept_teardown(struct phantom_ept_state *ept)
 {
 	int i;
 
 	if (ept->ram_pages) {
-		for (i = PHANTOM_EPT_RAM_PAGES - 1; i >= 0; i--) {
+		/*
+		 * Free 4KB region pages individually
+		 * (indices PHANTOM_EPT_2MB_REGION_PAGES..PHANTOM_EPT_RAM_PAGES-1).
+		 * The 2MB region pages (indices 0..PHANTOM_EPT_2MB_REGION_PAGES-1)
+		 * are sub-pages of order-9 blocks and must NOT be individually freed.
+		 */
+		for (i = PHANTOM_EPT_RAM_PAGES - 1;
+		     i >= (int)PHANTOM_EPT_2MB_REGION_PAGES; i--) {
 			if (ept->ram_pages[i]) {
 				__free_page(ept->ram_pages[i]);
 				ept->ram_pages[i] = NULL;
 			}
 		}
+
+		/* NULL out 2MB region pointers (owned by ram_2mb_blocks) */
+		for (i = 0; i < (int)PHANTOM_EPT_2MB_REGION_PAGES; i++)
+			ept->ram_pages[i] = NULL;
+
 		kvfree(ept->ram_pages);
 		ept->ram_pages = NULL;
 	}
 
+	/*
+	 * Free the order-9 (2MB) contiguous blocks for the first 8MB.
+	 * Each block covers 512 × 4KB = 2MB.
+	 */
+	for (i = PHANTOM_EPT_NR_2MB_ENTRIES - 1; i >= 0; i--) {
+		if (ept->ram_2mb_blocks[i]) {
+			__free_pages(ept->ram_2mb_blocks[i], 9);
+			ept->ram_2mb_blocks[i] = NULL;
+		}
+	}
+
+	/*
+	 * Free only the PHANTOM_EPT_NR_PT_PAGES PT pages for the 4KB region.
+	 * The split-list PT pages (from 2MB splits) are managed separately
+	 * by phantom_split_list_free().
+	 */
 	for (i = PHANTOM_EPT_NR_PT_PAGES - 1; i >= 0; i--) {
 		if (ept->pt[i]) {
 			__free_page(ept->pt[i]);
@@ -422,10 +548,16 @@ EXPORT_SYMBOL_GPL(phantom_ept_teardown);
  * @gpa: Guest physical address to look up.
  *
  * Walks: PML4 → PDPT → PD → PT.
- * Only valid for 4KB leaf entries (large-page entries not used here).
+ * Handles both 2MB large-page entries (PS=1 in PD) and 4KB entries.
  *
- * Returns a pointer to the leaf PT entry, or NULL if the GPA is outside
- * the EPT structure (e.g., GPA >= 16MB which has no PT page).
+ * For 2MB large-page entries (first 8MB, before any split):
+ *   Returns NULL — the PDE itself is not a 4KB leaf PTE.
+ *   Use phantom_ept_get_pd_entry() instead to get the PD entry pointer.
+ *
+ * For 4KB entries (second 8MB or after a 2MB split):
+ *   Returns a pointer to the leaf PT entry.
+ *
+ * Returns NULL if the GPA is outside the EPT structure.
  */
 u64 *phantom_ept_lookup_pte(struct phantom_ept_state *ept, u64 gpa)
 {
@@ -453,7 +585,12 @@ u64 *phantom_ept_lookup_pte(struct phantom_ept_state *ept, u64 gpa)
 	if (!(entry & EPT_PTE_READ))
 		return NULL;
 
-	/* Large page (PS bit set in PD entry) — not used in task 1.3 */
+	/*
+	 * 2MB large page (PS=1 in PD entry): this GPA is covered by a
+	 * large-page mapping, not a 4KB PT.  Caller should use
+	 * phantom_ept_get_pd_entry() to get the PDE pointer directly.
+	 * Return NULL so callers know this is not a 4KB PTE.
+	 */
 	if (entry & EPT_PTE_PS)
 		return NULL;
 
@@ -497,13 +634,18 @@ EXPORT_SYMBOL_GPL(phantom_ept_get_ram_page);
  * phantom_ept_mark_all_ro - Clear EPT_PTE_WRITE on all 16MB RAM PTEs.
  * @ept: EPT state with pages already built by phantom_ept_build().
  *
- * Iterates over all PT pages (PHANTOM_EPT_NR_PT_PAGES) and all 512
- * entries in each, clearing bit 1 (EPT_PTE_WRITE) from any present
- * (READ bit set) leaf PTE.
+ * Task 1.5: handles BOTH regions:
+ *
+ * 1. 2MB large-page region (PD entries 0–3, first 8MB):
+ *    Clears EPT_PTE_WRITE from each 2MB PD entry that has PS=1 and READ.
+ *
+ * 2. 4KB region (PT pages for PD entries 4–7, second 8MB):
+ *    Iterates all PT pages and clears EPT_PTE_WRITE from each present leaf.
  *
  * After this call:
  *   - All guest writes to RAM trigger EPT violation (exit 48).
- *   - phantom_cow_fault() handles violations by creating private copies.
+ *   - phantom_cow_fault() handles 4KB violations directly.
+ *   - phantom_cow_fault() calls phantom_split_2mb_page() for 2MB faults.
  *   - Execute and read access still function normally.
  *
  * Called before the first VMLAUNCH (snapshot point).
@@ -511,11 +653,34 @@ EXPORT_SYMBOL_GPL(phantom_ept_get_ram_page);
  */
 void phantom_ept_mark_all_ro(struct phantom_ept_state *ept)
 {
+	u64 *pd;
 	int pd_idx, pt_idx;
 
 	if (!ept || !ept->ready)
 		return;
 
+	pd = (u64 *)page_address(ept->pd);
+
+	/*
+	 * Step 1: Clear WRITE from 2MB large-page PD entries (first 8MB).
+	 *
+	 * These entries have PS=1 (EPT_PTE_PS).  After clearing WRITE,
+	 * any guest write to this 2MB region triggers EPT violation with
+	 * exit qualification showing the GPA is readable but not writable.
+	 * phantom_cow_fault() will detect PS=1 in the PDE and call
+	 * phantom_split_2mb_page() to split into 512 × 4KB RO entries.
+	 */
+	for (pd_idx = 0; pd_idx < PHANTOM_EPT_NR_2MB_ENTRIES; pd_idx++) {
+		if ((pd[pd_idx] & EPT_PTE_READ) &&
+		    (pd[pd_idx] & EPT_PTE_PS))
+			pd[pd_idx] &= ~EPT_PTE_WRITE;
+	}
+
+	/*
+	 * Step 2: Clear WRITE from 4KB PT entries (second 8MB).
+	 *
+	 * pt[i] corresponds to PD entry (PHANTOM_EPT_4KB_PD_START + i).
+	 */
 	for (pd_idx = 0; pd_idx < PHANTOM_EPT_NR_PT_PAGES; pd_idx++) {
 		u64 *pt;
 
@@ -531,3 +696,98 @@ void phantom_ept_mark_all_ro(struct phantom_ept_state *ept)
 	}
 }
 EXPORT_SYMBOL_GPL(phantom_ept_mark_all_ro);
+
+/* ------------------------------------------------------------------
+ * phantom_ept_get_pd_entry - Walk to PD level and return PDE pointer
+ * ------------------------------------------------------------------ */
+
+/**
+ * phantom_ept_get_pd_entry - Return pointer to the PD entry for a GPA.
+ * @ept: EPT state.
+ * @gpa: Guest physical address.
+ *
+ * Walks PML4 → PDPT → PD and returns a pointer to the PD entry
+ * (the entry at PD[GPA[29:21]]).  The caller can inspect or modify the
+ * entry directly (e.g., to check PS=1 for 2MB large-page detection or
+ * to replace a 2MB entry with a 4KB-level PT pointer during splitting).
+ *
+ * Returns NULL if PML4 or PDPT entries are absent (no EPT coverage).
+ * Hot-path safe: no allocation, no sleeping.
+ */
+u64 *phantom_ept_get_pd_entry(struct phantom_ept_state *ept, u64 gpa)
+{
+	unsigned int pml4_idx = (gpa >> 39) & 0x1FF;
+	unsigned int pdpt_idx = (gpa >> 30) & 0x1FF;
+	unsigned int pd_idx   = (gpa >> 21) & 0x1FF;
+	u64 *pml4, *pdpt, *pd;
+	u64 entry;
+
+	pml4 = (u64 *)page_address(ept->pml4);
+	entry = pml4[pml4_idx];
+	if (!(entry & EPT_PTE_READ))
+		return NULL;
+
+	pdpt = (u64 *)phys_to_virt(entry & EPT_PTE_HPA_MASK);
+	entry = pdpt[pdpt_idx];
+	if (!(entry & EPT_PTE_READ))
+		return NULL;
+
+	pd = (u64 *)phys_to_virt(entry & EPT_PTE_HPA_MASK);
+	return &pd[pd_idx];
+}
+EXPORT_SYMBOL_GPL(phantom_ept_get_pd_entry);
+
+/* ------------------------------------------------------------------
+ * phantom_invept_single_context - single-context INVEPT
+ * ------------------------------------------------------------------ */
+
+/*
+ * INVEPT descriptor: 16 bytes as required by Intel SDM Vol. 3C §30.3.
+ */
+struct phantom_invept_desc {
+	u64 eptp;
+	u64 rsvd;
+} __packed;
+
+/**
+ * phantom_invept_single_context - Invalidate EPT translations for @eptp.
+ * @eptp: EPT pointer value identifying the context to invalidate.
+ *
+ * Issues INVEPT type 1 (single-context) which invalidates all cached
+ * EPT translations associated with this EPTP value.
+ *
+ * Required after 2MB→4KB structural splits:
+ *   The processor may have cached the 2MB translation for non-faulting
+ *   GPAs within the same 2MB range.  INVEPT invalidates those stale
+ *   cached translations so subsequent accesses use the new 4KB PTEs.
+ *
+ * NOT required after 4KB RO→RW CoW faults:
+ *   The EPT violation itself invalidates the cached translation for the
+ *   faulting GPA (Intel SDM §28.3.3.1).
+ *
+ * Emits trace_printk under PHANTOM_DEBUG.
+ * Reports pr_err if INVEPT returns CF=1 (hardware error, should never
+ * happen with a valid EPTP and supported INVEPT type).
+ */
+void phantom_invept_single_context(u64 eptp)
+{
+	struct phantom_invept_desc desc = { .eptp = eptp, .rsvd = 0 };
+	u64 rflags;
+
+	asm volatile(
+		"invept %1, %2\n\t"
+		"pushfq\n\t"
+		"popq %0"
+		: "=r"(rflags)
+		: "m"(desc), "r"((u64)1)  /* type 1 = single-context */
+		: "cc", "memory");
+
+	if (rflags & X86_EFLAGS_CF)
+		pr_err("phantom: INVEPT single-context failed "
+		       "(CF=1, eptp=0x%llx)\n", eptp);
+
+#ifdef PHANTOM_DEBUG
+	trace_printk("PHANTOM INVEPT type=1 eptp=0x%llx\n", eptp);
+#endif
+}
+EXPORT_SYMBOL_GPL(phantom_invept_single_context);

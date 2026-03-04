@@ -536,6 +536,29 @@ struct phantom_vmx_cpu_state {
 	 * to verify CoW correctness without a race.
 	 */
 	u32			  last_dirty_count;
+
+	/*
+	 * Task 1.5: 2MB→4KB split list.
+	 *
+	 * Tracks PT pages allocated when phantom_split_2mb_page() converts
+	 * a 2MB large-page PD entry into 512 × 4KB PTEs.  Entries are freed
+	 * in phantom_cow_abort_iteration() after restoring the 2MB PD entry.
+	 *
+	 * Placed after cow_enabled/last_dirty_count to preserve prior field
+	 * offsets (assembly trampoline accesses fields above by offset).
+	 */
+	struct phantom_split_list split_list;
+
+	/*
+	 * Task 1.5: dirty list overflow counter.
+	 *
+	 * Incremented when phantom_cow_fault() detects dirty_count >=
+	 * dirty_max.  Unlike pool exhaustion (which sets CRASH result),
+	 * overflow causes a graceful abort via phantom_cow_abort_iteration()
+	 * and returns -ENOSPC.  The counter persists across iterations for
+	 * health monitoring.
+	 */
+	u32			  dirty_overflow_count;
 };
 
 DECLARE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);

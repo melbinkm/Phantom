@@ -1040,8 +1040,8 @@ int phantom_vmcs_setup(struct phantom_vmx_cpu_state *state)
 	state->cow_enabled   = true;
 
 	state->pages_allocated = true;
-	pr_info("phantom: CPU%d: pages allocated (EPT: 16MB RAM RO, "
-		"eptp=0x%llx, cow_pool=%u pages)\n",
+	pr_info("phantom: CPU%d: pages allocated (EPT: 8MB 2MB-pages + "
+		"8MB 4KB-pages, eptp=0x%llx, cow_pool=%u pages)\n",
 		cpu, state->ept.eptp, state->cow_pool.capacity);
 	return 0;
 
@@ -1183,6 +1183,14 @@ void phantom_vmcs_teardown(struct phantom_vmx_cpu_state *state)
 	phantom_cow_pool_destroy(&state->cow_pool);
 	state->cow_enabled   = false;
 	state->cow_iteration = 0;
+
+	/*
+	 * Task 1.5: free any split-list PT pages that were not freed by
+	 * phantom_cow_abort_iteration() (e.g., if module is unloaded while
+	 * a split region is active from the last iteration).
+	 */
+	phantom_split_list_free(&state->split_list);
+	state->dirty_overflow_count = 0;
 
 	state->pages_allocated = false;
 	state->vmcs_configured = false;

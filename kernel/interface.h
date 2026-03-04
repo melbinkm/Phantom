@@ -22,8 +22,9 @@
  * Task 1.2 baseline: version 1.2.0 = 0x00010200
  * Task 1.3 baseline: version 1.3.0 = 0x00010300
  * Task 1.4 baseline: version 1.4.0 = 0x00010400
+ * Task 1.5 baseline: version 1.5.0 = 0x00010500
  * ------------------------------------------------------------------ */
-#define PHANTOM_VERSION		0x00010400U
+#define PHANTOM_VERSION		0x00010500U
 
 /* ------------------------------------------------------------------
  * ioctl command numbers
@@ -73,10 +74,20 @@ struct phantom_run_args {
  * PHANTOM_IOCTL_DEBUG_DUMP_DIRTY_LIST — dump CoW dirty list entries.
  *
  * No arguments.  Emits DIRTY_ENTRY lines via trace_printk.
+ * Also emits DIRTY_OVERFLOW line if dirty_overflow_count > 0.
  * Output goes to /sys/kernel/debug/tracing/trace.
  * Returns 0 on success, -EINVAL if dirty_list not allocated.
  */
 #define PHANTOM_IOCTL_DEBUG_DUMP_DIRTY_LIST	_IO(PHANTOM_IOCTL_MAGIC, 7)
+
+/*
+ * PHANTOM_IOCTL_DEBUG_DUMP_DIRTY_OVERFLOW — report dirty list overflow count.
+ *
+ * No arguments.  Emits one trace_printk line:
+ *   "DIRTY_OVERFLOW count=N"
+ * Returns 0 on success.  Also returns 0 if no overflows have occurred.
+ */
+#define PHANTOM_IOCTL_DEBUG_DUMP_DIRTY_OVERFLOW	_IO(PHANTOM_IOCTL_MAGIC, 8)
 
 /*
  * Reserved for future phases:
