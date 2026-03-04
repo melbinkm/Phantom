@@ -136,6 +136,22 @@ static inline void __invept_single(u64 eptp)
 		     : "cc", "memory");
 }
 
+/*
+ * __invept_all - INVEPT type 2 (all-context invalidation).
+ *
+ * Invalidates all EPT TLB entries for ALL EPTPs on this logical
+ * processor.  Used during teardown to ensure KVM L0 has no cached
+ * references to our (soon to be freed) EPT page tables.
+ */
+static inline void __invept_all(void)
+{
+	struct phantom_invept_desc desc = { .eptp = 0, .rsvd = 0 };
+
+	asm volatile("invept %0, %1"
+		     :: "m"(desc), "r"((u64)2)   /* type 2 = all-context */
+		     : "cc", "memory");
+}
+
 /* ------------------------------------------------------------------
  * Control field adjustment
  *
@@ -260,59 +276,13 @@ int phantom_vmx_check_cpu_features(struct phantom_cpu_features *feat)
  * VMXON / VMXOFF workers
  * ------------------------------------------------------------------ */
 
-struct phantom_vmxon_work {
-	u32  revision_id;
-	int  result;
-};
-
-static void phantom_vmxon_cpu(void *data)
-{
-	struct phantom_vmxon_work *work = data;
-	struct phantom_vmx_cpu_state *state;
-	unsigned long cr4;
-	u64 phys;
-	u32 *rev_ptr;
-	int cpu, ret;
-	bool we_set_vmxe = false;
-
-	cpu   = smp_processor_id();
-	state = this_cpu_ptr(&phantom_vmx_state);
-
-	state->cpu      = cpu;
-	state->init_err = 0;
-
-	cr4 = native_read_cr4();
-	state->saved_cr4 = cr4;
-
-	if (cr4 & X86_CR4_VMXE) {
-		pr_warn("phantom: CPU%d: CR4.VMXE already set — "
-			"VMX likely active (conflict possible)\n", cpu);
-	} else {
-		cr4_set_bits(X86_CR4_VMXE);
-		we_set_vmxe = true;
-	}
-
-	rev_ptr  = (u32 *)page_address(state->vmxon_region);
-	*rev_ptr = work->revision_id;
-	phys     = page_to_phys(state->vmxon_region);
-
-	ret = __vmxon(phys);
-	if (ret) {
-		pr_err("phantom: CPU%d: VMXON failed (err=%d) — "
-		       "is kvm_intel loaded?\n", cpu, ret);
-		if (we_set_vmxe)
-			cr4_clear_bits(X86_CR4_VMXE);
-		state->vmx_active = false;
-		state->init_err   = ret;
-		work->result      = ret;
-		return;
-	}
-
-	state->vmx_active = true;
-	work->result      = 0;
-	pr_info("phantom: CPU%d: VMX root entered successfully\n", cpu);
-}
-
+/*
+ * phantom_vmxoff_cpu — helper used only by phantom_vmxoff_all for the
+ * (now rare) case where a CPU still has vmx_active=true.  After our fix,
+ * the vCPU thread always runs VMXOFF locally, so vmx_active will be false
+ * by the time phantom_vmxoff_all is called.  The function is kept for
+ * correctness on abnormal paths (e.g. vCPU thread never started).
+ */
 static void phantom_vmxoff_cpu(void *data)
 {
 	struct phantom_vmx_cpu_state *state = this_cpu_ptr(&phantom_vmx_state);
@@ -332,31 +302,51 @@ static void phantom_vmxoff_cpu(void *data)
 
 /* ------------------------------------------------------------------
  * Public: phantom_vmxon_all / phantom_vmxoff_all
+ *
+ * phantom_vmxon_all now ONLY allocates the VMXON backing page and reads
+ * the VMX revision ID.  The actual VMXON instruction is executed by the
+ * vCPU thread on its own CPU (no smp_call_function_single IPI needed).
+ *
+ * Background: after the first load's VMLAUNCH+VMXOFF cycle, KVM L0's
+ * nested VMX tracking for the target CPU is in a post-nested-exit state.
+ * Any cross-CPU function-call IPI (smp_call_function_single) to that CPU
+ * — even after VMXOFF — causes a triple fault in the guest kernel.
+ *
+ * The fix: the vCPU thread performs VMXON + VMCS alloc + VMPTRLD locally
+ * on its own CPU at startup, then signals vcpu_init_done.  Module init
+ * waits on vcpu_init_done.  Zero cross-CPU IPIs during the VMX init path.
  * ------------------------------------------------------------------ */
 
 int phantom_vmxon_all(const struct cpumask *cpumask)
 {
 	struct phantom_vmx_cpu_state *state;
-	struct phantom_vmxon_work work;
-	int cpu, n = 0, ret = 0;
+	u64 vmx_basic;
+	u32 revision_id;
+	int cpu, ret = 0;
 
-	{
-		u64 vmx_basic;
-
-		if (rdmsrl_safe(MSR_IA32_VMX_BASIC, &vmx_basic)) {
-			pr_err("phantom: failed to read VMX_BASIC for revision\n");
-			return -EIO;
-		}
-		work.revision_id = (u32)(vmx_basic & VMX_BASIC_REVISION_MASK);
+	/*
+	 * Read VMX revision ID from BSP (same value on all logical CPUs
+	 * on the same physical package).
+	 */
+	if (rdmsrl_safe(MSR_IA32_VMX_BASIC, &vmx_basic)) {
+		pr_err("phantom: failed to read VMX_BASIC for revision\n");
+		return -EIO;
 	}
+	revision_id = (u32)(vmx_basic & VMX_BASIC_REVISION_MASK);
 
 	for_each_cpu(cpu, cpumask) {
 		int node = cpu_to_node(cpu);
 
 		state = per_cpu_ptr(&phantom_vmx_state, cpu);
 		memset(state, 0, sizeof(*state));
-		state->cpu = cpu;
+		state->cpu            = cpu;
+		state->vmx_revision_id = revision_id;
 
+		/*
+		 * Allocate the VMXON region backing page.  This can be done
+		 * from any CPU — only the physical address matters for VMXON.
+		 * The actual VMXON instruction runs in the vCPU thread.
+		 */
 		state->vmxon_region = alloc_pages_node(node,
 						       GFP_KERNEL | __GFP_ZERO,
 						       0);
@@ -368,33 +358,7 @@ int phantom_vmxon_all(const struct cpumask *cpumask)
 		}
 	}
 
-	for_each_cpu(cpu, cpumask) {
-		work.result = 0;
-		smp_call_function_single(cpu, phantom_vmxon_cpu, &work, 1);
-
-		if (work.result) {
-			ret = work.result;
-			pr_err("phantom: VMXON failed on CPU%d; "
-			       "rolling back %d core(s)\n", cpu, n);
-			goto fail_vmxon;
-		}
-		n++;
-	}
-
 	return 0;
-
-fail_vmxon:
-	{
-		int j = 0;
-
-		for_each_cpu(cpu, cpumask) {
-			if (j >= n)
-				break;
-			smp_call_function_single(cpu, phantom_vmxoff_cpu,
-						 NULL, 1);
-			j++;
-		}
-	}
 
 fail_alloc:
 	for_each_cpu(cpu, cpumask) {
@@ -439,123 +403,17 @@ void phantom_vmxoff_all(const struct cpumask *cpumask)
 	}
 }
 
-/* ------------------------------------------------------------------
- * VMCS allocation workers
- * ------------------------------------------------------------------ */
-
-struct phantom_vmcs_work {
-	u32  revision_id;
-	int  result;
-};
-
-static void phantom_vmcs_alloc_cpu(void *data)
-{
-	struct phantom_vmcs_work *work = data;
-	struct phantom_vmx_cpu_state *state = this_cpu_ptr(&phantom_vmx_state);
-	u32 *rev_ptr;
-	u64 phys;
-	int cpu, ret;
-
-	cpu          = smp_processor_id();
-	work->result = 0;
-
-	state->vmcs_region = alloc_pages_node(cpu_to_node(cpu),
-					      GFP_KERNEL | __GFP_ZERO, 0);
-	if (!state->vmcs_region) {
-		pr_err("phantom: CPU%d: failed to alloc VMCS region\n", cpu);
-		work->result = -ENOMEM;
-		return;
-	}
-
-	rev_ptr  = (u32 *)page_address(state->vmcs_region);
-	*rev_ptr = work->revision_id & ~BIT(31);
-	phys     = page_to_phys(state->vmcs_region);
-
-	ret = __vmclear(phys);
-	if (ret) {
-		pr_err("phantom: CPU%d: VMCLEAR failed\n", cpu);
-		__free_page(state->vmcs_region);
-		state->vmcs_region = NULL;
-		work->result = ret;
-		return;
-	}
-
-	ret = __vmptrld(phys);
-	if (ret) {
-		pr_err("phantom: CPU%d: VMPTRLD failed\n", cpu);
-		__free_page(state->vmcs_region);
-		state->vmcs_region = NULL;
-		work->result = ret;
-		return;
-	}
-
-	pr_info("phantom: CPU%d: VMCS allocated and loaded\n", cpu);
-}
-
-static void phantom_vmcs_free_cpu(void *data)
-{
-	struct phantom_vmx_cpu_state *state = this_cpu_ptr(&phantom_vmx_state);
-
-	if (!state->vmcs_region)
-		return;
-
-	{
-		u64 phys = page_to_phys(state->vmcs_region);
-
-		__vmclear(phys);
-	}
-
-	__free_page(state->vmcs_region);
-	state->vmcs_region = NULL;
-
-	pr_info("phantom: CPU%d: VMCS freed\n", smp_processor_id());
-}
-
+/*
+ * phantom_vmcs_alloc_all is now a no-op: VMCS allocation and VMPTRLD are
+ * performed by the vCPU thread on its own CPU (see phantom_vcpu_init_on_cpu).
+ * This eliminates cross-CPU IPIs (smp_call_function_single) which caused
+ * triple faults in nested KVM after a prior VMLAUNCH+VMXOFF cycle.
+ *
+ * The function is retained for source compatibility; it always returns 0.
+ */
 int phantom_vmcs_alloc_all(const struct cpumask *cpumask)
 {
-	struct phantom_vmcs_work work;
-	struct phantom_vmx_cpu_state *state;
-	int cpu, n = 0, ret = 0;
-	u64 vmx_basic;
-
-	if (rdmsrl_safe(MSR_IA32_VMX_BASIC, &vmx_basic)) {
-		pr_err("phantom: failed to read VMX_BASIC for VMCS revision\n");
-		return -EIO;
-	}
-	work.revision_id = (u32)(vmx_basic & VMX_BASIC_REVISION_MASK);
-
-	for_each_cpu(cpu, cpumask) {
-		work.result = 0;
-		smp_call_function_single(cpu, phantom_vmcs_alloc_cpu,
-					 &work, 1);
-		if (work.result) {
-			ret = work.result;
-			goto fail;
-		}
-		n++;
-	}
 	return 0;
-
-fail:
-	{
-		int j = 0;
-
-		for_each_cpu(cpu, cpumask) {
-			if (j >= n)
-				break;
-			smp_call_function_single(cpu, phantom_vmcs_free_cpu,
-						 NULL, 1);
-			j++;
-		}
-	}
-	for_each_cpu(cpu, cpumask) {
-		state = per_cpu_ptr(&phantom_vmx_state, cpu);
-		if (state->vmcs_region) {
-			__free_page(state->vmcs_region);
-			state->vmcs_region = NULL;
-		}
-	}
-	return ret;
 }
 
 void phantom_vmcs_free_all(const struct cpumask *cpumask)
@@ -732,6 +590,7 @@ static u64 phantom_get_tr_base(void)
 	struct desc_struct *gdt;
 	u16 tr;
 	u64 base;
+	u64 high_word;
 
 	native_store_gdt(&gdtr);
 	asm volatile("str %0" : "=rm"(tr));
@@ -741,15 +600,27 @@ static u64 phantom_get_tr_base(void)
 	base = get_desc_base(gdt);
 
 	/*
-	 * For a 64-bit TSS, the high 32 bits of the base are in the
-	 * descriptor immediately following in the GDT.
+	 * 64-bit TSS descriptor layout (Intel SDM Vol 3A, Table 3-2):
+	 *
+	 * Word 0 (bytes  0– 7): standard segment descriptor encoding
+	 *   bits 39:16 = Base[23:0], bits 63:56 = Base[31:24]
+	 *   get_desc_base() extracts Base[31:0] from word 0.
+	 *
+	 * Word 1 (bytes  8–15): extension for 64-bit descriptor
+	 *   bits 31: 0 (of word 1) = Base[63:32]  ← LOWER 32 bits
+	 *   bits 63:32 (of word 1) = Reserved, must be 0
+	 *
+	 * Bug history: the original code used mask 0xFFFFFFFF00000000ULL
+	 * which extracted the UPPER 32 bits of word 1 (the reserved field,
+	 * always 0), yielding a truncated base address missing bits 63:32.
+	 * This caused the TSS base stored in HOST_TR_BASE to be the low
+	 * 32 bits only (e.g. 0x000000004377f000 instead of 0xfffffe4916fb1000).
+	 * On VM exit, the CPU loaded this wrong TSS base, corrupting IST
+	 * entries and causing a triple fault ~100ms later when the first
+	 * IST-based interrupt (NMI, double fault) fired.
 	 */
-	{
-		u64 high_word;
-
-		memcpy(&high_word, (u8 *)gdt + 8, 8);
-		base |= (high_word & 0xFFFFFFFF00000000ULL);
-	}
+	memcpy(&high_word, (u8 *)gdt + 8, 8);
+	base |= (high_word & 0x00000000FFFFFFFFULL) << 32;
 
 	return base;
 }
@@ -809,7 +680,25 @@ static int phantom_vmcs_setup_controls(struct phantom_vmx_cpu_state *state,
 					MSR_IA32_VMX_PROCBASED_CTLS2);
 	phantom_vmcs_write32(VMCS_CTRL_PROCBASED2, proc2);
 
-	/* VM-exit controls: host 64-bit + ACK interrupt + PAT + EFER */
+	/* VM-exit controls: host 64-bit + PAT + EFER.
+	 *
+	 * NOTE: VM_EXIT_ACK_INT_ON_EXIT is deliberately NOT set.
+	 *
+	 * When PIN_BASED_EXT_INT_EXITING causes an external interrupt to
+	 * exit from L2 to L1, the CPU must still deliver the interrupt to
+	 * L1's IDT.  With VM_EXIT_ACK_INT_ON_EXIT set, the CPU acknowledges
+	 * the interrupt (sends EOI to the virtual APIC) before exiting,
+	 * which means the interrupt is dismissed without ever running L1's
+	 * handler (e.g., the Linux timer interrupt handler).
+	 *
+	 * Without VM_EXIT_ACK_INT_ON_EXIT, the external interrupt remains
+	 * pending at the virtual APIC.  After the exit handler calls
+	 * local_irq_enable(), the APIC delivers the interrupt via L1's IDT
+	 * normally, allowing the Linux timer and other interrupt handlers to
+	 * run.  This prevents L1's APIC timer from being silently swallowed
+	 * by phantom.ko, which would cause scheduler failures and eventually
+	 * a triple fault 100-500ms after VMXOFF.
+	 */
 	{
 		u32 msr = use_true_ctls ?
 			MSR_IA32_VMX_TRUE_EXIT_CTLS :
@@ -817,7 +706,6 @@ static int phantom_vmcs_setup_controls(struct phantom_vmx_cpu_state *state,
 
 		exit_c = phantom_adjust_controls(
 			VM_EXIT_HOST_ADDR_SPACE_SIZE |
-			VM_EXIT_ACK_INT_ON_EXIT |
 			VM_EXIT_SAVE_IA32_PAT |
 			VM_EXIT_LOAD_IA32_PAT |
 			VM_EXIT_SAVE_IA32_EFER |
@@ -1304,7 +1192,120 @@ void phantom_vmcs_teardown(struct phantom_vmx_cpu_state *state)
  * completion back to the ioctl, and loops.  Kernel threads are proper
  * kernel tasks; the scheduler moves them to their pinned CPU normally,
  * and they are not subject to the nested-VMX IPI delivery issue.
+ *
+ * IPI-free init: the thread also performs VMXON + VMCS alloc + VMPTRLD
+ * locally at startup (phantom_vcpu_init_on_cpu), eliminating the
+ * smp_call_function_single calls that previously caused triple faults
+ * on the second module load in nested KVM environments.
  * ------------------------------------------------------------------ */
+
+/*
+ * phantom_vcpu_init_on_cpu - Per-CPU VMX init: VMXON + VMCS alloc + VMPTRLD.
+ *
+ * Called from the vCPU thread, running on state->cpu.  No cross-CPU
+ * IPIs involved.  This replaces the smp_call_function_single approach
+ * used in phantom_vmxon_cpu / phantom_vmcs_alloc_cpu.
+ *
+ * Root cause of second-load crash: after VMLAUNCH+VMXOFF, KVM L0's
+ * nested VMX tracking for this CPU is in a post-nested-exit state.
+ * Any function-call IPI to this CPU in that state causes a triple
+ * fault.  Running VMXON locally in the thread avoids all IPIs.
+ *
+ * Returns 0 on success, negative errno on failure.
+ */
+static int phantom_vcpu_init_on_cpu(struct phantom_vmx_cpu_state *state)
+{
+	u32 *rev_ptr;
+	u64 phys;
+	unsigned long cr4;
+	bool we_set_vmxe = false;
+	int cpu = smp_processor_id();
+	int ret;
+
+	/* Sanity: must be running on the right CPU */
+	if (WARN_ON(cpu != state->cpu))
+		return -EINVAL;
+
+	/* ----------------------------------------------------------
+	 * Step 1: VMXON
+	 * ---------------------------------------------------------- */
+	cr4 = native_read_cr4();
+	state->saved_cr4 = cr4;
+
+	if (cr4 & X86_CR4_VMXE) {
+		pr_warn("phantom: CPU%d: CR4.VMXE already set — "
+			"VMX likely active (conflict possible)\n", cpu);
+	} else {
+		cr4_set_bits(X86_CR4_VMXE);
+		we_set_vmxe = true;
+	}
+
+	rev_ptr  = (u32 *)page_address(state->vmxon_region);
+	*rev_ptr = state->vmx_revision_id;
+	phys     = page_to_phys(state->vmxon_region);
+
+	ret = __vmxon(phys);
+	if (ret) {
+		pr_err("phantom: CPU%d: VMXON failed (err=%d) — "
+		       "is kvm_intel loaded?\n", cpu, ret);
+		if (we_set_vmxe)
+			cr4_clear_bits(X86_CR4_VMXE);
+		state->vmx_active = false;
+		state->init_err   = ret;
+		return ret;
+	}
+
+	state->vmx_active = true;
+	pr_info("phantom: CPU%d: VMX root entered successfully\n", cpu);
+
+	/* ----------------------------------------------------------
+	 * Step 2: VMCS alloc + VMCLEAR + VMPTRLD
+	 * ---------------------------------------------------------- */
+	state->vmcs_region = alloc_pages_node(cpu_to_node(cpu),
+					      GFP_KERNEL | __GFP_ZERO, 0);
+	if (!state->vmcs_region) {
+		pr_err("phantom: CPU%d: failed to alloc VMCS region\n", cpu);
+		__vmxoff();
+		if (we_set_vmxe)
+			cr4_clear_bits(X86_CR4_VMXE);
+		state->vmx_active = false;
+		return -ENOMEM;
+	}
+
+	{
+		u32 *vmcs_rev = (u32 *)page_address(state->vmcs_region);
+
+		*vmcs_rev = state->vmx_revision_id & ~BIT(31);
+	}
+	phys = page_to_phys(state->vmcs_region);
+
+	ret = __vmclear(phys);
+	if (ret) {
+		pr_err("phantom: CPU%d: VMCLEAR failed\n", cpu);
+		__free_page(state->vmcs_region);
+		state->vmcs_region = NULL;
+		__vmxoff();
+		if (we_set_vmxe)
+			cr4_clear_bits(X86_CR4_VMXE);
+		state->vmx_active = false;
+		return ret;
+	}
+
+	ret = __vmptrld(phys);
+	if (ret) {
+		pr_err("phantom: CPU%d: VMPTRLD failed\n", cpu);
+		__free_page(state->vmcs_region);
+		state->vmcs_region = NULL;
+		__vmxoff();
+		if (we_set_vmxe)
+			cr4_clear_bits(X86_CR4_VMXE);
+		state->vmx_active = false;
+		return ret;
+	}
+
+	pr_info("phantom: CPU%d: VMCS allocated and loaded\n", cpu);
+	return 0;
+}
 
 /* Timeout for vCPU thread's initial idle wait (before first VMLAUNCH): 50ms */
 #define VCPU_THREAD_TIMEOUT_MS		50
@@ -1367,6 +1368,28 @@ static int phantom_vcpu_fn(void *data)
 	pr_info("phantom: CPU%d: vCPU thread started (pid=%d)\n",
 		state->cpu, current->pid);
 
+	/*
+	 * Perform VMXON + VMCS alloc + VMPTRLD locally on this CPU.
+	 *
+	 * This MUST happen here in the thread, not via smp_call_function_single
+	 * from another CPU.  After a prior VMLAUNCH+VMXOFF cycle (first module
+	 * load), KVM L0's nested VMX tracking for this CPU is in a post-nested-
+	 * exit state.  Any function-call IPI to this CPU in that state triggers
+	 * a triple fault in the guest kernel — even after VMXOFF.
+	 *
+	 * Running VMXON locally in the pinned thread avoids all cross-CPU IPIs
+	 * during VMX init, fixing the second-load crash.
+	 */
+	state->vcpu_init_result = phantom_vcpu_init_on_cpu(state);
+	complete(&state->vcpu_init_done);
+
+	if (state->vcpu_init_result) {
+		/* Init failed — cannot proceed; thread exits cleanly. */
+		pr_err("phantom: CPU%d: vcpu init failed: %d\n",
+		       state->cpu, state->vcpu_init_result);
+		return state->vcpu_init_result;
+	}
+
 	for (;;) {
 		/*
 		 * Wait for work or stop request.
@@ -1374,20 +1397,38 @@ static int phantom_vcpu_fn(void *data)
 		 * Phase 1 (before first VMLAUNCH): sleep on completion.
 		 * Phase 2 (after first VMLAUNCH):  busy-wait on flag.
 		 *
-		 * Phase 2 uses cpu_relax() to yield the CPU briefly without
-		 * entering TASK_INTERRUPTIBLE — the thread stays TASK_RUNNING
-		 * so kthread_stop()'s wake_up_process() is a no-op (no IPI).
+		 * Stop mechanism (IPI-free after VMLAUNCH):
+		 *   phantom_vcpu_thread_stop() sets vcpu_stop_requested=true
+		 *   (plain memory write, no IPI) and waits on vcpu_stopped.
+		 *   The thread checks vcpu_stop_requested in both phases.
+		 *   After do_stop (VMXOFF), the thread signals vcpu_stopped
+		 *   and returns.  phantom_vcpu_thread_stop() then calls
+		 *   kthread_stop() — by that point the thread has already
+		 *   exited VMX-root mode, so any IPI is harmless.
+		 *
+		 *   In Phase 1, we also check kthread_should_stop() (from
+		 *   kthread_stop() directly) as a fallback for the case where
+		 *   stop is requested before VMLAUNCH.
 		 */
 		if (!vmlaunch_done) {
 			/* Phase 1: safe to sleep (no VMLAUNCH yet) */
 			long tret;
 
+			/*
+			 * Check vcpu_stop_requested first (set without IPI).
+			 * Also check kthread_should_stop() for compatibility.
+			 */
+			if (READ_ONCE(state->vcpu_stop_requested) ||
+			    kthread_should_stop())
+				goto do_stop;
+
 			tret = wait_for_completion_interruptible_timeout(
 				&state->vcpu_run_start,
 				msecs_to_jiffies(VCPU_THREAD_TIMEOUT_MS));
 
-			/* Check kthread_stop() request — IPI safe in Phase 1 */
-			if (kthread_should_stop())
+			/* Re-check after wakeup */
+			if (READ_ONCE(state->vcpu_stop_requested) ||
+			    kthread_should_stop())
 				goto do_stop;
 
 			/* Timeout or signal — loop back and wait again */
@@ -1399,35 +1440,33 @@ static int phantom_vcpu_fn(void *data)
 			/*
 			 * Phase 2: busy-wait — thread must stay TASK_RUNNING.
 			 *
-			 * CRITICAL: do NOT call any function that puts the
-			 * thread to TASK_SLEEPING.  Sleeping → wakeup requires
-			 * a RESCHEDULE IPI → triple fault in nested KVM.
+			 * CRITICAL: After VMLAUNCH, any RESCHEDULE IPI to
+			 * this CPU causes a triple fault in KVM nested mode.
+			 * We MUST NOT call kthread_stop() or complete() or any
+			 * function that might trigger a wakeup IPI to this CPU.
 			 *
-			 * cpu_relax() inserts PAUSE for power efficiency.
-			 * kthread_should_stop() returns true when kthread_stop()
-			 * has been called.  Since we are TASK_RUNNING here,
-			 * kthread_stop()'s wake_up_process() is a no-op: no IPI
-			 * is sent to this CPU.
+			 * Instead, we use vcpu_stop_requested — a plain bool
+			 * that the stopper sets via WRITE_ONCE() (no IPI).
+			 * The thread polls it here via READ_ONCE().
 			 *
-			 * smp_load_acquire pairs with the ioctl's
-			 * smp_store_release to ensure vcpu_run_request is
-			 * visible before vcpu_work_ready is seen as true.
+			 * We also check kthread_should_stop() as a secondary
+			 * mechanism (for cases where kthread_stop() is called
+			 * after the thread has already left VMX-root mode and
+			 * signaled vcpu_stopped — i.e., after do_stop is done).
 			 *
-			 * cond_resched() is needed to prevent RCU stalls and
-			 * kernel watchdog trips: without it, the vCPU thread
-			 * holds CPU0 continuously, starving the RCU grace-
-			 * period kthread.  cond_resched() calls schedule() if
-			 * TIF_NEED_RESCHED is set — a local operation on CPU0,
-			 * no cross-CPU IPI.  The thread stays TASK_RUNNING and
-			 * is rescheduled without any wake IPI.
+			 * cond_resched() prevents RCU stalls: the scheduler
+			 * runs locally on this CPU (TIF_NEED_RESCHED), keeping
+			 * the task TASK_RUNNING — no cross-CPU IPI.
 			 */
 			while (!smp_load_acquire(&state->vcpu_work_ready) &&
+			       !READ_ONCE(state->vcpu_stop_requested) &&
 			       !kthread_should_stop()) {
 				cpu_relax();
 				cond_resched();
 			}
 
-			if (kthread_should_stop())
+			if (READ_ONCE(state->vcpu_stop_requested) ||
+			    kthread_should_stop())
 				goto do_stop;
 
 			/* Work available — consume the flag */
@@ -1491,31 +1530,112 @@ static int phantom_vcpu_fn(void *data)
 
 do_stop:
 	/*
-	 * Stop sequence — runs on this CPU, zero cross-CPU IPIs:
+	 * Stop sequence — runs on this CPU, zero cross-CPU IPIs.
 	 *
-	 * Step 1: VMCLEAR — clears KVM L0 nested VMX tracking for this CPU.
-	 * Step 2: VMXOFF  — exits VMX-root mode; sets vmx_active = false.
-	 *                    phantom_vmxoff_all() will skip this CPU.
-	 * Step 3: return 0 — kthread infrastructure calls kthread_exit()
-	 *         normally, releasing the module reference correctly.
-	 *         phantom_vcpu_thread_stop() calls kthread_stop() which
-	 *         waits for this return via the kthread-internal completion.
-	 *         No WARN in do_exit (no direct do_exit() call).
+	 * Correct Intel SDM teardown sequence: INVEPT → VMCLEAR → VMXOFF.
+	 *
+	 * INVEPT type=2 (all-context) flushes all cached EPT mappings for
+	 * this LP from KVM L0's TLB before we free the EPT page tables.
+	 * This prevents KVM L0 from referencing freed EPT pages after
+	 * module unload.
+	 *
+	 * VMCLEAR marks the VMCS as inactive/not-current in KVM L0's nested
+	 * VMX tracking.  This is required for proper KVM state cleanup:
+	 * without VMCLEAR, KVM L0's nested_vmx_hardware_disable() (called
+	 * from handle_vmxoff) may leave residual state that causes the next
+	 * VMXON to trigger a triple fault.
+	 *
+	 * VMXOFF exits VMX-root mode.  phantom_vmxoff_all() skips this CPU
+	 * because vmx_active is set to false here.
+	 *
+	 * The VMCS backing page is freed by phantom_vmcs_free_all() after
+	 * kthread_stop() returns.  By that point, both VMCLEAR and VMXOFF
+	 * have completed and no CPU references the VMCS page.
 	 */
-	if (state->vmcs_region) {
-		pr_info("phantom: CPU%d: stop: VMCLEAR\n", state->cpu);
-		__vmclear(page_to_phys(state->vmcs_region));
-		state->launched        = false;
-		state->vmcs_configured = false;
-	}
-
 	if (state->vmx_active) {
+		/*
+		 * Step 1: VMCLEAR — marks VMCS as inactive and not-current.
+		 *
+		 * NOTE: INVEPT is intentionally omitted here.  In a nested
+		 * KVM environment, INVEPT causes a VMEXIT to KVM L0 and
+		 * KVM L0 handles TLB invalidation internally when it processes
+		 * our VMCLEAR and VMXOFF exits.  Executing INVEPT before VMXOFF
+		 * was found to cause hangs in the vCPU thread (the INVEPT exit
+		 * to KVM L0 may not return cleanly in all cases).
+		 *
+		 * The EPT pages are freed after VMXOFF, by which point KVM L0
+		 * has already processed VMXOFF and no longer references them.
+		 *
+		 * Old comment preserved for history:
+		 * "INVEPT type=2 (all-context) flushes all cached EPT mappings
+		 *  for this LP from KVM L0's TLB before we free the EPT page
+		 *  tables."
+		 */
+
+		/*
+		 * VMCLEAR — marks VMCS as inactive and not-current.
+		 *
+		 * VMCLEAR is required before VMXOFF so that KVM L0's nested
+		 * VMX state machine properly transitions the VMCS from
+		 * "active/current" to "inactive/not-current".  Without this
+		 * step (when a guest WAS launched), the subsequent VMXOFF may
+		 * leave KVM's nested state inconsistent, causing the next
+		 * VMXON to triple-fault.
+		 *
+		 * IMPORTANT: Only call VMCLEAR if the guest was actually
+		 * launched (state->launched is true).  Calling VMCLEAR on a
+		 * VMCS that was never the target of VMLAUNCH triggers a KVM
+		 * nested VMX bug in certain configurations: KVM attempts to
+		 * clean up shadow VMCS state that was never fully initialised,
+		 * causing a guest triple fault.
+		 *
+		 * When no VMLAUNCH occurred (not launched path), VMXOFF alone
+		 * is sufficient — KVM's handle_vmxoff sees a "never-launched"
+		 * nested VMCS and cleans it up correctly without VMCLEAR.
+		 */
+		if (state->vmcs_region && state->launched) {
+			pr_info("phantom: CPU%d: stop: VMCLEAR (launched)\n",
+				state->cpu);
+			__vmclear(page_to_phys(state->vmcs_region));
+		} else if (state->vmcs_region) {
+			pr_info("phantom: CPU%d: stop: skip VMCLEAR "
+				"(never launched)\n", state->cpu);
+		}
+
+		/*
+		 * Step 3: VMXOFF — exits VMX-root mode.
+		 */
 		pr_info("phantom: CPU%d: stop: VMXOFF\n", state->cpu);
 		__vmxoff();
 		if (!(state->saved_cr4 & X86_CR4_VMXE))
 			cr4_clear_bits(X86_CR4_VMXE);
-		state->vmx_active = false;
+		state->vmx_active    = false;
+		state->launched      = false;
+		state->vmcs_configured = false;
+	} else if (state->vmcs_region) {
+		/*
+		 * VMX was not active (init failed before VMXON, or already
+		 * cleaned up).  If a VMCS region was allocated, mark it as
+		 * unconfigured to avoid phantom_vmcs_free_all accessing it
+		 * while it might still be "current" on some CPU.
+		 *
+		 * In the normal path, state->vmx_active is true whenever
+		 * vmcs_region is allocated (phantom_vcpu_init_on_cpu sets
+		 * vmx_active=true after VMXON + vmcs_region alloc).
+		 */
+		state->launched      = false;
+		state->vmcs_configured = false;
 	}
+
+	/*
+	 * Signal that VMX teardown is complete (VMXOFF has run or was not
+	 * needed).  phantom_vcpu_thread_stop() waits on this completion
+	 * before calling kthread_stop(), ensuring that kthread_stop()'s
+	 * wake_up_process() IPI (if any) only arrives after we are out of
+	 * VMX-root mode — safe because a post-VMXOFF IPI cannot cause a
+	 * nested VMX triple fault.
+	 */
+	complete(&state->vcpu_stopped);
 
 	return 0;
 }
@@ -1530,11 +1650,26 @@ int phantom_vcpu_thread_start(struct phantom_vmx_cpu_state *state)
 {
 	struct task_struct *t;
 
+	init_completion(&state->vcpu_init_done);
+	state->vcpu_init_result = -EINPROGRESS;
+
 	init_completion(&state->vcpu_run_start);
 	init_completion(&state->vcpu_run_done);
-	state->vcpu_run_request = 1;
-	state->vcpu_run_result  = 0;
-	state->vcpu_work_ready  = false;
+	/*
+	 * vcpu_run_request must start at 0.
+	 *
+	 * Previously set to 1 here, which caused the thread to attempt
+	 * phantom_vmcs_configure_fields() on the very first wakeup before
+	 * the ioctl had a chance to call phantom_vmcs_setup() (page alloc).
+	 * With pages_allocated=false, configure_fields would return -ENXIO,
+	 * but the race was a latent bug.  Start at 0: the ioctl sets it to 1
+	 * when it is ready to run the guest.
+	 */
+	state->vcpu_run_request    = 0;
+	state->vcpu_run_result     = 0;
+	state->vcpu_work_ready     = false;
+	state->vcpu_stop_requested = false;
+	init_completion(&state->vcpu_stopped);
 
 	t = kthread_create(phantom_vcpu_fn, state,
 			   "phantom-vcpu/%d", state->cpu);
@@ -1556,24 +1691,56 @@ int phantom_vcpu_thread_start(struct phantom_vmx_cpu_state *state)
 }
 
 /**
+ * phantom_vcpu_thread_wait_init - Wait for IPI-free per-CPU VMX init.
+ * @state: Per-CPU VMX state for the target CPU.
+ *
+ * Blocks until the vCPU thread has completed VMXON + VMCS alloc +
+ * VMPTRLD on its own CPU.  Called from module init after
+ * phantom_vcpu_thread_start(), replacing the old smp_call_function_single
+ * approach which caused triple faults on second module load.
+ *
+ * Returns 0 on success, negative errno if per-CPU init failed.
+ */
+int phantom_vcpu_thread_wait_init(struct phantom_vmx_cpu_state *state)
+{
+	wait_for_completion(&state->vcpu_init_done);
+	return state->vcpu_init_result;
+}
+
+/**
  * phantom_vcpu_thread_stop - Stop and destroy the per-CPU vCPU thread.
  * @state: Per-CPU VMX state.
  *
- * Uses kthread_stop() which is safe in both phases:
+ * Two-phase IPI-free stop protocol:
  *
- *   Phase 1 (before VMLAUNCH): thread may be sleeping.  kthread_stop()
- *   sends RESCHEDULE IPI to wake it.  This is safe because KVM L0's
- *   nested VMX tracking is not yet active.
+ *   Phase A — signal stop without IPI:
+ *     Sets vcpu_stop_requested=true via WRITE_ONCE().  This is a plain
+ *     memory write with no cross-CPU IPI.  The vCPU thread polls this
+ *     flag in both Phase 1 (sleeping) and Phase 2 (busy-wait).
  *
- *   Phase 2 (after VMLAUNCH): thread is TASK_RUNNING (busy-waiting).
- *   kthread_stop() sets KTHREAD_SHOULD_STOP and calls wake_up_process(),
- *   but wake_up_process() is a no-op for a TASK_RUNNING thread — no
- *   RESCHEDULE IPI is sent.  The thread sees kthread_should_stop() in
- *   its busy-wait loop, runs VMCLEAR + VMXOFF, then returns.
+ *   In Phase 1 (before VMLAUNCH): the thread is sleeping in
+ *     wait_for_completion_interruptible_timeout().  Setting the flag
+ *     alone won't wake it.  We also call complete(&vcpu_run_start) to
+ *     unblock the wait — this is safe (no VMLAUNCH has occurred yet,
+ *     so the RESCHEDULE IPI from complete() is harmless).
  *
- *   kthread_stop() waits for phantom_vcpu_fn to return via the kthread-
- *   internal completion.  The module reference is released correctly.
- *   No WARN in do_exit (thread returns normally, not via direct do_exit).
+ *   In Phase 2 (after VMLAUNCH): the thread is busy-waiting on
+ *     vcpu_stop_requested or vcpu_work_ready.  Setting the flag is
+ *     sufficient — the thread polls it on every cpu_relax() iteration.
+ *     No RESCHEDULE IPI is sent.
+ *
+ *   Phase B — wait for VMX teardown:
+ *     Waits on vcpu_stopped completion.  The thread signals this after
+ *     VMXOFF (in do_stop), confirming VMX-root mode has been exited.
+ *
+ *   Phase C — kthread cleanup:
+ *     Calls kthread_stop() to reclaim kernel thread resources (stack,
+ *     task_struct, module reference).  By this point the thread has
+ *     already completed do_stop and called complete(&vcpu_stopped), so
+ *     it is either returning from phantom_vcpu_fn or has already
+ *     returned.  kthread_stop() joins the thread by waiting on the
+ *     kthread-internal completion — no IPI is needed because the
+ *     thread is TASK_RUNNING (returning) or already exited.
  */
 void phantom_vcpu_thread_stop(struct phantom_vmx_cpu_state *state)
 {
@@ -1581,11 +1748,34 @@ void phantom_vcpu_thread_stop(struct phantom_vmx_cpu_state *state)
 		return;
 
 	/*
-	 * kthread_stop() sets KTHREAD_SHOULD_STOP and calls wake_up_process().
-	 * In Phase 2 (busy-wait), the thread is TASK_RUNNING so
-	 * wake_up_process() is a no-op — no RESCHEDULE IPI is sent.
-	 * The thread sees kthread_should_stop(), runs VMCLEAR + VMXOFF,
-	 * and returns.  kthread_stop() waits for the return.
+	 * Phase A: signal stop (no IPI).
+	 *
+	 * Set the stop flag so the thread exits its loop on the next
+	 * poll.  For Phase 1 threads (sleeping), also complete the
+	 * run_start so they wake up and see the flag.  The complete()
+	 * here sends a RESCHEDULE IPI — that is safe because Phase 1
+	 * means VMLAUNCH has NOT yet occurred, so the IPI is harmless.
+	 */
+	WRITE_ONCE(state->vcpu_stop_requested, true);
+	complete(&state->vcpu_run_start);  /* wake Phase 1 sleeper (safe) */
+
+	/*
+	 * Phase B: wait for VMX teardown.
+	 *
+	 * Block until the thread has executed do_stop (VMCLEAR + VMXOFF)
+	 * and signaled vcpu_stopped.  After this point, VMX-root mode is
+	 * inactive on state->cpu and any subsequent IPI is safe.
+	 */
+	wait_for_completion(&state->vcpu_stopped);
+
+	/*
+	 * Phase C: kthread cleanup.
+	 *
+	 * kthread_stop() reclaims the thread's resources.  The thread
+	 * has already completed its VMX work (signaled vcpu_stopped) and
+	 * is about to return from phantom_vcpu_fn (or has already done so).
+	 * kthread_stop() → wake_up_process() is a no-op (thread is
+	 * TASK_RUNNING or already gone) — no IPI.
 	 */
 	kthread_stop(state->vcpu_thread);
 	state->vcpu_thread = NULL;
@@ -1679,10 +1869,17 @@ static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 
 	case VMX_EXIT_EXTERNAL_INT:
 		/*
-		 * With ACK_INT_ON_EXIT set, the hardware has already
-		 * acknowledged the interrupt.  Nothing more to do here;
-		 * the interrupt will be delivered through the host IDT
-		 * when we return from the exit handler.
+		 * External interrupt caused a VM exit from L2 to L1.
+		 *
+		 * VM_EXIT_ACK_INT_ON_EXIT is NOT set in our exit controls.
+		 * The interrupt remains pending at the virtual APIC.  When
+		 * phantom_run_guest() calls local_irq_enable() after this
+		 * dispatch returns 0 (continue), the pending interrupt is
+		 * delivered naturally to L1's IDT.  This allows the Linux
+		 * timer handler, APIC, and scheduler to run normally.
+		 *
+		 * We return 0 to VMRESUME the guest after the interrupt
+		 * has been delivered.
 		 */
 		return 0;
 
@@ -2164,7 +2361,61 @@ int phantom_run_guest(struct phantom_vmx_cpu_state *state)
 	PHANTOM_TRACE_VM_ENTRY(state->cpu);
 
 	do {
+		/*
+		 * Refresh volatile host-state VMCS fields before every VM entry.
+		 *
+		 * HOST_GS_BASE: MSR_GS_BASE holds the kernel per-CPU base for
+		 * this CPU while the thread is running.  Refresh defensively,
+		 * mirroring KVM's vmx_prepare_switch_to_guest().
+		 *
+		 * HOST_TR_BASE: The TSS base is a per-CPU constant after boot,
+		 * but we refresh it to catch any edge cases (e.g. CPU hotplug).
+		 * Note: the TR base bug fix (wrong mask 0xFFFFFFFF00000000 →
+		 * correct 0x00000000FFFFFFFF in phantom_get_tr_base) means the
+		 * initial VMCS value was wrong (truncated to 32 bits).  This
+		 * refresh corrects it on the first VM entry after fix deployment.
+		 *
+		 * HOST_CR3 is refreshed inside the assembly trampoline.
+		 * GS_BASE and TR_BASE are refreshed here in C before IRQs are
+		 * disabled, avoiding rdmsr/str sequences in the assembly.
+		 */
+		{
+			u64 gs_base;
+			u64 tr_base;
+
+			rdmsrl(MSR_GS_BASE, gs_base);
+			phantom_vmcs_write64(VMCS_HOST_GS_BASE, gs_base);
+
+			tr_base = phantom_get_tr_base();
+			phantom_vmcs_write64(VMCS_HOST_TR_BASE, tr_base);
+		}
+
+		/*
+		 * Disable IRQs before VMLAUNCH/VMRESUME.  On VM exit, the CPU
+		 * always clears RFLAGS.IF (interrupts remain disabled).  We
+		 * must keep IRQs disabled across the entry/exit pair so that
+		 * the exit handler sees a consistent state.  IRQs are
+		 * re-enabled below, after the trampoline returns.
+		 *
+		 * Note: the vCPU thread runs with IRQs enabled in between
+		 * iterations (during dispatch).  This local_irq_disable applies
+		 * only to the VMLAUNCH/VMRESUME boundary itself.
+		 */
+		local_irq_disable();
 		tramp_ret = phantom_vmlaunch_trampoline(state);
+
+		/*
+		 * VM exit occurred.  RFLAGS.IF is 0 (interrupts disabled by
+		 * the CPU on every VM exit, per Intel SDM §27.5.4).
+		 * Re-enable IRQs immediately so the kernel's timer, RCU, and
+		 * other subsystems can continue to run.
+		 *
+		 * This also matches KVM's behaviour: kvm_x86_ops.run() always
+		 * runs local_irq_enable() after a VM exit before doing any
+		 * further processing.
+		 */
+		local_irq_enable();
+
 		if (tramp_ret < 0) {
 			pr_err("phantom: CPU%d: VM-entry failed err=%d "
 			       "vm_instr_error=%u\n",

@@ -29,6 +29,8 @@
 #include <linux/cpumask.h>
 #include <linux/errno.h>
 #include <linux/string.h>
+#include <linux/smp.h>
+#include <linux/rcupdate.h>
 #include <asm/processor.h>
 #include <asm/tlbflush.h>
 
@@ -136,39 +138,39 @@ out:
  * Advisory kvm_intel conflict check
  * ------------------------------------------------------------------ */
 
-struct phantom_cr4_check_work {
-	bool vmxe_set;
-};
-
-static void phantom_read_cr4_vmxe(void *data)
-{
-	struct phantom_cr4_check_work *work = data;
-
-	if (native_read_cr4() & X86_CR4_VMXE)
-		work->vmxe_set = true;
-}
-
 /**
  * phantom_kvm_intel_check - Advisory check for kvm_intel VMX conflict.
  *
- * Reads CR4.VMXE on each target core.  If set, emits a pr_warn
- * suggesting that kvm_intel be unloaded.  This is a TOCTOU pre-check
- * only; VMXON itself is the authoritative ownership test.
+ * Checks CR4.VMXE on the CURRENT CPU only (the calling context).
+ * Cross-CPU IPIs via smp_call_function_single are intentionally NOT used:
+ * after a prior VMLAUNCH+VMXOFF cycle, any function-call IPI to the target
+ * CPU causes a triple fault in nested KVM due to KVM L0's post-exit state.
+ *
+ * The VMXON instruction itself is the authoritative conflict test; this is
+ * an advisory pre-check only.  Logs a warning if CR4.VMXE is set on the
+ * calling CPU, which indicates another VMX user (e.g. kvm_intel) is active.
  */
 void phantom_kvm_intel_check(const struct cpumask *cpumask)
 {
-	struct phantom_cr4_check_work work;
-	int cpu;
-
-	for_each_cpu(cpu, cpumask) {
-		work.vmxe_set = false;
-		smp_call_function_single(cpu, phantom_read_cr4_vmxe,
-					 &work, 1);
-		if (work.vmxe_set) {
+	/*
+	 * Read CR4.VMXE on the calling CPU only.  We cannot safely IPI
+	 * target CPUs here because after a prior VMLAUNCH+VMXOFF cycle,
+	 * function-call IPIs to those CPUs trigger triple faults.
+	 *
+	 * If we are currently running on one of the target CPUs, check it.
+	 * Otherwise, skip — VMXON will detect the conflict authoritatively.
+	 */
+	if (cpumask_test_cpu(smp_processor_id(), cpumask)) {
+		if (native_read_cr4() & X86_CR4_VMXE) {
 			pr_warn("phantom: CPU%d: CR4.VMXE is already set — "
 				"kvm_intel may be loaded; "
-				"run: rmmod kvm_intel\n", cpu);
+				"run: rmmod kvm_intel\n",
+				smp_processor_id());
 		}
+	} else {
+		pr_info("phantom: kvm_intel advisory check skipped "
+			"(not running on target CPUs — "
+			"VMXON will detect conflicts)\n");
 	}
 }
 
@@ -218,26 +220,34 @@ static int __init phantom_init(void)
 		goto fail_debug;
 	}
 
-	/* Step 7: VMXON on all target cores */
+	/*
+	 * Step 7: Allocate VMXON region pages and read VMX revision ID.
+	 *
+	 * phantom_vmxon_all no longer executes the VMXON instruction via
+	 * smp_call_function_single.  That IPI-based approach caused a triple
+	 * fault on the second module load in nested KVM environments: after the
+	 * first load's VMLAUNCH+VMXOFF cycle, KVM L0's nested VMX tracking for
+	 * the target CPU is in a post-nested-exit state, and any function-call
+	 * IPI to that CPU triggers a crash.
+	 *
+	 * The VMXON instruction itself now runs inside the vCPU thread in step
+	 * 8b below, eliminating all cross-CPU IPIs during VMX init.
+	 */
 	ret = phantom_vmxon_all(pdev->vmx_cpumask);
 	if (ret) {
-		pr_err("phantom: VMXON failed: %d\n", ret);
+		pr_err("phantom: VMXON region alloc failed: %d\n", ret);
 		goto fail_chardev;
 	}
 
-	/* Step 8: VMCS allocation and VMPTRLD on all target cores */
-	ret = phantom_vmcs_alloc_all(pdev->vmx_cpumask);
-	if (ret) {
-		pr_err("phantom: VMCS allocation failed: %d\n", ret);
-		goto fail_vmxon;
-	}
-
 	/*
-	 * Step 8b: Start per-CPU vCPU kernel threads.
+	 * Step 8: Start per-CPU vCPU kernel threads.
 	 *
-	 * Each vCPU thread is pinned to its target CPU and waits for work
-	 * signals from the ioctl handler.  This avoids the smp_call_function
-	 * IPI mechanism which breaks KVM nested VMX state on repeated calls.
+	 * Each thread is pinned to its target CPU.  At startup, the thread
+	 * performs VMXON + VMCS alloc + VMPTRLD locally (IPI-free), then
+	 * signals vcpu_init_done.  We wait for that signal in step 8b below.
+	 *
+	 * This replaces the old phantom_vmcs_alloc_all / smp_call_function_single
+	 * approach which was unsafe after a prior VMLAUNCH+VMXOFF cycle.
 	 */
 	{
 		int cpu;
@@ -264,7 +274,40 @@ static int __init phantom_init(void)
 						phantom_vcpu_thread_stop(s);
 					}
 				}
-				goto fail_vmcs_alloc;
+				goto fail_vmxon;
+			}
+		}
+	}
+
+	/*
+	 * Step 8b: Wait for each vCPU thread to complete its per-CPU init
+	 * (VMXON + VMCS alloc + VMPTRLD).  The thread signals vcpu_init_done
+	 * when it is done.
+	 */
+	{
+		int cpu;
+
+		for_each_cpu(cpu, pdev->vmx_cpumask) {
+			struct phantom_vmx_cpu_state *state;
+
+			state = per_cpu_ptr(&phantom_vmx_state, cpu);
+			ret = phantom_vcpu_thread_wait_init(state);
+			if (ret) {
+				pr_err("phantom: CPU%d: vCPU init failed: %d\n",
+				       cpu, ret);
+				/* Stop all threads (each will VMXOFF if needed) */
+				{
+					int c;
+
+					for_each_cpu(c, pdev->vmx_cpumask) {
+						struct phantom_vmx_cpu_state *s;
+
+						s = per_cpu_ptr(&phantom_vmx_state,
+								c);
+						phantom_vcpu_thread_stop(s);
+					}
+				}
+				goto fail_vmxon;
 			}
 		}
 	}
@@ -278,8 +321,6 @@ static int __init phantom_init(void)
 		pdev->nr_vmx_cores);
 	return 0;
 
-fail_vmcs_alloc:
-	phantom_vmcs_free_all(pdev->vmx_cpumask);
 fail_vmxon:
 	phantom_vmxoff_all(pdev->vmx_cpumask);
 fail_chardev:
@@ -321,8 +362,13 @@ static void __exit phantom_exit(void)
 	 * This ordering ensures we never free pages that the CPU might still
 	 * reference through EPT or VMCS internal state.
 	 */
-	/* Stop vCPU threads before touching VMCS state */
-	pr_info("phantom: exit: step 0 vcpu threads\n");
+	/*
+	 * Step 1: Stop vCPU threads.
+	 *
+	 * Each thread performs VMCLEAR + VMXOFF locally on its pinned CPU
+	 * (no cross-CPU IPIs).  After phantom_vcpu_thread_stop() returns,
+	 * VMX root mode has been exited on the target CPU.
+	 */
 	{
 		int cpu;
 
@@ -333,15 +379,28 @@ static void __exit phantom_exit(void)
 			phantom_vcpu_thread_stop(state);
 		}
 	}
-	pr_info("phantom: exit: step 0 done\n");
 
-	pr_info("phantom: exit: step 1 VMCS free all\n");
-	/* VMCLEAR + VMXOFF already done by vCPU thread in step 0 */
+	/*
+	 * Step 2: Wait for KVM L0's deferred nested VMX cleanup.
+	 *
+	 * After VMXOFF, KVM L0's free_nested() may schedule RCU callbacks
+	 * and deferred TLB flushes.  synchronize_rcu() blocks until all
+	 * pending RCU grace periods elapse, ensuring KVM's deferred work
+	 * completes before rmmod returns.  The next insmod sees clean state.
+	 */
+	synchronize_rcu();
+
+	/*
+	 * Step 3: Free VMCS region pages.
+	 * VMCLEAR + VMXOFF already done by vCPU thread in step 1.
+	 */
 	phantom_vmcs_free_all(pdev->vmx_cpumask);
-	pr_info("phantom: exit: step 1 done\n");
 
-	/* Now safe to free EPT and guest pages */
-	pr_info("phantom: exit: step 2 teardown\n");
+	/*
+	 * Step 4: Free EPT and guest memory pages.
+	 * Safe now — VMCLEAR has removed CPU references to the VMCS,
+	 * and VMXOFF has exited VMX root mode entirely.
+	 */
 	{
 		int cpu;
 
@@ -352,11 +411,13 @@ static void __exit phantom_exit(void)
 			phantom_vmcs_teardown(state);
 		}
 	}
-	pr_info("phantom: exit: step 2 done\n");
 
-	pr_info("phantom: exit: step 3 VMXOFF\n");
+	/*
+	 * Step 5: Release VMXON region pages.
+	 * phantom_vmxoff_all() skips the VMXOFF SMP call (already done in
+	 * step 1) and only frees the vmxon_region backing page.
+	 */
 	phantom_vmxoff_all(pdev->vmx_cpumask);
-	pr_info("phantom: exit: step 3 done\n");
 	phantom_chardev_unregister(pdev);
 	phantom_debug_exit();
 	free_cpumask_var(pdev->vmx_cpumask);

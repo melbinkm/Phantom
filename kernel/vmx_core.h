@@ -429,17 +429,33 @@ struct phantom_vmx_cpu_state {
 	 * The ioctl hands work to this thread via completions to avoid
 	 * the IPI mechanism which breaks KVM nested VMX state on re-entry.
 	 *
-	 * Thread stop protocol:
-	 *   kthread_stop() is safe in both phases:
-	 *   - Phase 1 (before VMLAUNCH): RESCHEDULE IPI is safe.
-	 *   - Phase 2 (after VMLAUNCH): thread is TASK_RUNNING (busy-wait),
-	 *     so wake_up_process() is a no-op — no RESCHEDULE IPI sent.
-	 *   The thread polls kthread_should_stop(), runs VMCLEAR + VMXOFF,
-	 *   then returns.  kthread_stop() waits for the return.
+	 * Thread stop protocol (IPI-free two-phase approach):
+	 *   1. WRITE_ONCE(vcpu_stop_requested, true) — no IPI.
+	 *   2. complete(&vcpu_run_start) — safe (only needed for Phase 1,
+	 *      where VMLAUNCH hasn't happened so the IPI is harmless).
+	 *   3. wait_for_completion(&vcpu_stopped) — thread signals this
+	 *      after VMXOFF completes (in do_stop).
+	 *   4. kthread_stop() — reclaims thread resources; by this point
+	 *      the thread is post-VMXOFF so any IPI is safe.
 	 *   phantom_vmxoff_all() skips the SMP call for this CPU because
 	 *   vmx_active == false (VMXOFF already ran in thread).
+	 *
+	 * Init protocol (IPI-free VMXON + VMCS alloc):
+	 *   After the first load's VMLAUNCH+VMXOFF cycle, KVM L0's nested
+	 *   VMX tracking for this CPU is in a post-nested-exit state.  Any
+	 *   cross-CPU IPI (smp_call_function_single) to this CPU — even
+	 *   after VMXOFF — causes a triple fault in the guest kernel.
+	 *
+	 *   Solution: the vCPU thread performs VMXON, VMCS alloc, and
+	 *   VMPTRLD locally on its own CPU at startup, then signals
+	 *   vcpu_init_done.  Module init waits on vcpu_init_done instead
+	 *   of using smp_call_function_single.  Zero cross-CPU IPIs during
+	 *   the per-CPU VMX init path.
 	 */
 	struct task_struct	*vcpu_thread;
+	struct completion	 vcpu_init_done;  /* thread → init: VMXON done */
+	int			 vcpu_init_result; /* 0 = success, else errno */
+	u32			 vmx_revision_id;  /* VMX_BASIC revision for VMXON */
 	struct completion	 vcpu_run_start;  /* ioctl → thread: 1st run */
 	struct completion	 vcpu_run_done;   /* thread → ioctl: done */
 	int			 vcpu_run_request; /* 1=run, 2=reset, 0=exit */
@@ -457,6 +473,31 @@ struct phantom_vmx_cpu_state {
 	 * Protected by smp_store_release / smp_load_acquire barriers.
 	 */
 	bool			 vcpu_work_ready;  /* set by ioctl (no IPI) */
+
+	/*
+	 * IPI-free stop protocol for post-VMLAUNCH teardown.
+	 *
+	 * After the first VMLAUNCH, KVM L0's nested VMX state is "dirty" for
+	 * this CPU.  kthread_stop() calls wake_up_process() which may send a
+	 * RESCHEDULE IPI to this CPU even when the thread appears TASK_RUNNING
+	 * (e.g., if the thread was briefly preempted by the scheduler between
+	 * cond_resched() calls).  Such an IPI causes a triple fault in the
+	 * nested KVM guest.
+	 *
+	 * Fix: phantom_vcpu_thread_stop() uses a two-phase stop:
+	 *   1. Set vcpu_stop_requested = true (plain memory write, no IPI).
+	 *   2. Wait on vcpu_stopped (thread signals this after VMXOFF).
+	 *   3. Call kthread_stop() — thread has already exited VMX-root mode
+	 *      and either returned or is about to; any IPI at this point is
+	 *      harmless (VMX is inactive, no triple fault risk).
+	 *
+	 * vcpu_stop_requested: set by phantom_vcpu_thread_stop(), read by the
+	 *   vCPU thread in both Phase 1 and Phase 2.
+	 * vcpu_stopped: signaled by the vCPU thread after do_stop (VMXOFF done),
+	 *   before the thread function returns.
+	 */
+	bool			 vcpu_stop_requested; /* flag: request stop (no IPI) */
+	struct completion	 vcpu_stopped;        /* thread → stop: VMX done */
 };
 
 DECLARE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);
@@ -590,10 +631,24 @@ int phantom_vcpu_thread_start(struct phantom_vmx_cpu_state *state);
  * phantom_vcpu_thread_stop - Stop and destroy the per-CPU vCPU thread.
  * @state: Per-CPU VMX state for the target CPU.
  *
- * Calls kthread_stop().  Safe in both phases: no RESCHEDULE IPI is sent
- * after VMLAUNCH because the thread is TASK_RUNNING (busy-waiting).
+ * Uses a two-phase IPI-free stop protocol:
+ *   1. Sets vcpu_stop_requested (no IPI).
+ *   2. Wakes Phase-1 sleeper via complete() if needed (safe — pre-VMLAUNCH).
+ *   3. Waits on vcpu_stopped (thread signals after VMXOFF).
+ *   4. Calls kthread_stop() for resource cleanup (safe — post-VMXOFF).
  */
 void phantom_vcpu_thread_stop(struct phantom_vmx_cpu_state *state);
+
+/**
+ * phantom_vcpu_thread_wait_init - Wait for the vCPU thread's per-CPU init.
+ * @state: Per-CPU VMX state for the target CPU.
+ *
+ * Blocks until the vCPU thread has completed VMXON + VMCS alloc + VMPTRLD
+ * on its own CPU (no cross-CPU IPI involved).
+ *
+ * Returns 0 on success, negative errno if per-CPU init failed.
+ */
+int phantom_vcpu_thread_wait_init(struct phantom_vmx_cpu_state *state);
 
 /**
  * phantom_vm_exit_return - VM exit landing pad (HOST_RIP target).
