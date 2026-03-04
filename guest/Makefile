@@ -22,8 +22,13 @@ OBJDUMP	:= objdump
 ASFLAGS	:= --64
 LDFLAGS	:= -Ttext=0x0 --oformat=binary -m elf_x86_64
 
-# libxml2 static build compiled with musl-gcc, threading disabled.
-# Build: cd /root/phantom/libxml2-2.9.4 && CC=musl-gcc ./configure
+# libxml2 static build compiled with musl-gcc, threading and stack-protection
+# disabled.  -fno-stack-protector is required: stack-canary reads use
+# %fs:0x28; the VMCS sets FS.base=0x7000 so canary is at GPA 0x7028 (=0)
+# which is readable.  Older builds with FS.base=0 caused false-positive
+# null-guard EPT violations (task-2.4 root cause analysis, fixed in kernel).
+# Build: cd /root/phantom/libxml2-2.9.4 &&
+#        CC=musl-gcc CFLAGS='-O2 -fno-stack-protector' ./configure
 #        --disable-shared --without-python --without-readline
 #        --without-zlib --without-lzma --without-threads
 #        --prefix=/root/phantom/libxml2-musl-nothreads

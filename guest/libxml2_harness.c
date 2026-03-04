@@ -238,6 +238,33 @@ extern void      xmlCleanupParser(void);
 /* -------------------------------------------------------------------------
  * _start — ELF entry point, called by libxml2_trampoline.S
  * ---------------------------------------------------------------------- */
+/*
+ * musl TLS / VDSO initialisation stubs.
+ *
+ * musl requires two global pointers to be non-NULL before any library
+ * function is called from a bare-metal guest context:
+ *
+ *  1. __libc.auxv (offset 8): used by __vdsosym() to locate the VDSO.
+ *     With no OS, this stays NULL (BSS) and __vdsosym() dereferences it
+ *     → EPT violation at GPA 0x0.  Fix: point it at empty_auxv[] (AT_NULL
+ *     terminator) so __vdsosym() returns NULL and musl falls back to
+ *     ordinary syscalls for gettimeofday/clock_gettime.
+ *
+ *  2. %fs:0x0 (pthread_t self-pointer): musl's __pthread_self() reads
+ *     %fs:0x0.  With VMCS FS.base=0x7000, GPA 0x7000 is zeroed (BSS) so
+ *     the "self" pointer is NULL → self->field dereferences GPA 0x0.
+ *     Fix: write 0x7000 to GPA 0x7000 (self-pointer convention).
+ *
+ * IMPORTANT: both writes must happen AFTER vmcall(HC_ACQUIRE) because
+ * snapshot restore resets all EPT pages to their snapshot state (zeroed).
+ * Each iteration begins with fresh zeroed pages and must re-initialise
+ * these two values before calling any musl function.
+ */
+extern char __libc[];          /* musl internal — exported from BSS */
+static size_t empty_auxv[2];   /* {AT_NULL, 0} — zero-initialised */
+
+#define TLS_BASE_GPA 0x7000UL  /* must match VMCS_GUEST_FS_BASE in kernel */
+
 void _start(void)
 {
 	/* inject buffer: [uint32_t len][XML data ...] */
@@ -256,6 +283,25 @@ void _start(void)
 	 * value, so libxml2's allocations are automatically reclaimed.
 	 */
 	vmcall(HC_ACQUIRE, 0);
+
+	/*
+	 * Step 2b: musl TLS and VDSO bootstrap — runs on EVERY iteration
+	 * (snapshot restore resets EPT pages to zero; must re-init here).
+	 *
+	 * TLS self-pointer: musl pthread_self() returns %fs:0x0.
+	 * With FS.base=TLS_BASE_GPA, GPA TLS_BASE_GPA must hold a
+	 * pointer to itself so __pthread_self() returns a valid (non-NULL)
+	 * pthread_t and accesses to self->field land in mapped RAM.
+	 */
+	*(volatile uintptr_t *)TLS_BASE_GPA = TLS_BASE_GPA;
+
+	/*
+	 * VDSO auxv: __vdsosym() reads __libc.auxv (offset 8), then
+	 * dereferences it to walk the aux vector looking for AT_SYSINFO_EHDR.
+	 * Point it at empty_auxv[] so __vdsosym() finds AT_NULL immediately
+	 * and returns NULL, falling back to plain syscalls.
+	 */
+	*(size_t **)(__libc + 8) = empty_auxv;
 
 	/* Step 3: read payload length */
 	len = *len_ptr;

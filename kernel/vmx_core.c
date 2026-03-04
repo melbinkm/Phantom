@@ -824,7 +824,16 @@ static int phantom_vmcs_setup_guest_state(void)
 	phantom_vmcs_write32(VMCS_GUEST_ES_AR,       0x10000);
 
 	phantom_vmcs_write16(VMCS_GUEST_FS_SELECTOR, 0);
-	phantom_vmcs_write64(VMCS_GUEST_FS_BASE,     0ULL);
+	/*
+	 * Task 2.4: Set FS.base to GPA 0x7000 (safe zero page within EPT RAM,
+	 * above null guard zone 0x0-0xFFF, below trampoline at 0x10000).
+	 * Targets compiled with -fstack-protector read the canary from
+	 * %fs:0x28; with FS.base=0 that would hit GPA 0x28 (null guard) →
+	 * false-positive EPT violation.  With FS.base=0x7000 the canary is
+	 * at GPA 0x7028 (readable, value=0); the check passes because the
+	 * stack itself is never corrupted across normal iteration boundaries.
+	 */
+	phantom_vmcs_write64(VMCS_GUEST_FS_BASE,     0x7000ULL);
 	phantom_vmcs_write32(VMCS_GUEST_FS_LIMIT,    0);
 	phantom_vmcs_write32(VMCS_GUEST_FS_AR,       0x10000);
 
@@ -2272,11 +2281,13 @@ static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 			 * instead of jumping to the unset LSTAR.  We implement
 			 * the minimal Linux syscall ABI the musl allocator needs:
 			 *
-			 *   SYS_write  (1)  — silently succeed (drop stdout/stderr)
-			 *   SYS_mmap   (9)  — anonymous mmap via bump allocator
-			 *   SYS_munmap (11) — no-op
-			 *   SYS_brk    (12) — extend heap via bump pointer
-			 *   SYS_mprotect(10) — no-op (ignore page permissions)
+			 *   SYS_write       (1)   — silently succeed
+				 *   SYS_mmap        (9)   — anonymous mmap via bump allocator
+				 *   SYS_mprotect    (10)  — no-op
+				 *   SYS_munmap      (11)  — no-op
+				 *   SYS_brk         (12)  — bump pointer extend
+				 *   SYS_gettimeofday(96)  — return epoch (VDSO fallback)
+				 *   SYS_clock_gettime(228)— return epoch (VDSO fallback)
 			 *
 			 * guest_heap_ptr lives in the kernel and is reset to
 			 * PHANTOM_GUEST_HEAP_BASE on every snapshot restore so
@@ -2358,6 +2369,23 @@ static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 							/* Failed: return current brk */
 							res = state->guest_heap_ptr;
 						}
+						break;
+
+					case 96:  /* SYS_gettimeofday — return epoch */
+						/*
+						 * musl falls back to this syscall when
+						 * __vdsosym() returns NULL (no VDSO).
+						 * Struct timeval: {tv_sec=0, tv_usec=0}.
+						 */
+						res = 0;
+						break;
+
+					case 228: /* SYS_clock_gettime — return epoch */
+						/*
+						 * musl clock_gettime() VDSO fallback.
+						 * Struct timespec: {tv_sec=0, tv_nsec=0}.
+						 */
+						res = 0;
 						break;
 					}
 
