@@ -1409,6 +1409,54 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		break;
 	}
 
+	case PHANTOM_IOCTL_PERF_RESTORE_LATENCY: {
+		/*
+		 * Return the per-phase rdtsc cycle counts from the last
+		 * phantom_snapshot_restore() call.
+		 *
+		 * These are populated by snapshot_restore() running on the
+		 * vCPU thread and are stable by the time the ioctl handler
+		 * reads them (wait_for_completion() in SNAPSHOT_RESTORE
+		 * provides the necessary memory barrier before the thread
+		 * stores the values, and by definition no new SNAPSHOT_RESTORE
+		 * can be in flight when this ioctl is running).
+		 *
+		 * Returns -EINVAL if no snapshot has been taken (no restore
+		 * has ever run, so the counters would be meaningless zeros).
+		 */
+		int target_cpu = -1;
+		struct phantom_vmx_cpu_state *state;
+		struct phantom_perf_result result;
+		int cpu;
+
+		for_each_cpu(cpu, pdev->vmx_cpumask) {
+			target_cpu = cpu;
+			break;
+		}
+
+		if (target_cpu < 0) {
+			pr_err("phantom: PERF_RESTORE_LATENCY: no VMX CPU\n");
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+		if (!state->snap_taken) {
+			pr_err("phantom: PERF_RESTORE_LATENCY: no snapshot "
+			       "has been taken (run SNAPSHOT_RESTORE first)\n");
+			ret = -EINVAL;
+			break;
+		}
+
+		/* Copy perf_last from kernel state */
+		result = state->perf_last;
+
+		if (copy_to_user((void __user *)arg, &result, sizeof(result)))
+			ret = -EFAULT;
+		break;
+	}
+
 	default:
 		ret = -ENOTTY;
 		break;

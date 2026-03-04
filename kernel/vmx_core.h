@@ -19,6 +19,7 @@
 #include "ept.h"
 #include "ept_cow.h"
 #include "snapshot.h"
+#include "interface.h"
 
 /* ------------------------------------------------------------------
  * MSR constants — only defined if the running kernel headers omit them
@@ -606,6 +607,25 @@ struct phantom_vmx_cpu_state {
 	 * wrote the correct VMCS values).
 	 */
 	bool			  snap_continue;
+
+	/*
+	 * Task 1.8: Per-phase rdtsc cycle counts from the last
+	 * phantom_snapshot_restore() call.
+	 *
+	 * Populated atomically within snapshot_restore() using the pattern:
+	 *   t0 = rdtsc_ordered(); <dirty_walk>  t1 = rdtsc_ordered();
+	 *   <INVEPT>               t2 = rdtsc_ordered();
+	 *   <VMCS restore>         t3 = rdtsc_ordered();
+	 *   <XRSTOR>               t4 = rdtsc_ordered();
+	 *   t5 = rdtsc_ordered();
+	 *
+	 * Exposed via PHANTOM_IOCTL_PERF_RESTORE_LATENCY.
+	 * All fields are zero until the first successful SNAPSHOT_RESTORE.
+	 *
+	 * Placed at the END of the struct to avoid disturbing the
+	 * assembly-trampoline-referenced field offsets above.
+	 */
+	struct phantom_perf_result perf_last;
 };
 
 DECLARE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);

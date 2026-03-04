@@ -10,6 +10,7 @@
  * Version history:
  *   0x00010100  task 1.1 — GET_VERSION only
  *   0x00010200  task 1.2 — RUN_GUEST added
+ *   0x00010800  task 1.8 — PERF_RESTORE_LATENCY added
  */
 #ifndef PHANTOM_INTERFACE_H
 #define PHANTOM_INTERFACE_H
@@ -24,8 +25,9 @@
  * Task 1.4 baseline: version 1.4.0 = 0x00010400
  * Task 1.5 baseline: version 1.5.0 = 0x00010500
  * Task 1.6 baseline: version 1.6.0 = 0x00010600
+ * Task 1.8 baseline: version 1.8.0 = 0x00010800
  * ------------------------------------------------------------------ */
-#define PHANTOM_VERSION		0x00010600U
+#define PHANTOM_VERSION		0x00010800U
 
 /* ------------------------------------------------------------------
  * ioctl command numbers
@@ -119,6 +121,39 @@ struct phantom_run_args {
  * -ENXIO if device not initialised.
  */
 #define PHANTOM_IOCTL_SNAPSHOT_RESTORE	_IO(PHANTOM_IOCTL_MAGIC, 10)
+
+/*
+ * PHANTOM_IOCTL_PERF_RESTORE_LATENCY — read rdtsc cycle counts from
+ *   the last SNAPSHOT_RESTORE call.
+ *
+ * Returns a struct phantom_perf_result containing per-phase cycle deltas
+ * measured during the most recent phantom_snapshot_restore() execution.
+ * All counters are zero until the first SNAPSHOT_RESTORE has run.
+ *
+ * Fields:
+ *   dirty_page_count  — number of dirty list entries processed
+ *   dirty_walk_cycles — rdtsc delta: dirty list walk + EPT PTE resets
+ *                       + private page pool returns
+ *   invept_cycles     — rdtsc delta: single batched INVEPT instruction
+ *   vmcs_cycles       — rdtsc delta: all VMCS field writes (CRs, segs,
+ *                       descriptor tables, MSRs, interrupt state, GPRs)
+ *   xrstor_cycles     — rdtsc delta: kernel_fpu_begin + XRSTOR + kernel_fpu_end
+ *   total_cycles      — rdtsc delta: full restore path (t5 - t0)
+ *
+ * Returns 0 on success, -EINVAL if no snapshot has been created,
+ * -EFAULT on copy_to_user failure.
+ */
+struct phantom_perf_result {
+	__u64 dirty_page_count;
+	__u64 dirty_walk_cycles;
+	__u64 invept_cycles;
+	__u64 vmcs_cycles;
+	__u64 xrstor_cycles;
+	__u64 total_cycles;
+};
+
+#define PHANTOM_IOCTL_PERF_RESTORE_LATENCY \
+	_IOR(PHANTOM_IOCTL_MAGIC, 12, struct phantom_perf_result)
 
 /*
  * Reserved for future phases:
