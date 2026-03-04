@@ -18,6 +18,7 @@
 
 #include "ept.h"
 #include "ept_cow.h"
+#include "snapshot.h"
 
 /* ------------------------------------------------------------------
  * MSR constants — only defined if the running kernel headers omit them
@@ -559,6 +560,52 @@ struct phantom_vmx_cpu_state {
 	 * health monitoring.
 	 */
 	u32			  dirty_overflow_count;
+
+	/*
+	 * Task 1.6: Snapshot/restore fields.
+	 *
+	 * snap:                 Complete guest architectural state captured
+	 *                       by phantom_snapshot_create().
+	 *
+	 * xsave_area:           Raw allocation from kzalloc (xsave_area_size
+	 *                       + 64 bytes for alignment padding).  Freed in
+	 *                       phantom_vmcs_teardown().  NULL if XSAVE is
+	 *                       not supported or allocation failed.
+	 *
+	 * xsave_area_aligned:   PTR_ALIGN(xsave_area, 64) — the actual
+	 *                       64-byte aligned pointer passed to xsave64 /
+	 *                       xrstor64.
+	 *
+	 * xsave_area_size:      From CPUID.(EAX=0Dh,ECX=0).EBX, rounded up
+	 *                       to the next 64-byte boundary.  Minimum 512
+	 *                       bytes (SSE fallback for legacy hardware).
+	 *
+	 * xcr0_supported:       Host XCR0 value at instance creation.  Used
+	 *                       as the EDX:EAX pair for xsave64/xrstor64 to
+	 *                       specify which state components to save/restore.
+	 *
+	 * snap_taken:           true after the first successful
+	 *                       phantom_snapshot_create().  Cleared by
+	 *                       phantom_vmcs_teardown().
+	 */
+	struct phantom_snapshot	  snap;
+	void			 *xsave_area;          /* raw allocation */
+	void			 *xsave_area_aligned;  /* 64-byte aligned */
+	u32			  xsave_area_size;
+	u64			  xcr0_supported;
+	bool			  snap_taken;
+	/*
+	 * snap_continue: set by the RUN_GUEST ioctl handler to true only
+	 * when test_id==7 AND snap_taken==true (phase-2 or post-restore
+	 * continuation runs that must resume from snap->rip rather than
+	 * resetting to GUEST_CODE_GPA).  Always false for test_id != 7 and
+	 * for the initial phase-1 test_id=7 run (snap_taken=false).
+	 *
+	 * When true, the vCPU thread skips the RIP/RSP/RFLAGS reset in
+	 * the relaunch path (snapshot_restore or snapshot_create already
+	 * wrote the correct VMCS values).
+	 */
+	bool			  snap_continue;
 };
 
 DECLARE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);

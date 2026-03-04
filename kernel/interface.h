@@ -23,8 +23,9 @@
  * Task 1.3 baseline: version 1.3.0 = 0x00010300
  * Task 1.4 baseline: version 1.4.0 = 0x00010400
  * Task 1.5 baseline: version 1.5.0 = 0x00010500
+ * Task 1.6 baseline: version 1.6.0 = 0x00010600
  * ------------------------------------------------------------------ */
-#define PHANTOM_VERSION		0x00010500U
+#define PHANTOM_VERSION		0x00010600U
 
 /* ------------------------------------------------------------------
  * ioctl command numbers
@@ -88,6 +89,36 @@ struct phantom_run_args {
  * Returns 0 on success.  Also returns 0 if no overflows have occurred.
  */
 #define PHANTOM_IOCTL_DEBUG_DUMP_DIRTY_OVERFLOW	_IO(PHANTOM_IOCTL_MAGIC, 8)
+
+/*
+ * PHANTOM_IOCTL_SNAPSHOT_CREATE — capture current guest state as snapshot.
+ *
+ * No arguments.  Takes a full snapshot of the current guest architectural
+ * state: GPRs, VMCS fields (CRs, segments, MSRs), and XSAVE area.
+ * Also marks all EPT RAM pages read-only (CoW protection enabled).
+ *
+ * Workflow:
+ *   1. RUN_GUEST (with test_id=7) — guest runs to VMCALL snapshot point
+ *   2. SNAPSHOT_CREATE — save state, mark EPT RO
+ *   3. RUN_GUEST — guest runs from the snapshot point (CoW tracks writes)
+ *   4. SNAPSHOT_RESTORE — reset to snapshot for next iteration
+ *   5. Repeat 3-4 in tight loop
+ *
+ * Returns 0 on success, -ENXIO if device not initialised.
+ */
+#define PHANTOM_IOCTL_SNAPSHOT_CREATE	_IO(PHANTOM_IOCTL_MAGIC, 9)
+
+/*
+ * PHANTOM_IOCTL_SNAPSHOT_RESTORE — restore guest to last snapshot.
+ *
+ * No arguments.  Resets dirty EPT PTEs, returns private pages to pool,
+ * restores all VMCS guest-state fields, GPRs, and XSAVE area.
+ * Issues one batched single-context INVEPT.
+ *
+ * Returns 0 on success, -EINVAL if no snapshot has been taken,
+ * -ENXIO if device not initialised.
+ */
+#define PHANTOM_IOCTL_SNAPSHOT_RESTORE	_IO(PHANTOM_IOCTL_MAGIC, 10)
 
 /*
  * Reserved for future phases:
