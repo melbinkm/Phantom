@@ -26,8 +26,9 @@
  * Task 1.5 baseline: version 1.5.0 = 0x00010500
  * Task 1.6 baseline: version 1.6.0 = 0x00010600
  * Task 1.8 baseline: version 1.8.0 = 0x00010800
+ * Task 2.1 baseline: version 2.1.0 = 0x00020100
  * ------------------------------------------------------------------ */
-#define PHANTOM_VERSION		0x00010800U
+#define PHANTOM_VERSION		0x00020100U
 
 /* ------------------------------------------------------------------
  * ioctl command numbers
@@ -155,12 +156,103 @@ struct phantom_perf_result {
 #define PHANTOM_IOCTL_PERF_RESTORE_LATENCY \
 	_IOR(PHANTOM_IOCTL_MAGIC, 12, struct phantom_perf_result)
 
+/* ------------------------------------------------------------------
+ * Task 2.1: kAFL/Nyx ABI — shared memory, RUN_ITERATION, GET_RESULT
+ * ------------------------------------------------------------------ */
+
+/*
+ * Maximum fuzz payload size: 64KB.
+ *
+ * This matches the kAFL/Nyx payload buffer convention.  The payload is
+ * written into shared_mem->payload by the host before each iteration,
+ * and the guest reads it via GET_PAYLOAD hypercall (which registers the
+ * GPA and causes the host to memcpy on the next injection).
+ */
+#define PHANTOM_PAYLOAD_MAX		(1 << 16)  /* 64KB */
+
+/*
+ * struct phantom_shared_mem — kernel↔userspace shared memory region.
+ *
+ * This structure occupies the first mmap region of /dev/phantom.
+ * Userspace writes payload[] before calling RUN_ITERATION; kernel
+ * copies payload to the guest GPA registered via GET_PAYLOAD.
+ * After each iteration the kernel writes status and crash_addr.
+ *
+ * Layout is ABI-stable: fields must not be reordered.
+ *
+ * Mapped via PHANTOM_IOCTL_MMAP_SHARED_MEM or standard mmap with
+ * offset=0 on the /dev/phantom fd.
+ */
+struct phantom_shared_mem {
+	__u8	payload[PHANTOM_PAYLOAD_MAX];	/* fuzz input for next iter  */
+	__u32	payload_len;			/* valid bytes in payload[]  */
+	__u32	status;				/* PHANTOM_RESULT_* last iter */
+	__u64	crash_addr;			/* guest crash address       */
+};
+
+/*
+ * struct phantom_iter_params — parameters for PHANTOM_IOCTL_RUN_ITERATION.
+ *
+ * payload_len: number of valid bytes in shared_mem->payload[].
+ *              Must be <= PHANTOM_PAYLOAD_MAX.
+ * timeout_ms:  VMX preemption timer budget in milliseconds.
+ *              0 = use module default (no timeout).
+ *              Non-zero values are converted to VMX preemption timer
+ *              ticks at IOCTL time.
+ */
+struct phantom_iter_params {
+	__u32 payload_len;	/* length of payload in shared_mem->payload */
+	__u32 timeout_ms;	/* preemption timer timeout (0 = default)   */
+};
+
+/*
+ * struct phantom_iter_result — result from PHANTOM_IOCTL_GET_RESULT.
+ *
+ * status:     PHANTOM_RESULT_* code from the last iteration.
+ * crash_addr: Guest address at time of PANIC hypercall (if status==CRASH).
+ *             0 if not a PANIC result.
+ */
+struct phantom_iter_result {
+	__u32 status;		/* PHANTOM_RESULT_* */
+	__u32 _pad;
+	__u64 crash_addr;
+};
+
+/*
+ * PHANTOM_IOCTL_RUN_ITERATION — run one fuzzing iteration.
+ *
+ * Userspace must have written the payload into shared_mem->payload[]
+ * (via mmap) before calling this ioctl.  The ioctl:
+ *   1. Copies payload from shared_mem into guest RAM at payload_gpa.
+ *   2. Signals the vCPU thread to VMRESUME from the snapshot point.
+ *   3. Blocks until the iteration completes (RELEASE/PANIC/KASAN/timeout).
+ *   4. Writes status and crash_addr back to shared_mem.
+ *   5. Returns 0; status is available via GET_RESULT or shared_mem.
+ *
+ * Requires: ACQUIRE hypercall must have fired at least once (snapshot
+ * must be taken) before calling RUN_ITERATION.
+ *
+ * Returns 0 on success (check status for iteration result).
+ * Returns -EINVAL if no snapshot has been taken.
+ * Returns -ENXIO if device not initialised.
+ */
+#define PHANTOM_IOCTL_RUN_ITERATION \
+	_IOWR(PHANTOM_IOCTL_MAGIC, 20, struct phantom_iter_params)
+
+/*
+ * PHANTOM_IOCTL_GET_RESULT — retrieve result of last iteration.
+ *
+ * Returns a snapshot of status and crash_addr from state.
+ * Safe to call after RUN_ITERATION completes.
+ */
+#define PHANTOM_IOCTL_GET_RESULT \
+	_IOR(PHANTOM_IOCTL_MAGIC, 21, struct phantom_iter_result)
+
 /*
  * Reserved for future phases:
  *
  * PHANTOM_IOCTL_CREATE_INSTANCE	_IOW(PHANTOM_IOCTL_MAGIC, 2, ...)
  * PHANTOM_IOCTL_DESTROY_INSTANCE	_IOW(PHANTOM_IOCTL_MAGIC, 3, __u32)
- * PHANTOM_IOCTL_RUN_ITERATION		_IOWR(PHANTOM_IOCTL_MAGIC, 4, ...)
  * PHANTOM_IOCTL_GET_STATUS		_IOR(PHANTOM_IOCTL_MAGIC, 5, ...)
  */
 

@@ -626,6 +626,52 @@ struct phantom_vmx_cpu_state {
 	 * assembly-trampoline-referenced field offsets above.
 	 */
 	struct phantom_perf_result perf_last;
+
+	/*
+	 * Task 2.1: kAFL/Nyx ABI hypercall state.
+	 *
+	 * payload_gpa:       GPA registered by GET_PAYLOAD hypercall.
+	 *                    The host writes the fuzz payload here each
+	 *                    iteration before VMRESUME.  0 = not registered.
+	 *
+	 * pt_cr3:            Guest CR3 value registered by SUBMIT_CR3.
+	 *                    Used by Intel PT for address filtering.
+	 *                    0 = not submitted.
+	 *
+	 * crash_addr:        Guest address provided with PANIC hypercall.
+	 *                    Stored for retrieval via GET_RESULT ioctl.
+	 *
+	 * panic_handler_gpa: GPA of the guest panic handler, registered
+	 *                    by SUBMIT_PANIC.  Allows host to inject a
+	 *                    controlled panic in future iterations.
+	 *
+	 * iteration_active:  true after ACQUIRE (snapshot taken), false
+	 *                    after RELEASE/PANIC/KASAN (iteration ended).
+	 *
+	 * snap_acquired:     true once the very first ACQUIRE snapshot has
+	 *                    been taken.  ACQUIRE is idempotent after this:
+	 *                    subsequent ACQUIRE calls advance from the same
+	 *                    snapshot point without re-creating the snapshot.
+	 *
+	 * shared_mem:        Kernel virtual address of the shared memory
+	 *                    region (payload + status word + crash addr).
+	 *                    Allocated at VMCS setup time.  mmap'd to
+	 *                    userspace on demand.
+	 *
+	 * shared_mem_pages:  Backing pages for shared_mem (order-N block).
+	 *                    Freed in phantom_vmcs_teardown().
+	 *
+	 * shared_mem_order:  Page allocation order for shared_mem_pages.
+	 */
+	u64			  payload_gpa;
+	u64			  pt_cr3;
+	u64			  crash_addr;
+	u64			  panic_handler_gpa;
+	bool			  iteration_active;
+	bool			  snap_acquired;
+	void			 *shared_mem;
+	struct page		 *shared_mem_pages;
+	unsigned int		  shared_mem_order;
 };
 
 DECLARE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);

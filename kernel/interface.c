@@ -46,6 +46,8 @@
 #include <linux/string.h>
 #include <linux/mm.h>
 #include <linux/gfp.h>
+#include <linux/mman.h>
+#include <linux/version.h>
 
 #include "phantom.h"
 #include "interface.h"
@@ -53,6 +55,7 @@
 #include "ept.h"
 #include "ept_cow.h"
 #include "snapshot.h"
+#include "hypercall.h"
 #include "debug.h"
 #include "compat.h"
 
@@ -828,6 +831,87 @@ static const u8 phantom_snapshot_xmm_guest_bin[] = {
 };
 
 /* ------------------------------------------------------------------
+ * Guest binary 9 (test_id=8): kAFL/Nyx ABI hypercall harness
+ *
+ * Implements the full nyx_api iteration loop:
+ *   1. GET_PAYLOAD (0x11a): register payload buffer at GPA 0x5000.
+ *      On ACQUIRE, host will copy shared_mem->payload to this GPA.
+ *   2. ACQUIRE (0x11c): take snapshot on first call.
+ *      On subsequent calls (RUN_ITERATION), resumes from snapshot RIP.
+ *      === snapshot RIP is here (after ACQUIRE vmcall) ===
+ *   3. Read payload[0..7] from GPA 0x5000 into RBX.
+ *   4. RELEASE (0x11d): store result=OK, call snapshot_restore.
+ *      Guest never returns here — next iteration starts at snapshot RIP.
+ *   5. Safety: hlt + jmp loop (unreachable in normal operation).
+ *
+ * Assembly (64-bit long mode):
+ *
+ *   ; Phase 1: register payload buffer at GPA 0x5000
+ *   mov $0x11a, %rax              ; GET_PAYLOAD
+ *   mov $0x5000, %rbx             ; payload GPA
+ *   vmcall
+ *
+ *   ; Phase 2: acquire snapshot (or resume from snapshot)
+ *   mov $0x11c, %rax              ; ACQUIRE
+ *   vmcall
+ *   === snapshot RIP = GUEST_CODE_GPA + 36 ===
+ *
+ *   ; Phase 3: read payload[0..7]
+ *   mov 0x5000, %rbx              ; absolute memory ref
+ *
+ *   ; Phase 4: release (end iteration)
+ *   mov $0x11d, %rax              ; RELEASE
+ *   vmcall
+ *
+ *   ; Safety halt
+ *   hlt
+ *   jmp .halt
+ *
+ * Byte layout:
+ *   [0..9]    mov $0x11a, %rax    (10 bytes)
+ *   [10..19]  mov $0x5000, %rbx   (10 bytes)
+ *   [20..22]  vmcall               (3 bytes)
+ *   [23..32]  mov $0x11c, %rax    (10 bytes)
+ *   [33..35]  vmcall               (3 bytes)
+ *   === snapshot RIP = GUEST_CODE_GPA + 36 ===
+ *   [36..43]  mov 0x5000, %rbx    (8 bytes, absolute SIB encoding)
+ *   [44..53]  mov $0x11d, %rax    (10 bytes)
+ *   [54..56]  vmcall               (3 bytes)
+ *   [57]      hlt                  (1 byte)
+ *   [58..59]  jmp .halt  rel=-2   (2 bytes)
+ * ------------------------------------------------------------------ */
+static const u8 phantom_hypercall_harness_bin[] = {
+	/* [0..9] mov $0x11a, %rax  (REX.W B8 + 8-byte imm) */
+	0x48, 0xB8, 0x1A, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	/* [10..19] mov $0x5000, %rbx  (REX.W BB + 8-byte imm) */
+	0x48, 0xBB, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	/* [20..22] vmcall */
+	0x0F, 0x01, 0xC1,
+	/* [23..32] mov $0x11c, %rax */
+	0x48, 0xB8, 0x1C, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	/* [33..35] vmcall */
+	0x0F, 0x01, 0xC1,
+	/*
+	 * === snapshot RIP = GUEST_CODE_GPA + 36 ===
+	 * Execution resumes here each iteration after snapshot_restore.
+	 *
+	 * [36..43] mov 0x5000, %rbx  (absolute memory reference)
+	 * Encoding: REX.W(0x48) 8B /r with ModRM=00,011,100(SIB)
+	 *           SIB=00,100,101(disp32) + 32-bit displacement 0x00005000
+	 * = 48 8B 1C 25 00 50 00 00
+	 */
+	0x48, 0x8B, 0x1C, 0x25, 0x00, 0x50, 0x00, 0x00,
+	/* [44..53] mov $0x11d, %rax */
+	0x48, 0xB8, 0x1D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	/* [54..56] vmcall  (RELEASE → snapshot_restore → guest resumes at [36]) */
+	0x0F, 0x01, 0xC1,
+	/* [57] hlt  (safety: unreachable in normal operation) */
+	0xF4,
+	/* [58..59] jmp .halt  rel=-2 */
+	0xEB, 0xFD,
+};
+
+/* ------------------------------------------------------------------
  * File operations
  * ------------------------------------------------------------------ */
 
@@ -892,7 +976,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 *   7 = snapshot/restore XMM test (task 1.6)
 		 */
 		test_id = args.reserved;
-		if (test_id > 7) {
+		if (test_id > 8) {
 			pr_err("phantom: RUN_GUEST: invalid test_id=%u\n",
 			       test_id);
 			ret = -EINVAL;
@@ -1074,7 +1158,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			memcpy(page_address(state->guest_code_page),
 			       phantom_mixed_cow_guest_bin,
 			       sizeof(phantom_mixed_cow_guest_bin));
-		} else {
+		} else if (test_id == 7) {
 			/*
 			 * test_id=7: snapshot/restore XMM test.
 			 *
@@ -1096,6 +1180,28 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 				memcpy(page_address(state->guest_code_page),
 				       phantom_snapshot_xmm_guest_bin,
 				       sizeof(phantom_snapshot_xmm_guest_bin));
+			}
+		} else {
+			/*
+			 * test_id=8: kAFL/Nyx ABI hypercall harness.
+			 *
+			 * The binary uses ACQUIRE/RELEASE semantics:
+			 *   1. GET_PAYLOAD (0x11a): register GPA 0x5000.
+			 *   2. ACQUIRE (0x11c): take snapshot on first call.
+			 *   3. Read payload[0..7] from GPA 0x5000.
+			 *   4. RELEASE (0x11d): end iteration, restore snap.
+			 *
+			 * Only load the binary on the first run (snap_acquired
+			 * is false).  After ACQUIRE fires and the snapshot is
+			 * taken, the guest will resume from snapshot RIP on
+			 * each subsequent RUN_GUEST/RUN_ITERATION call.
+			 * Overwriting the code page would corrupt the binary
+			 * at the snapshot resume point.
+			 */
+			if (!state->snap_acquired) {
+				memcpy(page_address(state->guest_code_page),
+				       phantom_hypercall_harness_bin,
+				       sizeof(phantom_hypercall_harness_bin));
 			}
 		}
 
@@ -1125,7 +1231,14 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		state->run_result      = 0;
 		state->run_result_data = 0;
 		memset(&state->guest_regs, 0, sizeof(state->guest_regs));
-		state->snap_continue   = (test_id == 7 && state->snap_taken);
+		/*
+		 * snap_continue: true when the guest should resume from the
+		 * snapshot RIP rather than being reset to GUEST_CODE_GPA.
+		 *   test_id=7: snap_taken after first SNAPSHOT_CREATE.
+		 *   test_id=8: snap_acquired after first ACQUIRE hypercall.
+		 */
+		state->snap_continue = ((test_id == 7 && state->snap_taken) ||
+					 (test_id == 8 && state->snap_acquired));
 
 		if (!state->vmcs_configured) {
 			/* First run — configure_fields sets initial values */
@@ -1457,6 +1570,147 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		break;
 	}
 
+	case PHANTOM_IOCTL_RUN_ITERATION: {
+		/*
+		 * RUN_ITERATION — run one kAFL/Nyx fuzzing iteration.
+		 *
+		 * Prerequisites:
+		 *   - phantom_vmcs_setup() must have run (pages_allocated).
+		 *   - ACQUIRE hypercall must have fired (snap_acquired=true).
+		 *   - Userspace must have written payload to shared_mem->payload
+		 *     and set shared_mem->payload_len before this ioctl.
+		 *
+		 * Execution:
+		 *   1. Copy payload from shared_mem into guest RAM at
+		 *      state->payload_gpa (if set by GET_PAYLOAD hypercall).
+		 *   2. Set snap_continue=true so vCPU thread skips RIP reset.
+		 *   3. Signal vCPU thread via vcpu_run_request=6.
+		 *   4. Wait for iteration to complete.
+		 *   5. Copy result back to shared_mem (done by hypercall handler).
+		 *   6. Return 0; caller reads status from shared_mem or GET_RESULT.
+		 */
+		struct phantom_iter_params params;
+		struct phantom_vmx_cpu_state *state;
+		int target_cpu = -1;
+		int cpu_iter;
+		struct phantom_shared_mem *sm;
+
+		if (copy_from_user(&params, (void __user *)arg, sizeof(params))) {
+			ret = -EFAULT;
+			break;
+		}
+
+		if (params.payload_len > PHANTOM_PAYLOAD_MAX) {
+			ret = -EINVAL;
+			break;
+		}
+
+		/* Find target CPU */
+		for_each_cpu(cpu_iter, pdev->vmx_cpumask) {
+			target_cpu = cpu_iter;
+			break;
+		}
+
+		if (target_cpu < 0) {
+			pr_err("phantom: RUN_ITERATION: no VMX CPU\n");
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+		if (!state->pages_allocated) {
+			pr_err("phantom: RUN_ITERATION: pages not allocated "
+			       "(run RUN_GUEST test_id=8 first)\n");
+			ret = -ENXIO;
+			break;
+		}
+
+		if (!state->snap_acquired) {
+			pr_err("phantom: RUN_ITERATION: no snapshot taken "
+			       "(run RUN_GUEST test_id=8 first)\n");
+			ret = -EINVAL;
+			break;
+		}
+
+		if (!state->vcpu_thread) {
+			pr_err("phantom: RUN_ITERATION: vCPU thread not running\n");
+			ret = -ENXIO;
+			break;
+		}
+
+		/*
+		 * Update payload_len in shared memory so phantom_copy_to_guest
+		 * (called by inject_payload in handle_acquire) copies the
+		 * correct number of bytes.
+		 */
+		sm = (struct phantom_shared_mem *)state->shared_mem;
+		if (sm)
+			sm->payload_len = params.payload_len;
+
+		/*
+		 * Clear per-run result state before signalling the vCPU thread.
+		 * snap_continue=true: VMCS RIP is already at snap->rip from
+		 * the last phantom_snapshot_restore() (in RELEASE/PANIC/KASAN).
+		 */
+		state->run_result      = PHANTOM_RESULT_OK;
+		state->run_result_data = 0;
+		state->crash_addr      = 0;
+		state->snap_continue   = true;
+		state->vcpu_run_request = 6;
+
+		/*
+		 * Signal the vCPU thread.  After the first ACQUIRE (which means
+		 * vmcs_configured is true and vmlaunch_done is true in the vCPU
+		 * thread), we must use the IPI-free busy-wait path.
+		 */
+		smp_store_release(&state->vcpu_work_ready, true);
+		wait_for_completion(&state->vcpu_run_done);
+
+		if (state->vcpu_run_result < 0) {
+			pr_err("phantom: RUN_ITERATION failed: %d\n",
+			       state->vcpu_run_result);
+			ret = state->vcpu_run_result;
+			break;
+		}
+
+		ret = 0;
+		break;
+	}
+
+	case PHANTOM_IOCTL_GET_RESULT: {
+		/*
+		 * GET_RESULT — retrieve status and crash_addr from last iter.
+		 *
+		 * Returns a snapshot of state->run_result and crash_addr.
+		 * Safe to call after RUN_ITERATION completes.
+		 */
+		struct phantom_iter_result result;
+		struct phantom_vmx_cpu_state *state;
+		int target_cpu = -1;
+		int cpu_iter;
+
+		for_each_cpu(cpu_iter, pdev->vmx_cpumask) {
+			target_cpu = cpu_iter;
+			break;
+		}
+
+		if (target_cpu < 0) {
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+		memset(&result, 0, sizeof(result));
+		result.status     = (u32)state->run_result;
+		result.crash_addr = state->crash_addr;
+
+		if (copy_to_user((void __user *)arg, &result, sizeof(result)))
+			ret = -EFAULT;
+		break;
+	}
+
 	default:
 		ret = -ENOTTY;
 		break;
@@ -1465,11 +1719,77 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 	return ret;
 }
 
+/* ------------------------------------------------------------------
+ * mmap support — map shared_mem to userspace.
+ *
+ * Offset 0: struct phantom_shared_mem (payload[64KB] + status + crash).
+ *
+ * The shared memory was allocated as a physically contiguous page block
+ * by phantom_vmcs_setup() using alloc_pages_node(order).  We use
+ * remap_pfn_range() to map it into the VMA.
+ *
+ * Userspace writes payload[], sets payload_len, then calls RUN_ITERATION.
+ * Kernel writes status and crash_addr after each iteration completes.
+ *
+ * The VMA must fit within the shared_mem allocation.  We reject any
+ * mapping that would exceed it.
+ * ------------------------------------------------------------------ */
+
+static int phantom_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	struct phantom_dev *pdev = filp->private_data;
+	struct phantom_vmx_cpu_state *state;
+	int target_cpu = -1;
+	int cpu;
+	unsigned long size;
+	unsigned long pfn;
+
+	if (!pdev || !pdev->initialized)
+		return -ENXIO;
+
+	/* Find the first VMX CPU */
+	for_each_cpu(cpu, pdev->vmx_cpumask) {
+		target_cpu = cpu;
+		break;
+	}
+
+	if (target_cpu < 0)
+		return -ENODEV;
+
+	state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+	if (!state->pages_allocated || !state->shared_mem_pages)
+		return -EINVAL;
+
+	size = vma->vm_end - vma->vm_start;
+	if (size > (PAGE_SIZE << state->shared_mem_order))
+		return -EINVAL;
+
+	/*
+	 * Mark the VMA as shared (IO-mapped) so the kernel does not try to
+	 * swap it out.  Mark as not-dumpable (no core dumps of fuzzer state).
+	 *
+	 * Linux 6.3+ requires vm_flags_set() instead of direct assignment.
+	 * Earlier kernels use direct assignment.
+	 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
+#else
+	vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
+#endif
+
+	pfn = page_to_pfn(state->shared_mem_pages);
+
+	return remap_pfn_range(vma, vma->vm_start, pfn, size,
+			       vma->vm_page_prot);
+}
+
 static const struct file_operations phantom_fops = {
 	.owner          = THIS_MODULE,
 	.open           = phantom_open,
 	.release        = phantom_release,
 	.unlocked_ioctl = phantom_ioctl,
+	.mmap           = phantom_mmap,
 };
 
 /* ------------------------------------------------------------------

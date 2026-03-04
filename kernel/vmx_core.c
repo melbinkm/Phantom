@@ -1107,6 +1107,47 @@ int phantom_vmcs_setup(struct phantom_vmx_cpu_state *state)
 	state->snap_taken    = false;
 	state->snap_continue = false;
 
+	/*
+	 * Task 2.1: Allocate shared memory region (payload + status word).
+	 *
+	 * The shared memory is a struct phantom_shared_mem (payload[64KB] +
+	 * status u32 + pad + crash_addr u64).  We allocate it as a
+	 * physically contiguous page block so it can be mmap'd to userspace
+	 * via remap_pfn_range().
+	 *
+	 * Size: sizeof(struct phantom_shared_mem) rounded up to page order.
+	 * For 64KB payload + 16 bytes overhead: 17 × 4KB pages → order 5.
+	 */
+	{
+		unsigned int order;
+		struct page *pg;
+		size_t shm_size = sizeof(struct phantom_shared_mem);
+
+		order = get_order(shm_size);
+		pg = alloc_pages_node(node,
+				      GFP_KERNEL | __GFP_ZERO, order);
+		if (!pg) {
+			pr_warn("phantom: CPU%d: shared_mem alloc failed "
+				"(RUN_ITERATION will use in-kernel copy)\n",
+				cpu);
+			state->shared_mem_pages = NULL;
+			state->shared_mem       = NULL;
+			state->shared_mem_order = order;
+		} else {
+			state->shared_mem_pages = pg;
+			state->shared_mem       = page_address(pg);
+			state->shared_mem_order = order;
+		}
+	}
+
+	/* Task 2.1: initialise nyx_api fields */
+	state->payload_gpa      = 0;
+	state->pt_cr3           = 0;
+	state->crash_addr       = 0;
+	state->panic_handler_gpa = 0;
+	state->iteration_active = false;
+	state->snap_acquired    = false;
+
 	state->pages_allocated = true;
 	pr_info("phantom: CPU%d: pages allocated (EPT: 8MB 2MB-pages + "
 		"8MB 4KB-pages, eptp=0x%llx, cow_pool=%u pages, "
@@ -1273,6 +1314,19 @@ void phantom_vmcs_teardown(struct phantom_vmx_cpu_state *state)
 	state->snap_continue      = false;
 	state->xsave_area_size    = 0;
 	state->xcr0_supported     = 0;
+
+	/* Task 2.1: free shared memory region */
+	if (state->shared_mem_pages) {
+		__free_pages(state->shared_mem_pages, state->shared_mem_order);
+		state->shared_mem_pages = NULL;
+		state->shared_mem       = NULL;
+	}
+	state->payload_gpa       = 0;
+	state->pt_cr3            = 0;
+	state->crash_addr        = 0;
+	state->panic_handler_gpa = 0;
+	state->iteration_active  = false;
+	state->snap_acquired     = false;
 
 	state->pages_allocated = false;
 	state->vmcs_configured = false;
@@ -1602,6 +1656,48 @@ static int phantom_vcpu_fn(void *data)
 			state->vcpu_run_result = phantom_snapshot_restore(state);
 			complete(&state->vcpu_run_done);
 			continue;
+		}
+
+		/*
+		 * Task 2.1: vcpu_run_request == 6 — run one fuzzing iteration.
+		 *
+		 * This is the RUN_ITERATION path for the kAFL/Nyx ABI:
+		 *   1. snap_acquired must be true (ACQUIRE was called at least
+		 *      once to create the snapshot).
+		 *   2. The VMCS RIP is already at snap->rip (set by the last
+		 *      phantom_snapshot_restore() from RELEASE/PANIC/KASAN).
+		 *   3. The payload was already injected into guest RAM by the
+		 *      ioctl handler before setting vcpu_work_ready.
+		 *   4. We run the guest.  It will ACQUIRE (nop — snap exists),
+		 *      read the payload, then call RELEASE/PANIC/KASAN which
+		 *      calls phantom_snapshot_restore() and returns.
+		 *   5. We signal done.  EPT CoW cleanup is handled inside
+		 *      phantom_snapshot_restore() (dirty list walk + INVEPT).
+		 *
+		 * snap_continue = true: tells the relaunch path to skip the
+		 * RIP reset to GUEST_CODE_GPA (the snapshot RIP is correct).
+		 *
+		 * NOTE: We do NOT call phantom_cow_abort_iteration() here —
+		 * snapshot_restore() already handles the dirty list reset.
+		 * The phantom_run_guest() return path below would normally
+		 * call abort_iteration, but for request==6 we skip it because
+		 * snapshot_restore has already done the equivalent work.
+		 */
+		if (state->vcpu_run_request == 6) {
+			if (!state->snap_acquired) {
+				state->vcpu_run_result = -EINVAL;
+				complete(&state->vcpu_run_done);
+				continue;
+			}
+			/*
+			 * snap_continue = true: skip RIP reset in the
+			 * vcpu_run_request & 2 branch below.  The VMCS RIP
+			 * is already at snap->rip from the last restore.
+			 */
+			state->snap_continue   = true;
+			state->vcpu_run_request = 3; /* run | reset */
+
+			/* Run the guest — falls through to standard path */
 		}
 
 		/* Check for valid run request (bit 0 = "run guest") */
@@ -1993,12 +2089,23 @@ static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 		if (hret < 0)
 			return hret;
 		/*
-		 * After SUBMIT_RESULT the guest may continue to HLT;
-		 * if run_result is set, we can stop now.
+		 * Legacy: stop after SUBMIT_RESULT or non-zero result data.
+		 *
+		 * nyx_api: stop after RELEASE / PANIC / KASAN.
+		 * These handlers set iteration_active=false and call
+		 * phantom_snapshot_restore() which resets VMCS to snap->rip.
+		 * The next VMRESUME would loop forever, so we stop here.
+		 * phantom_run_guest() returns 0; the ioctl inspects run_result.
+		 *
+		 * Also stop for HYPERCALL_ERROR (bad nyx_api hypercall).
 		 */
 		if (state->run_result_data != 0 ||
 		    state->guest_regs.rax == PHANTOM_HC_SUBMIT_RESULT)
-			return 1; /* done */
+			return 1; /* legacy: done */
+		if (state->snap_acquired && !state->iteration_active)
+			return 1; /* nyx_api: iteration ended */
+		if (state->run_result == PHANTOM_RESULT_HYPERCALL_ERROR)
+			return 1; /* bad hypercall: abort */
 		return 0; /* continue */
 	}
 
