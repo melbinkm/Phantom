@@ -109,9 +109,15 @@ int phantom_multicore_init(const cpumask_t *cpus)
 
 		state = per_cpu_ptr(&phantom_vmx_state, cpu);
 
-		/* Zero per-task-3.3 fields without disturbing prior init */
-		memset(state->coverage_bitmap, 0,
-		       sizeof(state->coverage_bitmap));
+		/* Allocate 64KB coverage bitmap (too large for percpu static embed). */
+		state->coverage_bitmap = vzalloc_node(PHANTOM_BITMAP_SIZE,
+						      cpu_to_node(cpu));
+		if (!state->coverage_bitmap) {
+			pr_err("phantom: CPU%d: coverage_bitmap alloc failed\n",
+			       cpu);
+			ret = -ENOMEM;
+			goto fail;
+		}
 		state->iter_count        = 0;
 		state->iter_tsc_window   = 0;
 		state->iter_count_window = 0;
@@ -124,6 +130,8 @@ int phantom_multicore_init(const cpumask_t *cpus)
 		if (ret) {
 			pr_err("phantom: CPU%d: vmcs_setup failed: %d\n",
 			       cpu, ret);
+			vfree(state->coverage_bitmap);
+			state->coverage_bitmap = NULL;
 			goto fail;
 		}
 
@@ -137,6 +145,8 @@ int phantom_multicore_init(const cpumask_t *cpus)
 			pr_err("phantom: CPU%d: vcpu_thread_start failed: %d\n",
 			       cpu, ret);
 			phantom_vmcs_teardown(state);
+			vfree(state->coverage_bitmap);
+			state->coverage_bitmap = NULL;
 			goto fail;
 		}
 
@@ -171,6 +181,8 @@ fail:
 		state = per_cpu_ptr(&phantom_vmx_state, fcpu);
 		phantom_vcpu_thread_stop(state);
 		phantom_vmcs_teardown(state);
+		vfree(state->coverage_bitmap);
+		state->coverage_bitmap = NULL;
 		cpumask_clear_cpu(fcpu, &mc_cpumask);
 	}
 	return ret;
@@ -192,6 +204,8 @@ void phantom_multicore_teardown(void)
 		state = per_cpu_ptr(&phantom_vmx_state, cpu);
 		phantom_vcpu_thread_stop(state);
 		phantom_vmcs_teardown(state);
+		vfree(state->coverage_bitmap);
+		state->coverage_bitmap = NULL;
 	}
 
 	cpumask_clear(&mc_cpumask);
@@ -272,7 +286,11 @@ EXPORT_SYMBOL_GPL(phantom_multicore_start_fuzzing);
  * ------------------------------------------------------------------ */
 void phantom_merge_coverage_to_global(struct phantom_vmx_cpu_state *state)
 {
-	u64 *local  = (u64 *)state->coverage_bitmap;
+	u64 *local;
+
+	if (!state->coverage_bitmap)
+		return;
+	local  = (u64 *)state->coverage_bitmap;
 	u64 *global = (u64 *)phantom_global_bitmap;
 	int i;
 

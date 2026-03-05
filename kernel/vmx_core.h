@@ -877,7 +877,7 @@ struct phantom_vmx_cpu_state {
 	 *   the current measurement window.  Delta against current
 	 *   iter_count gives exec/sec for the window.
 	 */
-	u8			  coverage_bitmap[64 * 1024] __attribute__((aligned(64)));
+	u8			 *coverage_bitmap;	/* vmalloc'd 64KB; set by multicore_init */
 	u64			  iter_count;
 	u64			  iter_tsc_window;
 	u64			  iter_count_window;

@@ -63,6 +63,7 @@
 #include "pt_config.h"
 #include "msr_emul.h"
 #include "guest_boot.h"
+#include "multicore.h"
 
 /* ------------------------------------------------------------------
  * Guest binary 1 (test_id=0): R/W test
@@ -2506,6 +2507,17 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			ret = -EFAULT;
 
 		kfree(istate);
+		break;
+	}
+
+	case PHANTOM_IOCTL_GET_MULTICORE_STATS: {
+		struct phantom_multicore_stats stats;
+
+		ret = phantom_multicore_get_stats(&stats);
+		if (ret)
+			break;
+		if (copy_to_user((void __user *)arg, &stats, sizeof(stats)))
+			ret = -EFAULT;
 		break;
 	}
 

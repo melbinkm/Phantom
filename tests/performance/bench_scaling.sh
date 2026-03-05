@@ -114,46 +114,33 @@ measure_cores() {
 	fi
 
 	# Boot the guest on each active core using background python processes.
-	# Each process opens /dev/phantom independently — the driver supports
-	# one fd per CPU (PHANTOM_CREATE_VM pinned to that CPU).
+	# Each process opens /dev/phantom independently — one fd per CPU.
+	# Processes run for MEASURE_SECS then exit naturally and print stats.
 	local boot_pids=()
 	for ((i = 0; i < n_cores; i++)); do
 		python3 "${SRC_ROOT}/tests/integration/boot_and_fuzz.py" \
 			--bzimage "${BZIMAGE}" \
 			--cpu "${i}" \
-			--run-secs $(( MEASURE_SECS + 5 )) \
+			--seconds "${MEASURE_SECS}" \
 			>/tmp/phantom_scale_core${i}.log 2>&1 &
 		boot_pids+=($!)
 	done
 
-	# Wait for guests to reach steady state
-	echo "  Waiting ${MEASURE_SECS}s for steady state..."
-	sleep "${MEASURE_SECS}"
+	# Wait for all workers to finish (they self-terminate after MEASURE_SECS).
+	# boot_and_fuzz.py sleeps 2s for boot, then iterates for MEASURE_SECS,
+	# then prints stats and exits.  Total wall time ~= MEASURE_SECS + 5s.
+	echo "  Waiting for ${n_cores} core(s) to complete ${MEASURE_SECS}s run..."
+	wait "${boot_pids[@]}" 2>/dev/null || true
 
-	# Read stats while fuzzing is running
-	local stats
-	stats=$(python3 "${STATS_PY}" 2>/dev/null) || {
-		echo "  WARNING: multicore_stats.py failed; falling back to dmesg"
-		stats=""
-	}
-
+	# Parse exec_per_sec from each per-core log file.
+	# boot_and_fuzz.py prints: "cpu=N iters=M elapsed=T exec_per_sec=R"
 	local total_exec=0
-	if [[ -n "${stats}" ]]; then
-		# Parse "total_exec_per_sec: N" from multicore_stats.py output
-		total_exec=$(echo "${stats}" | awk '/total_exec_per_sec/{print $NF}')
-	else
-		# Fallback: sum exec/sec from per-core dmesg lines
-		# phantom logs: "phantom: core N: exec/sec: M"
-		total_exec=$(dmesg | grep -oP 'exec/sec:\s*\K[0-9]+' | \
-			tail -"${n_cores}" | awk '{s+=$1} END{print s}')
-		[[ -z "${total_exec}" ]] && total_exec=0
-	fi
-
-	# Kill background fuzz processes
-	for pid in "${boot_pids[@]}"; do
-		kill "${pid}" 2>/dev/null || true
+	local core_exec
+	for ((i = 0; i < n_cores; i++)); do
+		core_exec=$(grep -oP 'exec_per_sec=\K[0-9]+' \
+			"/tmp/phantom_scale_core${i}.log" 2>/dev/null | tail -1)
+		[[ -n "${core_exec}" ]] && total_exec=$(( total_exec + core_exec ))
 	done
-	wait 2>/dev/null || true
 
 	echo "  cores=${n_cores} total_exec/s=${total_exec}"
 	EXEC_RESULTS[${n_cores}]="${total_exec}"
