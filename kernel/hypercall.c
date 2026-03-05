@@ -402,6 +402,7 @@ static int handle_release(struct phantom_vmx_cpu_state *state)
 	state->run_result = PHANTOM_RESULT_OK;
 	state->crash_addr = 0;
 	state->iteration_active = false;
+	state->iter_count++;
 
 	if (state->shared_mem) {
 		struct phantom_shared_mem *sm =
@@ -451,6 +452,7 @@ static int handle_panic(struct phantom_vmx_cpu_state *state)
 	state->run_result = PHANTOM_RESULT_CRASH;
 	state->crash_addr = state->guest_regs.rcx;
 	state->iteration_active = false;
+	state->iter_count++;
 
 	if (state->shared_mem) {
 		struct phantom_shared_mem *sm =
@@ -475,6 +477,7 @@ static int handle_kasan(struct phantom_vmx_cpu_state *state)
 	state->run_result = PHANTOM_RESULT_KASAN;
 	state->crash_addr = 0;
 	state->iteration_active = false;
+	state->iter_count++;
 
 	if (state->shared_mem) {
 		struct phantom_shared_mem *sm =
