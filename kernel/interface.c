@@ -49,6 +49,7 @@
 #include <linux/mman.h>
 #include <linux/version.h>
 #include <linux/eventfd.h>
+#include <linux/vmalloc.h>
 
 #include "phantom.h"
 #include "interface.h"
@@ -60,6 +61,8 @@
 #include "debug.h"
 #include "compat.h"
 #include "pt_config.h"
+#include "msr_emul.h"
+#include "guest_boot.h"
 
 /* ------------------------------------------------------------------
  * Guest binary 1 (test_id=0): R/W test
@@ -2225,6 +2228,125 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		ret = 0;
 		break;
+
+	case PHANTOM_IOCTL_BOOT_KERNEL: {
+		/*
+		 * PHANTOM_IOCTL_BOOT_KERNEL — load a Linux bzImage and
+		 * configure a Class B guest.
+		 *
+		 * Process-context steps (done here):
+		 *   1. Copy bzImage from userspace.
+		 *   2. Allocate 256MB Class B EPT (GFP_KERNEL allowed).
+		 *   3. Load kernel image + populate boot_params.
+		 *   4. Set up MSR bitmap for Class B exits.
+		 *   5. Initialise MSR shadow state.
+		 *
+		 * vCPU-thread step (via vcpu_run_request=7):
+		 *   6. Write VMCS guest-state for 64-bit Linux boot.
+		 *
+		 * Step 6 must run on the vCPU thread because VMWRITE
+		 * requires the target VMCS to be current (VMPTRLD'd)
+		 * on the executing CPU.
+		 */
+		struct phantom_boot_kernel_args bk_args;
+		struct phantom_vmx_cpu_state *state;
+		int target_cpu;
+		void *buf;
+
+		if (copy_from_user(&bk_args, (void __user *)arg,
+				   sizeof(bk_args))) {
+			ret = -EFAULT;
+			break;
+		}
+
+		if (bk_args.bzimage_size == 0 ||
+		    bk_args.bzimage_size > PHANTOM_MAX_BZIMAGE_SIZE) {
+			ret = -EINVAL;
+			break;
+		}
+
+		/* Resolve target CPU */
+		if (bk_args.cpu == 0) {
+			target_cpu = cpumask_first(pdev->vmx_cpumask);
+		} else if (cpumask_test_cpu((int)bk_args.cpu,
+					    pdev->vmx_cpumask)) {
+			target_cpu = (int)bk_args.cpu;
+		} else {
+			target_cpu = cpumask_first(pdev->vmx_cpumask);
+		}
+
+		if (target_cpu < 0) {
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+		if (!state->vcpu_thread) {
+			ret = -ENXIO;
+			break;
+		}
+
+		buf = vmalloc(bk_args.bzimage_size);
+		if (!buf) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		if (copy_from_user(buf,
+				   (void __user *)(uintptr_t)bk_args.bzimage_uaddr,
+				   (size_t)bk_args.bzimage_size)) {
+			vfree(buf);
+			ret = -EFAULT;
+			break;
+		}
+
+		/* Free any existing Class B EPT */
+		if (state->class_b)
+			phantom_ept_free_class_b(state);
+
+		state->class_b     = true;
+		state->guest_mem_mb = bk_args.guest_mem_mb ? bk_args.guest_mem_mb : 256;
+
+		/* Step 2: Allocate 256MB EPT */
+		ret = phantom_ept_alloc_class_b(state);
+		if (ret) {
+			vfree(buf);
+			state->class_b = false;
+			break;
+		}
+
+		/* Step 3: Load kernel image + build boot structures */
+		ret = phantom_load_kernel_image(state, buf,
+						(size_t)bk_args.bzimage_size);
+		vfree(buf);
+		if (ret) {
+			phantom_ept_free_class_b(state);
+			state->class_b = false;
+			break;
+		}
+
+		/* Step 4: Configure MSR bitmap for Class B exits */
+		if (state->msr_bitmap)
+			phantom_msr_bitmap_setup_class_b(
+				page_address(state->msr_bitmap));
+
+		/* Step 5: Initialise MSR shadow state */
+		phantom_msr_state_init(state);
+
+		/* Step 6: Write VMCS guest-state (must run on vCPU thread) */
+		init_completion(&state->vcpu_run_done);
+		state->vcpu_run_request = 7;
+		smp_store_release(&state->vcpu_work_ready, true);
+		wait_for_completion(&state->vcpu_run_done);
+		ret = state->vcpu_run_result;
+
+		/* Bind fd to this CPU for subsequent ioctls */
+		if (!ret)
+			fctx->bound_cpu = target_cpu;
+
+		break;
+	}
 
 	default:
 		ret = -ENOTTY;

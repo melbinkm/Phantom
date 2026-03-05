@@ -108,6 +108,7 @@
 #define VMCS_CTRL_IO_BITMAP_A		0x2000
 #define VMCS_CTRL_IO_BITMAP_B		0x2002
 #define VMCS_CTRL_MSR_BITMAP		0x2004
+#define VMCS_CTRL_TSC_OFFSET		0x2010
 #define VMCS_CTRL_EPT_POINTER		0x201A
 #define VMCS_CTRL_VMCS_LINK_PTR		0x2800
 
@@ -244,6 +245,10 @@
 #define VMX_EXIT_EXTERNAL_INT		1
 #define VMX_EXIT_TRIPLE_FAULT		2
 #define VMX_EXIT_CPUID			10
+#define VMX_EXIT_CR_ACCESS		28
+#define VMX_EXIT_IO_INSTR		30
+#define VMX_EXIT_MSR_READ		31
+#define VMX_EXIT_MSR_WRITE		32
 #define VMX_EXIT_VMCALL			18
 #define VMX_EXIT_EPT_VIOLATION		48
 #define VMX_EXIT_EPT_MISCONFIG		49
@@ -701,6 +706,64 @@ struct phantom_vmx_cpu_state {
 	 * PIN_BASED_VMX_PREEMPTION_TIMER in the pin-based controls.
 	 */
 	u32			  preemption_timer_value;
+
+	/*
+	 * Task 3.1: Class B (Linux kernel) mode fields.
+	 *
+	 * class_b:            True when this vCPU runs a Linux guest kernel.
+	 *
+	 * snapshot_tsc:       TSC value at snapshot creation time.
+	 *                     Used to compute TSC_OFFSET for the VMCS so the
+	 *                     guest sees a monotonically increasing TSC from 0.
+	 *
+	 * guest_mem_mb:       Guest physical memory in MB.
+	 *                     16 for Class A, 256 for Class B.
+	 *
+	 * kernel_entry_gpa:   GPA of the kernel entry point (for Class B boot).
+	 *
+	 * MSR shadows — emulated in phantom_handle_msr_read/write():
+	 *   msr_apicbase:     IA32_APICBASE shadow (0xFEE00900).
+	 *   msr_misc_enable:  IA32_MISC_ENABLE shadow (0x850089).
+	 *   msr_mtrr_def_type: IA32_MTRR_DEF_TYPE shadow (0xC06).
+	 *   msr_star/lstar/cstar/sfmask: syscall MSR shadows.
+	 *   msr_kernel_gs_base: IA32_KERNEL_GS_BASE shadow.
+	 *   msr_tsc_aux:      IA32_TSC_AUX shadow.
+	 *   msr_mtrr_fix[11]: Fixed MTRR shadows (all default 0x0606...).
+	 */
+	bool			  class_b;
+	u64			  snapshot_tsc;
+	u32			  guest_mem_mb;
+	u64			  kernel_entry_gpa;
+	u64			  msr_apicbase;
+	u64			  msr_misc_enable;
+	u64			  msr_mtrr_def_type;
+	u64			  msr_star;
+	u64			  msr_lstar;
+	u64			  msr_cstar;
+	u64			  msr_sfmask;
+	u64			  msr_kernel_gs_base;
+	u64			  msr_tsc_aux;
+	u64			  msr_mtrr_fix[11];
+
+	/*
+	 * Task 3.1: Class B EPT backing pages.
+	 *
+	 * The 256MB Class B EPT uses separate page arrays managed by
+	 * phantom_ept_alloc_class_b() / phantom_ept_free_class_b() in
+	 * guest_boot.c.  They are distinct from state->ept which holds
+	 * the 16MB Class A EPT.
+	 *
+	 * class_b_ept_pml4:   EPT PML4 page (1 page).
+	 * class_b_ept_pdpt:   EPT PDPT page (1 page).
+	 * class_b_ept_pd:     EPT PD page (1 page, 128 active entries).
+	 * class_b_pt_pages:   kvmalloc_array of 128 EPT PT pages.
+	 * class_b_ram_pages:  kvmalloc_array of 65536 RAM backing pages.
+	 */
+	struct page		 *class_b_ept_pml4;
+	struct page		 *class_b_ept_pdpt;
+	struct page		 *class_b_ept_pd;
+	struct page		**class_b_pt_pages;    /* 128 PT pages  */
+	struct page		**class_b_ram_pages;   /* 65536 RAM pages */
 
 	/*
 	 * Task 2.4: Kernel-side guest heap tracker.

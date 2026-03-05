@@ -486,6 +486,44 @@ struct phantom_status {
 #define PHANTOM_MMAP_TOPA_BUF_B_LEGACY	0x20000UL
 
 /* ------------------------------------------------------------------
+ * Task 3.1: Class B (Linux kernel guest) boot ioctl
+ * ------------------------------------------------------------------ */
+
+/*
+ * Maximum bzImage size accepted by PHANTOM_IOCTL_BOOT_KERNEL.
+ */
+#define PHANTOM_MAX_BZIMAGE_SIZE	(64 * 1024 * 1024)  /* 64MB */
+
+/*
+ * struct phantom_boot_kernel_args — arguments for PHANTOM_IOCTL_BOOT_KERNEL.
+ *
+ * bzimage_uaddr: Userspace virtual address of the bzImage data.
+ * bzimage_size:  Size of the bzImage in bytes (must be <= PHANTOM_MAX_BZIMAGE_SIZE).
+ * cpu:           Phantom vCPU index to use (0 = first).
+ * guest_mem_mb:  Guest physical memory in MB (256 for Class B).
+ */
+struct phantom_boot_kernel_args {
+	__u64 bzimage_uaddr;   /* IN: userspace VA of bzImage data */
+	__u64 bzimage_size;    /* IN: size in bytes                */
+	__u32 cpu;             /* IN: which Phantom core to use    */
+	__u32 guest_mem_mb;    /* IN: 256 for Class B              */
+};
+
+/*
+ * PHANTOM_IOCTL_BOOT_KERNEL — load a Linux bzImage into a Class B guest.
+ *
+ * Copies the bzImage from userspace, allocates a 256MB EPT, loads the
+ * kernel image, populates boot_params, and configures the VMCS for
+ * 64-bit Linux boot.
+ *
+ * Returns 0 on success.
+ * Returns -EINVAL if cpu is invalid or bzimage_size is 0 or too large.
+ * Returns -ENOMEM if EPT or page allocation fails.
+ */
+#define PHANTOM_IOCTL_BOOT_KERNEL \
+	_IOW(PHANTOM_IOC_MAGIC, 22, struct phantom_boot_kernel_args)
+
+/* ------------------------------------------------------------------
  * Forward declaration — struct phantom_dev is defined in phantom.h
  * ------------------------------------------------------------------ */
 struct phantom_dev;

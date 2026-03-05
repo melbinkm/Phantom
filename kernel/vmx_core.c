@@ -55,6 +55,9 @@
 #include "debug.h"
 #include "memory.h"
 #include "pt_config.h"
+#include "cpuid_emul.h"
+#include "msr_emul.h"
+#include "guest_boot.h"
 
 /* Per-CPU VMX state — one entry per physical CPU */
 DEFINE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);
@@ -708,6 +711,9 @@ static int phantom_vmcs_setup_controls(struct phantom_vmx_cpu_state *state,
 	/* MSR bitmap: 4KB zero page — no MSR exits */
 	phantom_vmcs_write64(VMCS_CTRL_MSR_BITMAP,
 			     page_to_phys(state->msr_bitmap));
+
+	/* TSC offset: 0 initially; set to -(snapshot_tsc) at snapshot time */
+	phantom_vmcs_write64(VMCS_CTRL_TSC_OFFSET, 0);
 
 	/* EPT pointer */
 	phantom_vmcs_write64(VMCS_CTRL_EPT_POINTER, eptp);
@@ -1635,9 +1641,13 @@ static int phantom_vcpu_fn(void *data)
 	complete(&state->vcpu_init_done);
 
 	if (state->vcpu_init_result) {
-		/* Init failed — cannot proceed; thread exits cleanly. */
+		/* Init failed — cannot proceed; thread exits cleanly.
+		 * Signal vcpu_stopped so phantom_vcpu_thread_stop() does
+		 * not deadlock waiting on the completion.
+		 */
 		pr_err("phantom: CPU%d: vcpu init failed: %d\n",
 		       state->cpu, state->vcpu_init_result);
+		complete(&state->vcpu_stopped);
 		return state->vcpu_init_result;
 	}
 
@@ -1748,6 +1758,24 @@ static int phantom_vcpu_fn(void *data)
 		if (state->vcpu_run_request == 5) {
 			/* snapshot_restore on this CPU */
 			state->vcpu_run_result = phantom_snapshot_restore(state);
+			complete(&state->vcpu_run_done);
+			continue;
+		}
+
+		if (state->vcpu_run_request == 7) {
+			/*
+			 * Task 3.1: phantom_vmcs_setup_linux64 on this CPU.
+			 *
+			 * VMCS guest-state writes for Class B Linux boot must
+			 * run on the vCPU thread where the VMCS is current.
+			 * The ioctl handler has already called:
+			 *   phantom_ept_alloc_class_b()
+			 *   phantom_load_kernel_image()
+			 *   phantom_msr_bitmap_setup_class_b()
+			 *   phantom_msr_state_init()
+			 */
+			state->vcpu_run_result =
+				phantom_vmcs_setup_linux64(state);
 			complete(&state->vcpu_run_done);
 			continue;
 		}
@@ -2213,6 +2241,80 @@ void phantom_vcpu_thread_stop(struct phantom_vmx_cpu_state *state)
  *  -ve — error
  * ------------------------------------------------------------------ */
 
+/*
+ * phantom_handle_cr_access - Handle MOV to/from CR VM exit (exit reason 28).
+ *
+ * Emulates CR0/CR3/CR4 reads and writes from the guest.
+ * Required for Class B (Linux kernel) guests that set CRs during boot.
+ */
+static int phantom_handle_cr_access(struct phantom_vmx_cpu_state *state)
+{
+	unsigned long qual = phantom_vmcs_read64(VMCS_RO_EXIT_QUAL);
+	int cr   = qual & 0xf;          /* bits 3:0 = CR number */
+	int type = (qual >> 4) & 0x3;   /* bits 5:4: 0=write, 1=read */
+	int reg  = (qual >> 8) & 0xf;   /* bits 11:8: general register */
+	unsigned long val = 0;
+	u32 ilen = phantom_vmcs_read32(VMCS_RO_EXIT_INSTR_LEN);
+
+	/* Read source register value for CR writes */
+	if (type == 0) { /* MOV to CR */
+		switch (reg) {
+		case 0:  val = state->guest_regs.rax; break;
+		case 1:  val = state->guest_regs.rcx; break;
+		case 2:  val = state->guest_regs.rdx; break;
+		case 3:  val = state->guest_regs.rbx; break;
+		case 4:  val = phantom_vmcs_read64(VMCS_GUEST_RSP); break;
+		case 5:  val = state->guest_regs.rbp; break;
+		case 6:  val = state->guest_regs.rsi; break;
+		case 7:  val = state->guest_regs.rdi; break;
+		case 8:  val = state->guest_regs.r8;  break;
+		case 9:  val = state->guest_regs.r9;  break;
+		case 10: val = state->guest_regs.r10; break;
+		case 11: val = state->guest_regs.r11; break;
+		case 12: val = state->guest_regs.r12; break;
+		case 13: val = state->guest_regs.r13; break;
+		case 14: val = state->guest_regs.r14; break;
+		case 15: val = state->guest_regs.r15; break;
+		}
+		switch (cr) {
+		case 0: phantom_vmcs_write64(VMCS_GUEST_CR0, val); break;
+		case 3: phantom_vmcs_write64(VMCS_GUEST_CR3, val); break;
+		case 4: phantom_vmcs_write64(VMCS_GUEST_CR4, val); break;
+		default:
+			pr_warn_ratelimited("phantom: unhandled CR%d write\n", cr);
+		}
+	} else if (type == 1) { /* MOV from CR */
+		switch (cr) {
+		case 0: val = phantom_vmcs_read64(VMCS_GUEST_CR0); break;
+		case 3: val = phantom_vmcs_read64(VMCS_GUEST_CR3); break;
+		case 4: val = phantom_vmcs_read64(VMCS_GUEST_CR4); break;
+		default:
+			pr_warn_ratelimited("phantom: unhandled CR%d read\n", cr);
+		}
+		switch (reg) {
+		case 0:  state->guest_regs.rax = val; break;
+		case 1:  state->guest_regs.rcx = val; break;
+		case 2:  state->guest_regs.rdx = val; break;
+		case 3:  state->guest_regs.rbx = val; break;
+		case 4:  phantom_vmcs_write64(VMCS_GUEST_RSP, val); break;
+		case 5:  state->guest_regs.rbp = val; break;
+		case 6:  state->guest_regs.rsi = val; break;
+		case 7:  state->guest_regs.rdi = val; break;
+		case 8:  state->guest_regs.r8  = val; break;
+		case 9:  state->guest_regs.r9  = val; break;
+		case 10: state->guest_regs.r10 = val; break;
+		case 11: state->guest_regs.r11 = val; break;
+		case 12: state->guest_regs.r12 = val; break;
+		case 13: state->guest_regs.r13 = val; break;
+		case 14: state->guest_regs.r14 = val; break;
+		case 15: state->guest_regs.r15 = val; break;
+		}
+	}
+	phantom_vmcs_write64(VMCS_GUEST_RIP,
+			     phantom_vmcs_read64(VMCS_GUEST_RIP) + ilen);
+	return 0;
+}
+
 static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 {
 	u32 reason;
@@ -2445,25 +2547,26 @@ static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 		return 1;
 	}
 
-	case VMX_EXIT_CPUID: {
-		/*
-		 * Minimal CPUID emulation: return all-zeros.
-		 * The trivial guest does not use CPUID, but handle it
-		 * to avoid infinite exit loops.
-		 */
-		u64 rip;
-		u32 ilen;
+	case VMX_EXIT_CPUID:
+		return phantom_handle_cpuid(state);
 
-		state->guest_regs.rax = 0;
-		state->guest_regs.rbx = 0;
-		state->guest_regs.rcx = 0;
-		state->guest_regs.rdx = 0;
+	case VMX_EXIT_MSR_READ:
+		return phantom_handle_msr_read(state);
 
-		ilen = phantom_vmcs_read32(VMCS_RO_EXIT_INSTR_LEN);
-		rip  = phantom_vmcs_read64(VMCS_GUEST_RIP);
-		phantom_vmcs_write64(VMCS_GUEST_RIP, rip + ilen);
+	case VMX_EXIT_MSR_WRITE:
+		return phantom_handle_msr_write(state);
+
+	case VMX_EXIT_IO_INSTR: {
+		/* Swallow I/O port access — advance RIP */
+		u32 ilen = phantom_vmcs_read32(VMCS_RO_EXIT_INSTR_LEN);
+
+		phantom_vmcs_write64(VMCS_GUEST_RIP,
+				     phantom_vmcs_read64(VMCS_GUEST_RIP) + ilen);
 		return 0;
 	}
+
+	case VMX_EXIT_CR_ACCESS:
+		return phantom_handle_cr_access(state);
 
 	case VMX_EXIT_EPT_VIOLATION: {
 		u64 gpa = phantom_vmcs_read64(VMCS_RO_GUEST_PHYS_ADDR);

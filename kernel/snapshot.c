@@ -216,6 +216,17 @@ int phantom_snapshot_create(struct phantom_vmx_cpu_state *state)
 
 	snap->valid = true;
 
+	/*
+	 * TSC offset for Class B guests: capture the host TSC at snapshot
+	 * time and program VMCS_CTRL_TSC_OFFSET = -(snapshot_tsc) so the
+	 * guest sees a monotonically increasing TSC starting near 0.
+	 * On each restore, this offset is re-written to maintain consistency.
+	 */
+	if (state->class_b) {
+		state->snapshot_tsc = rdtsc_ordered();
+		phantom_vmcs_write64(VMCS_CTRL_TSC_OFFSET,
+				     -(u64)state->snapshot_tsc);
+	}
 
 	return 0;
 }
@@ -466,6 +477,15 @@ int phantom_snapshot_restore(struct phantom_vmx_cpu_state *state)
 	 * syscalls handled by the #UD intercept.
 	 */
 	state->guest_heap_ptr = PHANTOM_GUEST_HEAP_BASE;
+
+	/*
+	 * For Class B guests, re-apply the TSC offset so the guest sees
+	 * a monotonically increasing TSC starting from the snapshot point.
+	 * snapshot_tsc was captured by phantom_snapshot_create().
+	 */
+	if (state->class_b)
+		phantom_vmcs_write64(VMCS_CTRL_TSC_OFFSET,
+				     -(u64)state->snapshot_tsc);
 
 	return 0;
 	/* Caller does VMRESUME */

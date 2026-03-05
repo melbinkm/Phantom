@@ -16,7 +16,10 @@ phantom-objs := \
 	debug.o \
 	hypercall.o \
 	nmi.o \
-	pt_config.o
+	pt_config.o \
+	cpuid_emul.o \
+	msr_emul.o \
+	guest_boot.o
 
 # Enable debug assertions and trace_printk during development.
 # Remove -DPHANTOM_DEBUG for production builds.
