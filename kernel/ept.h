@@ -86,7 +86,14 @@
 
 /* Guest page layout (GPAs that must be backed by specific pages) */
 #define GUEST_CODE_GPA			0x00010000ULL
-#define GUEST_STACK_GPA			0x00011000ULL
+/*
+ * Stack GPA: top page of a ~640KB stack region (0x5FF000–0x5FFFF0).
+ * RSP is initialised to GUEST_STACK_GPA + 0xFF0 = 0x5FFFF0.
+ * Stack grows down; CoW handles each new page as it is touched.
+ * Moved from 0x11000 (4KB) after task-2.4 diagnosis: 4KB stack caused
+ * non-deterministic EPT null-guard crashes in deep libxml2 call chains.
+ */
+#define GUEST_STACK_GPA			0x005FF000ULL
 #define GUEST_DATA_GPA			0x00012000ULL
 #define GUEST_PML4_GPA			0x00013000ULL
 #define GUEST_PDPT_GPA			0x00014000ULL

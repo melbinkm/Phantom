@@ -2531,9 +2531,59 @@ static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 				     "qual=0x%llx type=%s\n",
 				     state->cpu, gpa, rip, qual, type_str);
 #endif
-			pr_err("phantom: CPU%d: EPT VIOLATION GPA=0x%llx "
-			       "RIP=0x%llx qual=0x%llx type=%s\n",
-			       state->cpu, gpa, rip, qual, type_str);
+			{
+				u64 rsp = phantom_vmcs_read64(VMCS_GUEST_RSP);
+
+				pr_err("phantom: CPU%d: EPT VIOLATION GPA=0x%llx "
+				       "RIP=0x%llx RSP=0x%llx qual=0x%llx type=%s\n",
+				       state->cpu, gpa, rip, rsp, qual, type_str);
+				pr_err("phantom: CPU%d:   RAX=0x%llx RBX=0x%llx "
+				       "RCX=0x%llx RDX=0x%llx\n",
+				       state->cpu,
+				       state->guest_regs.rax,
+				       state->guest_regs.rbx,
+				       state->guest_regs.rcx,
+				       state->guest_regs.rdx);
+				pr_err("phantom: CPU%d:   RSI=0x%llx RDI=0x%llx "
+				       "RBP=0x%llx R8=0x%llx\n",
+				       state->cpu,
+				       state->guest_regs.rsi,
+				       state->guest_regs.rdi,
+				       state->guest_regs.rbp,
+				       state->guest_regs.r8);
+
+				/* Diagnostic: read key guest memory at crash */
+				{
+					u64 *hp = phantom_gpa_to_kva(state,
+								     0x5540a0ULL);
+					u64 *xm = phantom_gpa_to_kva(state,
+								     0x554428ULL);
+					u64 *ra = phantom_gpa_to_kva(state,
+								     rsp + 24);
+
+					pr_err("phantom: CPU%d:   _heap_ptr=%s "
+					       "xmlMalloc=%s [RSP+24]=%s\n",
+					       state->cpu,
+					       hp ? ({
+						       static char _hb[20];
+						       snprintf(_hb, 20,
+							"0x%llx", *hp);
+						       _hb;
+					       }) : "?",
+					       xm ? ({
+						       static char _xb[20];
+						       snprintf(_xb, 20,
+							"0x%llx", *xm);
+						       _xb;
+					       }) : "?",
+					       ra ? ({
+						       static char _rb[20];
+						       snprintf(_rb, 20,
+							"0x%llx", *ra);
+						       _rb;
+					       }) : "?");
+				}
+			}
 		}
 
 		state->run_result = PHANTOM_RESULT_CRASH;
