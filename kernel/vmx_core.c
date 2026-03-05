@@ -645,9 +645,11 @@ static int phantom_vmcs_setup_controls(struct phantom_vmx_cpu_state *state,
 		phantom_vmcs_write32(VMCS_CTRL_PROCBASED, proc);
 	}
 
-	/* Secondary proc-based: EPT enable */
-	proc2 = phantom_adjust_controls(SECONDARY_EXEC_ENABLE_EPT,
-					MSR_IA32_VMX_PROCBASED_CTLS2);
+	/* Secondary proc-based: EPT + RDTSCP (Class B needs RDTSCP for tsc clocksource) */
+	proc2 = phantom_adjust_controls(
+		SECONDARY_EXEC_ENABLE_EPT |
+		(state->class_b ? SECONDARY_EXEC_ENABLE_RDTSCP : 0),
+		MSR_IA32_VMX_PROCBASED_CTLS2);
 	phantom_vmcs_write32(VMCS_CTRL_PROCBASED2, proc2);
 
 	/* VM-exit controls: host 64-bit + PAT + EFER.
