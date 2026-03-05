@@ -46,10 +46,9 @@ CONFIG_SHUFFLE_PAGE_ALLOCATOR=n
 CONFIG_RANDOM_TRUST_CPU=n
 CONFIG_RANDOM_TRUST_BOOTLOADER=n
 
-# KASAN — kernel address sanitizer for bug detection
-CONFIG_KASAN=y
-CONFIG_KASAN_INLINE=y
-CONFIG_KASAN_GENERIC=y
+# KASAN — disabled: shadow memory init causes 8+ min boot delay in Phantom
+# Enable only when diagnosing kernel memory bugs, not for boot testing.
+CONFIG_KASAN=n
 
 # Printk / early boot output
 CONFIG_PRINTK=y

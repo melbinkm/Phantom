@@ -42,6 +42,7 @@
 #include <asm/msr-index.h>
 #include <asm/processor-flags.h>
 #include <asm/special_insns.h>
+#include <linux/vmalloc.h>
 
 #include "vmx_core.h"
 #include "ept.h"
@@ -60,12 +61,15 @@
 #define BZIMAGE_OFF_MAGIC	0x202	/* u32: "HdrS" */
 #define BZIMAGE_OFF_CODE32_START 0x214	/* u32: protected-mode code start */
 #define BZIMAGE_OFF_PREF_ADDR	0x258	/* u64: preferred load address */
+#define BZIMAGE_OFF_INIT_SIZE	0x260	/* u32: init_size (kernel init area) */
 
-/* boot_params offsets (struct boot_params, include/uapi/asm/bootparam.h) */
-#define BOOT_PARAMS_OFF_SETUP_SECTS  0x1F1  /* u8 */
-#define BOOT_PARAMS_OFF_BOOT_FLAG    0x1FE  /* u16: 0xAA55 */
-#define BOOT_PARAMS_OFF_HEADER	     0x202  /* u32: "HdrS" */
-#define BOOT_PARAMS_OFF_CMDLINE_PTR  0x228  /* u32: GPA of cmdline */
+/* boot_params offsets (struct boot_params, include/uapi/asm/bootparam.h).
+ * setup_header hdr is at offset 0x1F1 within boot_params, and maps
+ * 1:1 to the bzImage setup header (bytes 0x1F1 onward in bzImage).
+ */
+#define BOOT_PARAMS_OFF_SETUP_HDR    0x1F1  /* start of setup_header in boot_params */
+#define BOOT_PARAMS_OFF_SETUP_HDR_SZ 0x80  /* sizeof(setup_header) ~123 bytes; 0x80 covers all fields */
+#define BOOT_PARAMS_OFF_CMDLINE_PTR  0x228  /* u32: GPA of cmdline (in setup_header) */
 #define BOOT_PARAMS_OFF_E820_COUNT   0x1E8  /* u8:  number of E820 entries */
 #define BOOT_PARAMS_OFF_E820_TABLE   0x2D0  /* array of e820_entry structs */
 
@@ -153,6 +157,9 @@ int phantom_parse_bzimage(const void *data, size_t size,
 	if (info->pref_address == 0 ||
 	    info->pref_address < PHANTOM_KERNEL_LOAD_GPA)
 		info->pref_address = PHANTOM_KERNEL_LOAD_GPA;
+
+	/* init_size: kernel init area size (needed by startup_64 for relocation) */
+	memcpy(&info->init_size, hdr + BZIMAGE_OFF_INIT_SIZE, sizeof(info->init_size));
 
 	return 0;
 }
@@ -283,6 +290,21 @@ int phantom_ept_alloc_class_b(struct phantom_vmx_cpu_state *state)
 		}
 	}
 
+	/*
+	 * vmap all 65536 RAM pages as a contiguous PAGE_KERNEL window.
+	 * This bypasses any read-only direct-map PTEs that STRICT_MODULE_RWX
+	 * may have left on recycled module pages, giving us a guaranteed
+	 * writable mapping that class_b_gpa_to_kva() uses for all writes.
+	 */
+	state->class_b_vmap_base = vmap(state->class_b_ram_pages,
+					PHANTOM_CLASS_B_RAM_PAGES,
+					VM_MAP, PAGE_KERNEL);
+	if (!state->class_b_vmap_base) {
+		ret = -ENOMEM;
+		i = PHANTOM_CLASS_B_RAM_PAGES;
+		goto err_ram_pages;
+	}
+
 	/* ----------------------------------------------------------
 	 * Build EPT entries now that all allocations succeeded.
 	 * ---------------------------------------------------------- */
@@ -318,9 +340,74 @@ int phantom_ept_alloc_class_b(struct phantom_vmx_cpu_state *state)
 	state->ept.eptp = page_to_phys(state->class_b_ept_pml4) |
 			  EPTP_MEMTYPE_WB | EPTP_PAGEWALK_4;
 
-	pr_info("phantom: Class B EPT ready: 256MB RAM, EPTP=0x%llx\n",
+	/* ----------------------------------------------------------
+	 * Map the Local APIC MMIO page at GPA 0xFEE00000.
+	 *
+	 * 0xFEE00000 is at:
+	 *   PML4[0] → PDPT[3] → PD[0x1F7=503] → PT[0x1EE=494]
+	 *
+	 * The 256MB RAM EPT only wires PDPT[0].  We add a separate
+	 * PDPT[3] subtree with a single PT entry for the LAPIC page.
+	 * Using UC memory type (bits[5:3]=0) for MMIO correctness.
+	 * ---------------------------------------------------------- */
+	state->class_b_lapic_page = alloc_pages_node(node,
+					    GFP_KERNEL | __GFP_ZERO, 0);
+	if (!state->class_b_lapic_page) {
+		ret = -ENOMEM;
+		goto err_lapic_page;
+	}
+
+	state->class_b_lapic_pd = alloc_pages_node(node,
+					    GFP_KERNEL | __GFP_ZERO, 0);
+	if (!state->class_b_lapic_pd) {
+		ret = -ENOMEM;
+		goto err_lapic_pd;
+	}
+
+	state->class_b_lapic_pt = alloc_pages_node(node,
+					    GFP_KERNEL | __GFP_ZERO, 0);
+	if (!state->class_b_lapic_pt) {
+		ret = -ENOMEM;
+		goto err_lapic_pt;
+	}
+
+	{
+		u64 *lapic_pd_va, *lapic_pt_va;
+		/* PD index for 0xFEE00000: (0xFEE00000 >> 21) & 0x1FF = 503 */
+		/* PT index for 0xFEE00000: (0xFEE00000 >> 12) & 0x1FF = 494 */
+		#define LAPIC_GPA_PDPT_IDX  3U
+		#define LAPIC_GPA_PD_IDX  503U
+		#define LAPIC_GPA_PT_IDX  0U
+
+		lapic_pd_va = (u64 *)page_address(state->class_b_lapic_pd);
+		lapic_pt_va = (u64 *)page_address(state->class_b_lapic_pt);
+
+		/* PDPT[3] → LAPIC PD */
+		pdpt_va[LAPIC_GPA_PDPT_IDX] =
+			page_to_phys(state->class_b_lapic_pd) | EPT_PERM_RWX;
+		/* LAPIC PD[503] → LAPIC PT */
+		lapic_pd_va[LAPIC_GPA_PD_IDX] =
+			page_to_phys(state->class_b_lapic_pt) | EPT_PERM_RWX;
+		/* LAPIC PT[494] → LAPIC page (UC, RW, no exec needed) */
+		lapic_pt_va[LAPIC_GPA_PT_IDX] =
+			page_to_phys(state->class_b_lapic_page) |
+			EPT_PTE_READ | EPT_PTE_WRITE | EPT_PTE_MEMTYPE_UC;
+	}
+
+	pr_info("phantom: Class B EPT ready: 256MB RAM + LAPIC @ 0xfee00000, EPTP=0x%llx\n",
 		state->ept.eptp);
 	return 0;
+
+err_lapic_pt:
+	__free_page(state->class_b_lapic_pd);
+	state->class_b_lapic_pd = NULL;
+err_lapic_pd:
+	__free_page(state->class_b_lapic_page);
+	state->class_b_lapic_page = NULL;
+err_lapic_page:
+	vunmap(state->class_b_vmap_base);
+	state->class_b_vmap_base = NULL;
+	i = PHANTOM_CLASS_B_RAM_PAGES;
 
 err_ram_pages:
 	for (i = i - 1; i >= 0; i--) {
@@ -366,6 +453,12 @@ void phantom_ept_free_class_b(struct phantom_vmx_cpu_state *state)
 {
 	int i;
 
+	/* Unmap the vmap window before freeing the backing pages */
+	if (state->class_b_vmap_base) {
+		vunmap(state->class_b_vmap_base);
+		state->class_b_vmap_base = NULL;
+	}
+
 	/* Free 65536 backing RAM pages */
 	if (state->class_b_ram_pages) {
 		for (i = PHANTOM_CLASS_B_RAM_PAGES - 1; i >= 0; i--) {
@@ -403,6 +496,20 @@ void phantom_ept_free_class_b(struct phantom_vmx_cpu_state *state)
 	if (state->class_b_ept_pml4) {
 		__free_page(state->class_b_ept_pml4);
 		state->class_b_ept_pml4 = NULL;
+	}
+
+	/* Free LAPIC MMIO EPT pages */
+	if (state->class_b_lapic_pt) {
+		__free_page(state->class_b_lapic_pt);
+		state->class_b_lapic_pt = NULL;
+	}
+	if (state->class_b_lapic_pd) {
+		__free_page(state->class_b_lapic_pd);
+		state->class_b_lapic_pd = NULL;
+	}
+	if (state->class_b_lapic_page) {
+		__free_page(state->class_b_lapic_page);
+		state->class_b_lapic_page = NULL;
 	}
 
 	state->ept.eptp = 0;
@@ -495,10 +602,12 @@ static void *class_b_gpa_to_kva(struct phantom_vmx_cpu_state *state, u64 gpa)
 
 	if (idx >= PHANTOM_CLASS_B_RAM_PAGES)
 		return NULL;
+	if (!state->class_b_vmap_base)
+		return NULL;
 	if (!state->class_b_ram_pages || !state->class_b_ram_pages[idx])
 		return NULL;
 
-	return (u8 *)page_address(state->class_b_ram_pages[idx]) + page_off;
+	return (u8 *)state->class_b_vmap_base + (u64)idx * PAGE_SIZE + page_off;
 }
 
 /**
@@ -590,14 +699,15 @@ int phantom_load_kernel_image(struct phantom_vmx_cpu_state *state,
 	 *   PT[i][j]: GVA = (i*512+j)*4096 → GPA same (identity)
 	 *
 	 * Guest PTE HPA = GPA because Class B uses an identity EPT
-	 * (GPA[n] maps to a single backing page at HPA = EPT maps to).
-	 * For the guest PT entries, we need the HPA of each page.
-	 * Since class_b_ram_pages[] gives us the struct page, use
-	 * page_to_phys() to get the real HPA.
+	 * Identity mapping: GVA = GPA for the full 256MB range.
 	 *
-	 * NOTE: This is simpler than the Class A approach of pointing
-	 * GPA identically to HPA.  Here the guest PT entries point to
-	 * the same HPA that the EPT maps each GPA to.
+	 * Two-stage translation:
+	 *   - Guest PT entries map GVA → GPA (identity: GPA = GVA).
+	 *   - EPT maps GPA → HPA (built by phantom_ept_alloc_class_b).
+	 *
+	 * Guest PT entries must contain GPAs (not HPAs).  The CPU hardware
+	 * walks the guest PT during address translation to get the GPA, then
+	 * VMX uses the EPT to translate GPA → HPA.
 	 * ---------------------------------------------------------- */
 	pml4_va = class_b_gpa_to_kva(state, PHANTOM_PML4_GPA);
 	pdpt_va = class_b_gpa_to_kva(state, PHANTOM_PDPT_GPA);
@@ -609,35 +719,22 @@ int phantom_load_kernel_image(struct phantom_vmx_cpu_state *state,
 	memset(pdpt_va, 0, PAGE_SIZE);
 	memset(pd_va,   0, PAGE_SIZE);
 
-	/* PML4[0] → PDPT */
-	{
-		unsigned int pdpt_idx = (unsigned int)(PHANTOM_PDPT_GPA >> PAGE_SHIFT);
-		u64 pdpt_hpa = page_to_phys(state->class_b_ram_pages[pdpt_idx]);
+	/*
+	 * Guest PML4[0] → PDPT_GPA: GVA[0] maps via PDPT at PHANTOM_PDPT_GPA.
+	 * These entries contain GPAs — the CPU hardware walks the guest PT
+	 * to get the GPA, then VMX/EPT translates GPA → HPA.
+	 * The EPT (built in phantom_ept_alloc_class_b) handles GPA → HPA.
+	 */
+	pml4_va[0] = PHANTOM_PDPT_GPA | GPTE_PRESENT | GPTE_RW;
 
-		pml4_va[0] = pdpt_hpa | GPTE_PRESENT | GPTE_RW;
-	}
+	/* PDPT[0] → PD_GPA */
+	pdpt_va[0] = PHANTOM_PD_GPA | GPTE_PRESENT | GPTE_RW;
 
-	/* PDPT[0] → PD */
-	{
-		unsigned int pd_idx = (unsigned int)(PHANTOM_PD_GPA >> PAGE_SHIFT);
-		u64 pd_hpa = page_to_phys(state->class_b_ram_pages[pd_idx]);
-
-		pdpt_va[0] = pd_hpa | GPTE_PRESENT | GPTE_RW;
-	}
-
-	/* PD[0..127] → PT[i] and PT[i][j] → identity-mapped RAM pages */
+	/* PD[0..127] → PT[i] at PT_BASE_GPA + i*PAGE_SIZE */
 	for (i = 0; i < PHANTOM_CLASS_B_NR_PT_PAGES; i++) {
 		u64 pt_gpa = PHANTOM_PT_BASE_GPA + (u64)i * PAGE_SIZE;
-		unsigned int pt_page_idx = (unsigned int)(pt_gpa >> PAGE_SHIFT);
-		u64 pt_hpa;
 
-		if (pt_page_idx >= PHANTOM_CLASS_B_RAM_PAGES)
-			break;
-		if (!state->class_b_ram_pages[pt_page_idx])
-			break;
-
-		pt_hpa = page_to_phys(state->class_b_ram_pages[pt_page_idx]);
-		pd_va[i] = pt_hpa | GPTE_PRESENT | GPTE_RW;
+		pd_va[i] = pt_gpa | GPTE_PRESENT | GPTE_RW;
 
 		pt_va = class_b_gpa_to_kva(state, pt_gpa);
 		if (!pt_va)
@@ -651,17 +748,9 @@ int phantom_load_kernel_image(struct phantom_vmx_cpu_state *state,
 
 			if (ram_idx >= PHANTOM_CLASS_B_RAM_PAGES)
 				break;
-			if (!state->class_b_ram_pages[ram_idx])
-				break;
 
-			/*
-			 * Guest PT entries point to HPA of each backing page.
-			 * GVA = GPA = ram_idx * PAGE_SIZE (identity map).
-			 */
-			pt_va[j] = page_to_phys(
-					state->class_b_ram_pages[ram_idx]) |
-				   GPTE_PRESENT | GPTE_RW;
-			(void)gpa; /* GVA = GPA: documented, not used */
+			/* Identity map: GVA = GPA = ram_idx * PAGE_SIZE */
+			pt_va[j] = gpa | GPTE_PRESENT | GPTE_RW;
 		}
 	}
 
@@ -677,18 +766,22 @@ int phantom_load_kernel_image(struct phantom_vmx_cpu_state *state,
 
 	memset(boot_params, 0, PAGE_SIZE);
 
-	/* boot_flag: 0xAA55 */
-	*(__le16 *)(boot_params + BOOT_PARAMS_OFF_BOOT_FLAG) =
-		cpu_to_le16(0xAA55U);
+	/*
+	 * Copy the bzImage setup header (bytes 0x1F1..0x28F) into boot_params
+	 * at the same offsets.  The setup_header struct in boot_params starts
+	 * at offset 0x1F1 with an identical layout to the bzImage header.
+	 * This copies all critical fields: kernel_alignment (0x230),
+	 * pref_address (0x258), init_size (0x260), etc.
+	 *
+	 * startup_64 reads boot_params+0x230 (kernel_alignment) to align rbp.
+	 * With kernel_alignment=0 the calc overflows -> triple fault at +0x5a.
+	 */
+	if (bzimage_size > BOOT_PARAMS_OFF_SETUP_HDR + BOOT_PARAMS_OFF_SETUP_HDR_SZ)
+		memcpy(boot_params + BOOT_PARAMS_OFF_SETUP_HDR,
+		       (const u8 *)bzimage + BOOT_PARAMS_OFF_SETUP_HDR,
+		       BOOT_PARAMS_OFF_SETUP_HDR_SZ);
 
-	/* setup header magic */
-	*(__le32 *)(boot_params + BOOT_PARAMS_OFF_HEADER) =
-		cpu_to_le32(BZIMAGE_MAGIC);
-
-	/* setup_sects */
-	boot_params[BOOT_PARAMS_OFF_SETUP_SECTS] = (u8)info.setup_sects;
-
-	/* cmd_line_ptr: GPA of the command line string */
+	/* Override cmd_line_ptr with our GPA (bzImage has 0 there) */
 	*(__le32 *)(boot_params + BOOT_PARAMS_OFF_CMDLINE_PTR) =
 		cpu_to_le32((u32)PHANTOM_CMDLINE_GPA);
 
@@ -723,10 +816,11 @@ int phantom_load_kernel_image(struct phantom_vmx_cpu_state *state,
 		return -EFAULT;
 
 	strncpy(cl,
-		"console=hvc0 noapic noapictimer nokaslr "
-		"nosmp lpj=4000000 panic=1",
-		127);
-	((char *)cl)[127] = '\0';
+		"earlyprintk=serial,0x3f8,115200 "
+		"noapic noapictimer nokaslr "
+		"nosmp lpj=4000000 panic=-1",
+		255);
+	((char *)cl)[255] = '\0';
 
 	/* Step 8: Record kernel entry GPA for VMCS setup */
 	state->kernel_entry_gpa = load_gpa;
@@ -791,12 +885,29 @@ int phantom_vmcs_setup_linux64(struct phantom_vmx_cpu_state *state)
 	cr4 = (cr4 | cr4_fixed0) & cr4_fixed1;
 	phantom_vmcs_write64(VMCS_GUEST_CR4, cr4);
 
+	/*
+	 * CR4 guest/host mask: intercept writes to VMXE (bit 13).
+	 *
+	 * In VMX non-root mode the guest cannot clear VMXE without causing
+	 * a #GP (which, with no IDT, double-faults → triple-faults).
+	 * Setting CR4_MASK bit 13 causes any MOV to CR4 that touches VMXE
+	 * to VM-exit (reason 28), letting phantom_handle_cr_access() force
+	 * VMXE back on.
+	 *
+	 * CR4_READ_SHADOW presents the guest-visible CR4 without VMXE, so
+	 * the guest's own CR4 reads (e.g. rdcr4 in asm) return the value
+	 * it expects.
+	 */
+	phantom_vmcs_write64(VMCS_CTRL_CR4_MASK,        X86_CR4_VMXE);
+	phantom_vmcs_write64(VMCS_CTRL_CR4_READ_SHADOW, cr4 & ~X86_CR4_VMXE);
+
 	/* ---- EFER: LME + LMA + SCE (Linux needs syscall) ---- */
 	phantom_vmcs_write64(VMCS_GUEST_IA32_EFER,
 			     EFER_LME | EFER_LMA | EFER_SCE);
 
 	/* ---- RIP, RSP, RSI, RFLAGS ---- */
-	phantom_vmcs_write64(VMCS_GUEST_RIP,    state->kernel_entry_gpa);
+	/* startup_64 is at +0x200 from the bzImage PM kernel load address */
+	phantom_vmcs_write64(VMCS_GUEST_RIP,    state->kernel_entry_gpa + 0x200ULL);
 	phantom_vmcs_write64(VMCS_GUEST_RSP,    PHANTOM_GUEST_STACK_TOP);
 	/* RSI = boot_params GPA per Linux boot protocol */
 	state->guest_regs.rsi = PHANTOM_BOOT_PARAMS_GPA;
@@ -890,7 +1001,7 @@ int phantom_vmcs_setup_linux64(struct phantom_vmx_cpu_state *state)
 
 	pr_info("phantom: VMCS Class B guest state configured: "
 		"RIP=0x%llx RSP=0x%llx CR3=0x%llx\n",
-		state->kernel_entry_gpa,
+		state->kernel_entry_gpa + 0x200ULL,
 		(u64)PHANTOM_GUEST_STACK_TOP,
 		(u64)PHANTOM_PML4_GPA);
 

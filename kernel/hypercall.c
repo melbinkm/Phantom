@@ -257,6 +257,9 @@ static int handle_acquire(struct phantom_vmx_cpu_state *state)
 		}
 		state->snap_acquired = true;
 		state->snap_taken = true;
+		/* Signal Class B guest boot success to host dmesg for test detection. */
+		if (state->class_b)
+			pr_info("phantom-harness: init\n");
 	}
 
 	/*

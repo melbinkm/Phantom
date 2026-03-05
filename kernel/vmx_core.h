@@ -253,6 +253,7 @@
 #define VMX_EXIT_EPT_VIOLATION		48
 #define VMX_EXIT_EPT_MISCONFIG		49
 #define VMX_EXIT_PREEMPT_TIMER		52
+#define VMX_EXIT_XSETBV			55
 
 /* ------------------------------------------------------------------
  * VMCS control field bit definitions
@@ -758,12 +759,30 @@ struct phantom_vmx_cpu_state {
 	 * class_b_ept_pd:     EPT PD page (1 page, 128 active entries).
 	 * class_b_pt_pages:   kvmalloc_array of 128 EPT PT pages.
 	 * class_b_ram_pages:  kvmalloc_array of 65536 RAM backing pages.
+	 * class_b_vmap_base:  writable vmap() window over all 65536 RAM pages.
 	 */
 	struct page		 *class_b_ept_pml4;
 	struct page		 *class_b_ept_pdpt;
 	struct page		 *class_b_ept_pd;
 	struct page		**class_b_pt_pages;    /* 128 PT pages  */
 	struct page		**class_b_ram_pages;   /* 65536 RAM pages */
+	void			 *class_b_vmap_base;  /* writable vmap window over all RAM pages */
+
+	/*
+	 * Task 3.1: LAPIC MMIO EPT mapping.
+	 *
+	 * The Linux guest accesses the Local APIC at GPA 0xFEE00000.
+	 * This GPA is in PDPT[3] (3-4GB range), outside the 256MB RAM window.
+	 * We allocate one zeroed page for LAPIC MMIO and wire a separate
+	 * PDPT[3] subtree for it so EPT violations at 0xFEE00000 don't abort boot.
+	 *
+	 * class_b_lapic_page:    backing page for LAPIC MMIO (4KB, zeroed).
+	 * class_b_lapic_pd:      EPT PD page for PDPT[3] → covers 3-4GB.
+	 * class_b_lapic_pt:      EPT PT page covering the 2MB slot with LAPIC.
+	 */
+	struct page		 *class_b_lapic_page;  /* LAPIC MMIO backing page */
+	struct page		 *class_b_lapic_pd;    /* EPT PD for PDPT[3] */
+	struct page		 *class_b_lapic_pt;    /* EPT PT for LAPIC 2MB slot */
 
 	/*
 	 * Task 2.4: Kernel-side guest heap tracker.
@@ -781,6 +800,19 @@ struct phantom_vmx_cpu_state {
 	 * Range: [PHANTOM_GUEST_HEAP_BASE, PHANTOM_GUEST_HEAP_LIMIT).
 	 */
 	u64			  guest_heap_ptr;
+	/*
+	 * Task 3.1: Guest XCR0 — set by XSETBV VM-exit emulation.
+	 * Applied at VM-entry, host XCR0 (xcr0_supported) restored at VM-exit.
+	 * 0 = guest has not issued XSETBV yet.
+	 */
+	u64			  guest_xcr0;
+
+	/*
+	 * Task 3.1: Serial console line buffer for guest diagnostics.
+	 * Accumulates COM1 (0x3F8) writes until newline, then logs to host dmesg.
+	 */
+	char			  serial_buf[256];
+	int			  serial_buf_len;
 };
 
 DECLARE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);

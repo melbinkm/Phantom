@@ -84,14 +84,28 @@ else
 	fail "phantom_handle_cr_access missing from vmx_core.c"
 fi
 
-# Test 7: Guest kernel boot (requires pre-built bzImage)
-echo "Test 7: Linux kernel boot to harness init"
+# Test 7: Full Linux boot to harness init
+echo "Test 7: Linux kernel boots to phantom-harness init"
 if [ ! -f "$BZIMAGE" ]; then
-	skip "bzImage not at $BZIMAGE — build with: make -C $SRC/guest/guest_kernel/ bzImage"
+	skip "bzImage not at $BZIMAGE — build with: make -C $SRC/guest/guest_kernel/ setup bzImage install"
 else
-	pass "bzImage present at $BZIMAGE (boot test requires manual run)"
+	# Reload with single core for boot test
+	rmmod phantom 2>/dev/null || true
+	rmmod kvm_intel 2>/dev/null || true
+	insmod "$KO" phantom_cores=0
+
+	boot_out=$(python3 /root/phantom/src/tests/boot_kernel_test.py \
+		"$BZIMAGE" --cpu 0 --timeout 300 2>&1) || true
+	echo "$boot_out" | tail -20
+
+	if echo "$boot_out" | grep -q "SUCCESS: guest kernel reached"; then
+		pass "Linux kernel booted to phantom-harness init"
+	else
+		fail "Boot failed -- see output above"
+	fi
 fi
 
+# Unconditional teardown: ensure phantom is unloaded and KVM restored
 rmmod phantom 2>/dev/null || true
 modprobe kvm_intel 2>/dev/null || true   # restore KVM
 echo ""

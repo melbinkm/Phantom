@@ -91,6 +91,7 @@ struct phantom_bzimage_info {
 	u32 code32_start;	/* 32-bit kernel entry (hdr.code32_start) */
 	u32 pm_offset;		/* byte offset of PM kernel in bzImage */
 	u32 pm_size;		/* byte size of PM kernel blob */
+	u32 init_size;		/* kernel init area size (from hdr.init_size) */
 };
 
 /* ------------------------------------------------------------------

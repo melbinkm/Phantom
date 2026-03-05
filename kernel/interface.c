@@ -2308,7 +2308,25 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		state->class_b     = true;
 		state->guest_mem_mb = bk_args.guest_mem_mb ? bk_args.guest_mem_mb : 256;
 
-		/* Step 2: Allocate 256MB EPT */
+		/*
+		 * Step 1b: Allocate Class A infrastructure (MSR bitmap, CoW
+		 * pool, XSAVE area, IO bitmaps) via phantom_vmcs_setup().
+		 * This is idempotent if already called; for a fresh fd it
+		 * allocates the resources that phantom_vmcs_configure_fields()
+		 * expects (MSR bitmap, CoW pool, etc.).
+		 *
+		 * The Class A 16MB EPT allocated here is overridden by
+		 * phantom_ept_alloc_class_b() below which writes the 256MB
+		 * Class B EPTP into state->ept.eptp.
+		 */
+		ret = phantom_vmcs_setup(state);
+		if (ret) {
+			vfree(buf);
+			state->class_b = false;
+			break;
+		}
+
+		/* Step 2: Allocate 256MB EPT (overwrites state->ept.eptp) */
 		ret = phantom_ept_alloc_class_b(state);
 		if (ret) {
 			vfree(buf);
@@ -2337,14 +2355,36 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		/* Step 6: Write VMCS guest-state (must run on vCPU thread) */
 		init_completion(&state->vcpu_run_done);
 		state->vcpu_run_request = 7;
-		smp_store_release(&state->vcpu_work_ready, true);
+		/*
+		 * BOOT_KERNEL always runs before any VMLAUNCH, so the vCPU
+		 * thread is in Phase 1 (sleeping on vcpu_run_start).
+		 * Use complete() — safe, no IPIs to worry about yet.
+		 */
+		complete(&state->vcpu_run_start);
 		wait_for_completion(&state->vcpu_run_done);
 		ret = state->vcpu_run_result;
+		if (ret)
+			break;
 
 		/* Bind fd to this CPU for subsequent ioctls */
-		if (!ret)
-			fctx->bound_cpu = target_cpu;
+		fctx->bound_cpu = target_cpu;
 
+		/*
+		 * Step 7: Launch the guest kernel.
+		 *
+		 * The vCPU thread has completed VMCS setup and looped back
+		 * to Phase 1 wait (still no VMLAUNCH yet).  Signal it with
+		 * a standard run (request=1) to boot the kernel.
+		 *
+		 * The ioctl returns immediately after signaling; the kernel
+		 * boots asynchronously in the vCPU thread.  The test
+		 * (boot_kernel_test.py) polls dmesg for "phantom-harness: init".
+		 */
+		init_completion(&state->vcpu_run_done);
+		state->vcpu_run_request = 1;   /* run guest, no reset */
+		complete(&state->vcpu_run_start);
+		/* Return immediately — boot is asynchronous */
+		ret = 0;
 		break;
 	}
 
