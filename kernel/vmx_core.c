@@ -2602,6 +2602,27 @@ static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 		return 1;
 	}
 
+		case VMX_EXIT_HLT:
+		/*
+		 * HLT: Class B guest kernel halted (idle or panic halt).
+		 * Flush any partial serial line, log the halt, and stop.
+		 */
+		if (state->class_b) {
+			if (state->serial_buf_len > 0) {
+				state->serial_buf[state->serial_buf_len] = '\0';
+				pr_info("phantom[guest]: %s\n", state->serial_buf);
+				state->serial_buf_len = 0;
+			}
+			pr_info("phantom: CPU%d: Class B guest HLT at RIP=0x%llx\n",
+				state->cpu,
+				phantom_vmcs_read64(VMCS_GUEST_RIP));
+			state->run_result = 0; /* PHANTOM_RESULT_OK - clean halt */
+			return 1;
+		}
+		/* Class A should not HLT */
+		state->run_result = 1;
+		return 1;
+
 	case VMX_EXIT_CPUID:
 		return phantom_handle_cpuid(state);
 
@@ -3392,15 +3413,20 @@ int phantom_run_guest(struct phantom_vmx_cpu_state *state)
 			pr_info("phantom: CPU%d: first exit reason=%u disp=%d\n",
 				state->cpu, state->exit_reason & 0xFFFF,
 				disp_ret);
-		if (state->class_b && (iterations % 1000000) == 0) {
+		if (state->class_b && (iterations % 100000) == 0) {
 			u64 _rip = phantom_vmcs_read64(VMCS_GUEST_RIP);
-			/* Log ECX (MSR number for RDMSR/WRMSR exits) */
-			pr_info("phantom: CPU%d: boot iter=%d exit=%u rip=0x%llx ecx=0x%x rax=0x%x\n",
-				state->cpu, iterations,
-				state->exit_reason & 0xFFFF,
-				_rip,
-				(u32)state->guest_regs.rcx,
-				(u32)state->guest_regs.rax);
+			u32 _exit = state->exit_reason & 0xFFFF;
+			/* For I/O exits show port; for others show ECX (MSR#) */
+			if (_exit == VMX_EXIT_IO_INSTR)
+				pr_info("phantom: CPU%d: boot iter=%d exit=%u rip=0x%llx port=0x%x rax=0x%x\n",
+					state->cpu, iterations, _exit, _rip,
+					((u32)state->exit_qualification >> 16) & 0xFFFF,
+					(u32)state->guest_regs.rax);
+			else
+				pr_info("phantom: CPU%d: boot iter=%d exit=%u rip=0x%llx ecx=0x%x rax=0x%x\n",
+					state->cpu, iterations, _exit, _rip,
+					(u32)state->guest_regs.rcx,
+					(u32)state->guest_regs.rax);
 		}
 		{
 			int max_iter = state->class_b ?

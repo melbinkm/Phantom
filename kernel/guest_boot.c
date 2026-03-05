@@ -818,7 +818,7 @@ int phantom_load_kernel_image(struct phantom_vmx_cpu_state *state,
 	strncpy(cl,
 		"earlyprintk=serial,0x3f8,115200 "
 		"noapic noapictimer nokaslr "
-		"nosmp lpj=4000000 panic=-1",
+		"nosmp lpj=4000000 panic=0",
 		255);
 	((char *)cl)[255] = '\0';
 
