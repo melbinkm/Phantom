@@ -96,4 +96,7 @@ CONFIG_DRM=n
 CONFIG_CRYPTO=n
 
 # GCC plugins (disable for reproducibility)
+# CONFIG_GCC_PLUGINS=n implicitly disables CONFIG_GCC_PLUGIN_RANDSTRUCT.
+# Explicit =n is redundant but stated for the audit table (source #7).
 CONFIG_GCC_PLUGINS=n
+CONFIG_GCC_PLUGIN_RANDSTRUCT=n
