@@ -38,7 +38,7 @@ elif [ ! -f "$BRIDGE" ]; then
 else
 	out=$(python3 "$BRIDGE" --cores 0 --max-iterations 100 \
 		--payload-size 64 --timeout-ms 2000 2>&1) || true
-	if echo "$out" | grep -q "iterations: 100"; then
+	if grep -q "iterations: 100" <<< "$out"; then
 		pass "Class A: 100 iterations completed without regression"
 	else
 		fail "Class A regression: $out"
@@ -98,7 +98,7 @@ else
 		"$BZIMAGE" --cpu 0 --timeout 300 2>&1) || true
 	echo "$boot_out" | tail -20
 
-	if echo "$boot_out" | grep -q "SUCCESS: guest kernel reached"; then
+	if grep -q "SUCCESS: guest kernel reached" <<< "$boot_out"; then
 		pass "Linux kernel booted to phantom-harness init"
 	else
 		fail "Boot failed -- see output above"

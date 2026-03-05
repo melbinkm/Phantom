@@ -9,10 +9,15 @@
  * Memory layout (GPAs, as agreed with Phantom host):
  *   0x600000: payload region — first 4 bytes = u32 length,
  *             followed by payload bytes (max 65532 bytes)
+ *
+ * Note: access payload via __va(GPA) because after kernel paging init
+ * physical addresses must be accessed through the direct mapping at
+ * 0xffff888000000000+phys, not via the raw physical address as pointer.
  */
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/types.h>
+#include <asm/page.h>		/* __va(): phys → kernel virtual address */
 
 /* Phantom nyx_api hypercall numbers (must match hypercall.h) */
 #define HC_GET_PAYLOAD  0x11aULL
@@ -47,12 +52,20 @@ static void __init phantom_fuzz_target(const u8 *data, u32 len)
 
 static int __init phantom_harness_init(void)
 {
-	volatile u32 *len_ptr = (volatile u32 *)PHANTOM_PAYLOAD_GPA;
-	volatile u8  *payload = (volatile u8 *)(PHANTOM_PAYLOAD_GPA + sizeof(u32));
+	/*
+	 * Use __va() to convert the physical GPA to the kernel virtual
+	 * address via the direct mapping.  Direct cast of a physical
+	 * address as pointer would fault because the kernel's page tables
+	 * only identity-map the very early boot region; after paging init
+	 * all physical RAM is accessible at 0xffff888000000000+phys.
+	 */
+	volatile u32 *len_ptr = (volatile u32 *)__va(PHANTOM_PAYLOAD_GPA);
+	volatile u8  *payload =
+		(volatile u8 *)__va(PHANTOM_PAYLOAD_GPA + sizeof(u32));
 	u32 len;
 
-	pr_info("phantom-harness: init, registering payload at 0x%lx\n",
-		PHANTOM_PAYLOAD_GPA);
+	pr_info("phantom-harness: init, registering payload at 0x%lx (va=%p)\n",
+		PHANTOM_PAYLOAD_GPA, len_ptr);
 
 	/* Register payload GPA with host, then take snapshot */
 	phantom_vmcall(HC_GET_PAYLOAD, PHANTOM_PAYLOAD_GPA);
