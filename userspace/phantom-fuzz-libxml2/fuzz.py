@@ -81,6 +81,34 @@ SEEDS = [
     b"<![CDATA[hello]]>",
     b"<r xmlns=\"http://example.org\"/>",
     b"<a><b><c><d/></c></b></a>",
+    # Namespace-heavy (CVE-2016-4658: namespace node buffer overflow)
+    b"<a xmlns:a=\"A\" xmlns:b=\"B\" xmlns:c=\"C\" xmlns:d=\"D\" "
+    b"xmlns:e=\"E\" xmlns:f=\"F\" a:x=\"1\" b:x=\"2\" c:x=\"3\"/>",
+    b"<r xmlns=\"http://x.org\" xmlns:y=\"http://y.org\"><y:a/></r>",
+    # Internal entity stress (CVE-2016-5131: use-after-free in xmlParseMisc)
+    b"<!DOCTYPE x [<!ENTITY a \"A\"><!ENTITY b \"&a;&a;\">]><x>&b;</x>",
+    b"<!DOCTYPE x [<!ENTITY a \"&a;\">]><x>&a;</x>",
+    # Attribute list edge cases
+    b"<a x=\"\" y=\"\" z=\"\" w=\"\" v=\"\" u=\"\" t=\"\" s=\"\"/>",
+    b"<a x='&lt;&gt;&amp;&quot;&#x0;&#x1;&#xD;&#xA;'/>",
+    # Processing instructions
+    b"<?xml version=\"1.0\"?><?pi data?><a><?pi2 data2?></a>",
+    # DOCTYPE with external subset trigger attempt (no network = safe)
+    b"<!DOCTYPE a SYSTEM \"file:///dev/null\"><a/>",
+    # Malformed XML that triggers recovery paths
+    b"<a><b></a>",
+    b"<a attr",
+    b"< a/>",
+    b"&amp;",
+    b"<a>&#x0;</a>",
+    # CDATA with edge cases
+    b"<a><![CDATA[]]></a>",
+    b"<a><![CDATA[]]><!]></a>",
+    # Long tag/attr names (stress hash tables)
+    b"<" + b"a" * 100 + b"/>",
+    b"<a " + b"x" * 100 + b"=\"v\"/>",
+    # Deeply nested (but shallow enough to not stack-overflow libxml2)
+    b"<a>" * 50 + b"<x/>" + b"</a>" * 50,
 ]
 
 # Interesting byte values for mutation
