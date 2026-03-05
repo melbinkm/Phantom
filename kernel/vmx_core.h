@@ -856,6 +856,31 @@ struct phantom_vmx_cpu_state {
 	bool			  tss_dirty_verified;
 	u64			  tss_rsp0_snapshot;
 	u64			  tss_rsp0_restored;
+
+	/*
+	 * Task 3.3: Multi-core coverage and throughput tracking.
+	 *
+	 * coverage_bitmap:  Per-core 64KB AFL++ edge bitmap.  Written by
+	 *   the PT decoder or coverage tracking code each iteration.
+	 *   Periodically OR'd into phantom_global_bitmap by
+	 *   phantom_merge_coverage_to_global() then cleared.
+	 *   64-byte aligned to prevent false sharing between cores.
+	 *
+	 * iter_count:       Total iterations completed on this core since
+	 *   module load.  Incremented at HC_RELEASE/PANIC/KASAN in the
+	 *   hot path (no sleeping, no printk).
+	 *
+	 * iter_tsc_window:  TSC value at the start of the current 1-second
+	 *   measurement window.  Written once per window by multicore.c.
+	 *
+	 * iter_count_window: iter_count snapshot captured at the start of
+	 *   the current measurement window.  Delta against current
+	 *   iter_count gives exec/sec for the window.
+	 */
+	u8			  coverage_bitmap[64 * 1024] __attribute__((aligned(64)));
+	u64			  iter_count;
+	u64			  iter_tsc_window;
+	u64			  iter_count_window;
 };
 
 DECLARE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);

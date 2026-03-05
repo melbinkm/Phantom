@@ -598,6 +598,20 @@ struct phantom_iter_state {
  */
 #define PHANTOM_IOCTL_GET_ITER_STATE	_IO(PHANTOM_IOCTL_MAGIC, 23)
 
+/*
+ * PHANTOM_IOCTL_GET_MULTICORE_STATS — retrieve per-core exec/sec statistics.
+ *
+ * Returns a struct phantom_multicore_stats with:
+ *   active_cores:       number of running vCPU threads
+ *   total_exec_per_sec: sum of per-core exec/sec
+ *   per_core_exec[8]:   per-core exec/sec (0 for inactive cores)
+ *
+ * Defined in multicore.h; reproduced here for discoverability.
+ *   _IOR(PHANTOM_IOCTL_MAGIC, 24, struct phantom_multicore_stats)
+ *
+ * Returns 0 on success, -ENXIO if multicore not initialised.
+ */
+
 /* ------------------------------------------------------------------
  * Forward declaration — struct phantom_dev is defined in phantom.h
  * ------------------------------------------------------------------ */

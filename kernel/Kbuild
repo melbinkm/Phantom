@@ -19,7 +19,8 @@ phantom-objs := \
 	pt_config.o \
 	cpuid_emul.o \
 	msr_emul.o \
-	guest_boot.o
+	guest_boot.o \
+	multicore.o
 
 # Enable debug assertions and trace_printk during development.
 # Remove -DPHANTOM_DEBUG for production builds.
