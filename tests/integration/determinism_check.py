@@ -81,42 +81,40 @@ PHANTOM_IOCTL_BOOT_KERNEL = _IOW(PHANTOM_IOC_MAGIC, 22, BOOT_KERNEL_STRUCT_SIZE)
 RUN_ITER_STRUCT_SIZE = 8
 PHANTOM_IOCTL_RUN_ITERATION = _IOWR(PHANTOM_IOC_MAGIC, 20, RUN_ITER_STRUCT_SIZE)
 
-# Task 3.2: PHANTOM_IOCTL_GET_ITER_STATE = _IOR('P', 23, phantom_iter_state)
+# Task 3.2: PHANTOM_IOCTL_GET_ITER_STATE = _IO('P', 23)
 #
-# TODO: finalize struct size once kdev-tss commits phantom_iter_state.
-# The struct layout (from task brief):
-#   u64 rip, rsp, rflags, cr3           = 4 × 8 = 32 bytes
-#   u64 gp_regs[16] (RAX..R15)          = 16 × 8 = 128 bytes
-#   u32 dirty_count                      = 4 bytes
-#   u32 _pad                             = 4 bytes
-#   u64 dirty_gpas[DIRTY_LIST_MAX]       = N × 8 bytes
+# Uses _IO (not _IOR) because struct phantom_iter_state is ~32KB, which
+# overflows the 14-bit size field in the ioctl encoding. The kernel copies
+# sizeof(struct phantom_iter_state) bytes to the userspace pointer in arg.
 #
-# DIRTY_LIST_DEFAULT_MAX is 4096 (from ept_cow.c / snapshot.c).
-# Full struct size: 32 + 128 + 4 + 4 + 4096*8 = 32936 bytes.
-#
-# If the kernel uses a smaller DIRTY_LIST_MAX for GET_ITER_STATE, update
-# GET_ITER_STATE_STRUCT_SIZE below.
+# struct phantom_iter_state layout (kernel/interface.h):
+#   u64 rax,rbx,rcx,rdx,rsi,rdi,rsp,rbp  = 8 × 8 =  64 bytes  offset 0
+#   u64 r8..r15                            = 8 × 8 =  64 bytes  offset 64
+#   u64 rip, rflags, cr3                   = 3 × 8 =  24 bytes  offset 128
+#   u32 dirty_count, u32 _pad0             = 8 bytes             offset 152
+#   u64 dirty_gpas[4096]                   = 32768 bytes         offset 160
+#   u8  tss_verified, u8 _pad1[7]          = 8 bytes             offset 32928
+#   u64 tss_rsp0_snapshot                  = 8 bytes             offset 32936
+#   u64 tss_rsp0_restored                  = 8 bytes             offset 32944
+#   u32 run_result, u32 _pad2              = 8 bytes             offset 32952
+#   Total: 32960 bytes
 DIRTY_LIST_MAX = 4096
-_ITER_STATE_HEADER_SIZE = 32 + 128 + 4 + 4          # rip/rsp/rflags/cr3 + gp_regs + dirty_count + pad
-GET_ITER_STATE_STRUCT_SIZE = _ITER_STATE_HEADER_SIZE + DIRTY_LIST_MAX * 8
-PHANTOM_IOCTL_GET_ITER_STATE = _IOR(PHANTOM_IOC_MAGIC, 23,
-                                     GET_ITER_STATE_STRUCT_SIZE)
+# _IO(type, nr) = _IOC(0, type, nr, 0)
+PHANTOM_IOCTL_GET_ITER_STATE = _IOC(0, PHANTOM_IOC_MAGIC, 23, 0)
 
-# Struct format for struct phantom_iter_state:
-#   Q rip, Q rsp, Q rflags, Q cr3     (4 u64)
-#   16Q gp_regs[16]                    (16 u64: RAX..R15)
-#   I dirty_count, I _pad             (2 u32)
-#   4096Q dirty_gpas[]                (up to DIRTY_LIST_MAX u64)
-ITER_STATE_FMT = '4Q16QII{n}Q'.format(n=DIRTY_LIST_MAX)
+# Struct format: native byte order, no padding inserted by Python (explicit pads)
+# 16 GPRs (rax..r15), 3 (rip/rflags/cr3), 2 u32 (dirty_count+pad),
+# 4096 u64 (dirty_gpas), 1 u8 (tss_verified), 7 pad bytes,
+# 2 u64 (tss_rsp0_*), 2 u32 (run_result+pad)
+ITER_STATE_FMT = '=16Q3QII4096QB7xQQII'
 ITER_STATE_SIZE = struct.calcsize(ITER_STATE_FMT)
-assert ITER_STATE_SIZE == GET_ITER_STATE_STRUCT_SIZE, (
-    'struct size mismatch: %d vs %d' % (ITER_STATE_SIZE,
-                                        GET_ITER_STATE_STRUCT_SIZE))
+GET_ITER_STATE_STRUCT_SIZE = ITER_STATE_SIZE
+assert ITER_STATE_SIZE == 32960, (
+    'struct size mismatch: expected 32960, got %d' % ITER_STATE_SIZE)
 
-# GP register names in order (matching VCPU_REG_* enum in vcpu.h)
-GP_REGS = ['RAX', 'RCX', 'RDX', 'RBX', 'RSP_GP', 'RBP',
-           'RSI', 'RDI', 'R8', 'R9', 'R10', 'R11',
-           'R12', 'R13', 'R14', 'R15']
+# GP register names in order (matching struct phantom_iter_state field order)
+GP_REGS = ['RAX', 'RBX', 'RCX', 'RDX', 'RSI', 'RDI', 'RSP', 'RBP',
+           'R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']
 
 # Fixed determinism test input: 4 bytes, same every iteration.
 # Use all-zeros so the result is maximally deterministic.
@@ -124,24 +122,45 @@ FIXED_INPUT = b'\x00\x00\x00\x00'
 
 
 def parse_iter_state(raw):
-    """Parse raw bytes from PHANTOM_IOCTL_GET_ITER_STATE into a dict."""
+    """Parse raw bytes from PHANTOM_IOCTL_GET_ITER_STATE into a dict.
+
+    Format: =16Q3QII4096QB7xQQII
+      fields[0:16]  = rax,rbx,rcx,rdx,rsi,rdi,rsp,rbp,r8..r15
+      fields[16:19] = rip, rflags, cr3
+      fields[19]    = dirty_count
+      fields[20]    = _pad0 (ignored)
+      fields[21:21+4096] = dirty_gpas[4096]
+      fields[4117]  = tss_verified (u8, packed as int)
+      (7 pad bytes skipped by format)
+      fields[4118]  = tss_rsp0_snapshot
+      fields[4119]  = tss_rsp0_restored
+      fields[4120]  = run_result
+      fields[4121]  = _pad2 (ignored)
+    """
     fields = struct.unpack_from(ITER_STATE_FMT, raw)
-    rip      = fields[0]
-    rsp      = fields[1]
-    rflags   = fields[2]
-    cr3      = fields[3]
-    gp_regs  = list(fields[4:20])
-    dirty_count = fields[20]
-    # _pad    = fields[21]
-    dirty_gpas = list(fields[22:22 + dirty_count])
+    gp_regs     = list(fields[0:16])
+    rip         = fields[16]
+    rflags      = fields[17]
+    cr3         = fields[18]
+    dirty_count = fields[19]
+    # fields[20] = _pad0
+    dirty_gpas  = list(fields[21:21 + dirty_count])
+    tss_verified        = bool(fields[4117])
+    tss_rsp0_snapshot   = fields[4118]
+    tss_rsp0_restored   = fields[4119]
+    run_result          = fields[4120]
     return {
-        'rip':        rip,
-        'rsp':        rsp,
-        'rflags':     rflags,
-        'cr3':        cr3,
-        'gp_regs':    gp_regs,
-        'dirty_count': dirty_count,
-        'dirty_gpas': dirty_gpas,
+        'rip':               rip,
+        'rsp':               gp_regs[6],   # RSP is gp_regs[6]
+        'rflags':            rflags,
+        'cr3':               cr3,
+        'gp_regs':           gp_regs,
+        'dirty_count':       dirty_count,
+        'dirty_gpas':        dirty_gpas,
+        'tss_verified':      tss_verified,
+        'tss_rsp0_snapshot': tss_rsp0_snapshot,
+        'tss_rsp0_restored': tss_rsp0_restored,
+        'run_result':        run_result,
     }
 
 
