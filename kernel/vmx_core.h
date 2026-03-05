@@ -814,6 +814,41 @@ struct phantom_vmx_cpu_state {
 	 */
 	char			  serial_buf[256];
 	int			  serial_buf_len;
+
+	/*
+	 * Task 3.2: Cached VMCS guest-state at HC_RELEASE/PANIC/KASAN time.
+	 *
+	 * RIP, RFLAGS, RSP, and CR3 must be read from the VMCS while still
+	 * in VMX-root context (i.e., before VMRESUME or VMXOFF).  They are
+	 * cached here in the hypercall handler for later retrieval via
+	 * PHANTOM_IOCTL_GET_ITER_STATE.
+	 *
+	 * last_guest_rip:    VMCS_GUEST_RIP at iteration end.
+	 * last_guest_rflags: VMCS_GUEST_RFLAGS at iteration end.
+	 * last_guest_rsp:    VMCS_GUEST_RSP at iteration end.
+	 * last_guest_cr3:    VMCS_GUEST_CR3 at iteration end.
+	 */
+	u64			  last_guest_rip;
+	u64			  last_guest_rflags;
+	u64			  last_guest_rsp;
+	u64			  last_guest_cr3;
+
+	/*
+	 * Task 3.2: TSS dirty-list verification.
+	 *
+	 * tss_dirty_verified: set to true after HC_RELEASE if the TSS page
+	 *   GPA was found in the dirty list for that iteration.  Reset to
+	 *   false at the start of each iteration (HC_ACQUIRE).
+	 *
+	 * tss_rsp0_snapshot: RSP0 from guest TSS captured at snapshot time
+	 *   (phantom_snapshot_create, once snap_acquired is true).
+	 *
+	 * tss_rsp0_restored: RSP0 from guest TSS read after restore, checked
+	 *   against tss_rsp0_snapshot to detect TSS restore failures.
+	 */
+	bool			  tss_dirty_verified;
+	u64			  tss_rsp0_snapshot;
+	u64			  tss_rsp0_restored;
 };
 
 DECLARE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);

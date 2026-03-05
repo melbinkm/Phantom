@@ -2388,6 +2388,99 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		break;
 	}
 
+	case PHANTOM_IOCTL_GET_ITER_STATE: {
+		/*
+		 * GET_ITER_STATE — read per-iteration state for determinism
+		 * testing.
+		 *
+		 * Returns guest GPRs, VMCS-sourced registers (RIP, RFLAGS,
+		 * CR3 cached at HC_RELEASE time), the dirty GPA list, TSS
+		 * verification results, and the run result.
+		 *
+		 * This ioctl must be called after RUN_ITERATION completes.
+		 * All fields are populated by the HC_RELEASE/PANIC/KASAN
+		 * handlers in VMX-root context.
+		 */
+		struct phantom_iter_state *istate;
+		struct phantom_vmx_cpu_state *state;
+		int target_cpu;
+		u32 dc;
+
+		target_cpu = phantom_file_cpu(fctx);
+		if (target_cpu < 0) {
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+		/*
+		 * Allocate on heap — struct is >32KB (4096 u64 dirty_gpas)
+		 * and must not be placed on the kernel stack.
+		 */
+		istate = kzalloc(sizeof(*istate), GFP_KERNEL);
+		if (!istate) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		/* GPRs saved by the VM exit handler (not VMCS-sourced) */
+		istate->rax = state->guest_regs.rax;
+		istate->rbx = state->guest_regs.rbx;
+		istate->rcx = state->guest_regs.rcx;
+		istate->rdx = state->guest_regs.rdx;
+		istate->rsi = state->guest_regs.rsi;
+		istate->rdi = state->guest_regs.rdi;
+		istate->rsp = state->last_guest_rsp;
+		istate->rbp = state->guest_regs.rbp;
+		istate->r8  = state->guest_regs.r8;
+		istate->r9  = state->guest_regs.r9;
+		istate->r10 = state->guest_regs.r10;
+		istate->r11 = state->guest_regs.r11;
+		istate->r12 = state->guest_regs.r12;
+		istate->r13 = state->guest_regs.r13;
+		istate->r14 = state->guest_regs.r14;
+		istate->r15 = state->guest_regs.r15;
+
+		/*
+		 * RIP/RFLAGS/CR3 cached at HC_RELEASE time from VMCS
+		 * (cannot be read here — not in VMX-root context).
+		 */
+		istate->rip    = state->last_guest_rip;
+		istate->rflags = state->last_guest_rflags;
+		istate->cr3    = state->last_guest_cr3;
+
+		/*
+		 * Dirty page list — use last_dirty_count (populated before
+		 * phantom_cow_abort_iteration() resets dirty_count to 0).
+		 */
+		dc = state->last_dirty_count;
+		if (dc > PHANTOM_MAX_DIRTY_PAGES)
+			dc = PHANTOM_MAX_DIRTY_PAGES;
+		istate->dirty_count = dc;
+
+		if (dc && state->dirty_list) {
+			u32 i;
+
+			for (i = 0; i < dc; i++)
+				istate->dirty_gpas[i] = state->dirty_list[i].gpa;
+		}
+
+		/* TSS verification */
+		istate->tss_verified      = state->tss_dirty_verified ? 1 : 0;
+		istate->tss_rsp0_snapshot = state->tss_rsp0_snapshot;
+		istate->tss_rsp0_restored = state->tss_rsp0_restored;
+
+		/* Run result */
+		istate->run_result = (u32)state->run_result;
+
+		if (copy_to_user((void __user *)arg, istate, sizeof(*istate)))
+			ret = -EFAULT;
+
+		kfree(istate);
+		break;
+	}
+
 	default:
 		ret = -ENOTTY;
 		break;

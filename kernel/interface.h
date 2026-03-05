@@ -524,6 +524,81 @@ struct phantom_boot_kernel_args {
 	_IOW(PHANTOM_IOC_MAGIC, 22, struct phantom_boot_kernel_args)
 
 /* ------------------------------------------------------------------
+ * Task 3.2: Per-iteration state ioctl for determinism testing
+ * ------------------------------------------------------------------ */
+
+/*
+ * Maximum dirty pages returned by PHANTOM_IOCTL_GET_ITER_STATE.
+ * Matches the CoW pool capacity (dirty_max).
+ */
+#define PHANTOM_MAX_DIRTY_PAGES		4096
+
+/*
+ * struct phantom_iter_state — per-iteration state for determinism testing.
+ *
+ * Returned by PHANTOM_IOCTL_GET_ITER_STATE after each iteration.
+ * Captures guest register state, dirty page list, TSS verification
+ * results, and run result so the determinism test can compare two
+ * runs of the same input.
+ *
+ * All VMCS-sourced fields (rip, rflags, cr3) are cached at HC_RELEASE
+ * time while still in VMX-root context, then copied here on ioctl.
+ *
+ * Fields:
+ *   rax–r15:          Guest GPRs at iteration end (from state->guest_regs).
+ *   rip:              Guest RIP at RELEASE/PANIC/KASAN exit.
+ *   rflags:           Guest RFLAGS at exit.
+ *   cr3:              Guest CR3 at exit.
+ *   dirty_count:      Number of dirty pages in this iteration.
+ *   dirty_gpas:       GPAs of dirty pages (up to PHANTOM_MAX_DIRTY_PAGES).
+ *   tss_verified:     True if TSS page was found in the dirty list.
+ *   tss_rsp0_snapshot: RSP0 value from TSS at snapshot time.
+ *   tss_rsp0_restored: RSP0 value from TSS after restore (should match).
+ *   run_result:       PHANTOM_RESULT_* code for the iteration.
+ */
+struct phantom_iter_state {
+	/* Guest register state at iteration end */
+	__u64 rax, rbx, rcx, rdx, rsi, rdi, rsp, rbp;
+	__u64 r8, r9, r10, r11, r12, r13, r14, r15;
+	__u64 rip, rflags, cr3;
+
+	/* Dirty page list */
+	__u32 dirty_count;
+	__u32 _pad0;
+	__u64 dirty_gpas[PHANTOM_MAX_DIRTY_PAGES];
+
+	/* TSS verification */
+	__u8  tss_verified;
+	__u8  _pad1[7];
+	__u64 tss_rsp0_snapshot;
+	__u64 tss_rsp0_restored;
+
+	/* Run result */
+	__u32 run_result;
+	__u32 _pad2;
+};
+
+/*
+ * PHANTOM_IOCTL_GET_ITER_STATE — read per-iteration state for determinism test.
+ *
+ * Fills a struct phantom_iter_state with the guest register state,
+ * dirty page list, TSS verification results, and run result from the
+ * most recently completed iteration.
+ *
+ * Must be called after RUN_ITERATION or RUN_GUEST completes.
+ * Fields are populated at HC_RELEASE/PANIC/KASAN time in VMX-root context.
+ *
+ * The arg must be a userspace pointer to struct phantom_iter_state.
+ * The struct is too large (>16KB) for _IOR's size field encoding, so
+ * _IO is used; the kernel copies sizeof(struct phantom_iter_state) bytes.
+ *
+ * Returns 0 on success.
+ * Returns -ENODEV if no vCPU is bound to this fd.
+ * Returns -EFAULT on copy_to_user failure.
+ */
+#define PHANTOM_IOCTL_GET_ITER_STATE	_IO(PHANTOM_IOCTL_MAGIC, 23)
+
+/* ------------------------------------------------------------------
  * Forward declaration — struct phantom_dev is defined in phantom.h
  * ------------------------------------------------------------------ */
 struct phantom_dev;
