@@ -1778,6 +1778,12 @@ static int phantom_vcpu_fn(void *data)
 			 *   phantom_msr_state_init()
 			 *   state->pages_allocated = true
 			 *
+			 * On re-boot (vcpu_phase2=true), the VMCS is in "active"
+			 * state from the previous VMLAUNCH.  VMLAUNCH requires
+			 * "clear" state.  Issue VMCLEAR before configure_fields to
+			 * return the VMCS to "clear" state, then VMPTRLD to make it
+			 * current again.
+			 *
 			 * Step A: configure_fields() sets up VMCS control fields
 			 *   (MSR bitmap, EPT pointer, exit/entry controls, PT),
 			 *   generic guest state, and host state.  Uses state->ept.eptp
@@ -1789,6 +1795,16 @@ static int phantom_vcpu_fn(void *data)
 			 *   (RIP=kernel_entry_gpa, RSP=stack_top, CR0/CR3/CR4/EFER,
 			 *   segments, GDT, RSI=boot_params).
 			 */
+			if (READ_ONCE(state->vcpu_phase2) && state->vmcs_region) {
+				u64 phys = page_to_phys(state->vmcs_region);
+				if (__vmclear(phys) || __vmptrld(phys)) {
+					pr_err("phantom: CPU%d: re-boot VMCLEAR/VMPTRLD failed\n",
+					       state->cpu);
+					state->vcpu_run_result = -EIO;
+					complete(&state->vcpu_run_done);
+					continue;
+				}
+			}
 			state->vcpu_run_result =
 				phantom_vmcs_configure_fields(state);
 			if (!state->vcpu_run_result)
@@ -1985,12 +2001,17 @@ static int phantom_vcpu_fn(void *data)
 		}
 
 		/*
-		 * After the first VMLAUNCH/VMRESUME, switch to busy-wait mode.
-		 * KVM L0's nested VMX tracking is now "dirty" for this CPU:
+		 * After the first VMLAUNCH/VMRESUME attempt, switch to busy-wait
+		 * mode.  KVM L0's nested VMX tracking is now "dirty" for this CPU:
 		 * any subsequent RESCHEDULE IPI will cause a triple fault.
 		 * From this point on, the thread never sleeps.
+		 *
+		 * Also set state->vcpu_phase2 so ioctl handlers can detect this
+		 * phase without relying on state->launched (which may be false if
+		 * VM-entry failed).
 		 */
 		vmlaunch_done = true;
+		WRITE_ONCE(state->vcpu_phase2, true);
 
 		/*
 		 * Signal ioctl handler that the run is complete.
@@ -2156,6 +2177,7 @@ int phantom_vcpu_thread_start(struct phantom_vmx_cpu_state *state)
 	state->vcpu_run_request    = 0;
 	state->vcpu_run_result     = 0;
 	state->vcpu_work_ready     = false;
+	state->vcpu_phase2         = false;
 	state->vcpu_stop_requested = false;
 	init_completion(&state->vcpu_stopped);
 
@@ -3301,7 +3323,7 @@ int phantom_run_guest(struct phantom_vmx_cpu_state *state)
 /* Class A fuzzing: 10k exits max (one iteration).
 	 * Class B (Linux kernel boot): 10M exits (kernel boot takes ~10k+ exits). */
 #define MAX_EXIT_ITERATIONS      10000
-#define MAX_EXIT_ITERATIONS_CLASSB 200000000
+#define MAX_EXIT_ITERATIONS_CLASSB 10000000
 
 	if (!state->vmcs_configured)
 		return -ENXIO;

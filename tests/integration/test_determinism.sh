@@ -3,10 +3,10 @@
 #
 # test_determinism.sh — 1000/1000 determinism gate for Phantom kernel fuzzing.
 #
-# Loads phantom.ko, boots the guest bzImage, then runs 1000 iterations using
-# the same fixed input.  After each iteration it calls PHANTOM_IOCTL_GET_ITER_STATE
-# (ioctl nr=23) via determinism_check.py to read register state + dirty list.
-# All 1000 states must be byte-identical to the first.
+# Loads phantom.ko, then runs determinism_check.py which boots the guest
+# bzImage and runs 1000 iterations using the same fixed input.  After each
+# iteration it calls PHANTOM_IOCTL_GET_ITER_STATE (ioctl nr=23) to read
+# register state + dirty list.  All 1000 states must be byte-identical.
 #
 # Exit codes:
 #   0  PASS — 1000/1000 identical states
@@ -28,7 +28,6 @@ ITERATIONS="${2:-1000}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 KO="${SRC_ROOT}/kernel/phantom.ko"
-BOOT_TEST="${SRC_ROOT}/tests/boot_kernel_test.py"
 DET_CHECK="${SCRIPT_DIR}/determinism_check.py"
 
 echo "=== Phantom determinism gate: ${ITERATIONS} iterations ==="
@@ -73,19 +72,13 @@ if [[ ! -c /dev/phantom ]]; then
 	exit 3
 fi
 
-# ---- Boot guest kernel ------------------------------------------------------
-
-echo ""
-echo "--- Booting guest bzImage ---"
-python3 "${BOOT_TEST}" "${BZIMAGE}" --timeout 60
-BOOT_RC=$?
-if [[ ${BOOT_RC} -ne 0 ]]; then
-	echo "ERROR: guest boot failed (exit ${BOOT_RC})"
-	dmesg | tail -30
-	exit 3
-fi
-
 # ---- Run determinism check --------------------------------------------------
+#
+# determinism_check.py handles boot and iterations in a single fd session:
+#   1. Opens /dev/phantom
+#   2. Calls PHANTOM_IOCTL_BOOT_KERNEL (boots guest, waits 2s for harness init)
+#   3. Runs ITERATIONS × (RUN_ITERATION + GET_ITER_STATE)
+#   4. Compares all states against the reference (iteration 1)
 
 echo ""
 echo "--- Running determinism_check.py (${ITERATIONS} iterations) ---"

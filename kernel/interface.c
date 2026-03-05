@@ -1752,7 +1752,15 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 * Signal the vCPU thread.  After the first ACQUIRE (which means
 		 * vmcs_configured is true and vmlaunch_done is true in the vCPU
 		 * thread), we must use the IPI-free busy-wait path.
+		 *
+		 * CRITICAL: re-initialize vcpu_run_done BEFORE signalling the
+		 * vCPU.  The boot run (BOOT_KERNEL step 7, async) fires
+		 * complete(&vcpu_run_done) when the guest reaches HC_RELEASE.
+		 * Without this init, wait_for_completion returns immediately on
+		 * the stale count from the boot run, causing GET_ITER_STATE to
+		 * race against the vCPU's in-progress snapshot_restore.
 		 */
+		init_completion(&state->vcpu_run_done);
 		smp_store_release(&state->vcpu_work_ready, true);
 		wait_for_completion(&state->vcpu_run_done);
 
@@ -2251,6 +2259,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		struct phantom_boot_kernel_args bk_args;
 		struct phantom_vmx_cpu_state *state;
 		int target_cpu;
+		bool was_launched;
 		void *buf;
 
 		if (copy_from_user(&bk_args, (void __user *)arg,
@@ -2309,6 +2318,17 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		state->guest_mem_mb = bk_args.guest_mem_mb ? bk_args.guest_mem_mb : 256;
 
 		/*
+		 * Check state->vcpu_phase2 (set by vCPU thread on ANY VM entry
+		 * attempt — even a failed one).  This is more reliable than
+		 * state->launched which we are about to reset to false.
+		 * If vcpu_phase2 is true the thread is in Phase 2 busy-wait;
+		 * use the IPI-free wakeup.  Otherwise Phase 1 (safe to sleep).
+		 */
+		was_launched = READ_ONCE(state->vcpu_phase2);
+		state->launched       = false;
+		state->vmcs_configured = false;
+
+		/*
 		 * Step 1b: Allocate Class A infrastructure (MSR bitmap, CoW
 		 * pool, XSAVE area, IO bitmaps) via phantom_vmcs_setup().
 		 * This is idempotent if already called; for a fresh fd it
@@ -2356,11 +2376,16 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		init_completion(&state->vcpu_run_done);
 		state->vcpu_run_request = 7;
 		/*
-		 * BOOT_KERNEL always runs before any VMLAUNCH, so the vCPU
-		 * thread is in Phase 1 (sleeping on vcpu_run_start).
-		 * Use complete() — safe, no IPIs to worry about yet.
+		 * Use was_launched (saved before the reset above) to determine
+		 * which wakeup path to use.  The vCPU thread's local
+		 * vmlaunch_done flag mirrors was_launched: if was_launched is
+		 * true the thread is in Phase 2 busy-wait; if false it is in
+		 * Phase 1 sleeping on vcpu_run_start.
 		 */
-		complete(&state->vcpu_run_start);
+		if (was_launched)
+			smp_store_release(&state->vcpu_work_ready, true);
+		else
+			complete(&state->vcpu_run_start);
 		wait_for_completion(&state->vcpu_run_done);
 		ret = state->vcpu_run_result;
 		if (ret)
@@ -2372,17 +2397,20 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		/*
 		 * Step 7: Launch the guest kernel.
 		 *
-		 * The vCPU thread has completed VMCS setup and looped back
-		 * to Phase 1 wait (still no VMLAUNCH yet).  Signal it with
-		 * a standard run (request=1) to boot the kernel.
+		 * After step 6 completes, the thread loops back.  If
+		 * was_launched was true (Phase 2 before reset), the thread
+		 * stays in Phase 2 busy-wait — use IPI-free wakeup.
+		 * If was_launched was false (first boot, Phase 1), the
+		 * thread is sleeping — use complete().
 		 *
-		 * The ioctl returns immediately after signaling; the kernel
-		 * boots asynchronously in the vCPU thread.  The test
-		 * (boot_kernel_test.py) polls dmesg for "phantom-harness: init".
+		 * The ioctl returns immediately; boot is asynchronous.
 		 */
 		init_completion(&state->vcpu_run_done);
 		state->vcpu_run_request = 1;   /* run guest, no reset */
-		complete(&state->vcpu_run_start);
+		if (was_launched)
+			smp_store_release(&state->vcpu_work_ready, true);
+		else
+			complete(&state->vcpu_run_start);
 		/* Return immediately — boot is asynchronous */
 		ret = 0;
 		break;

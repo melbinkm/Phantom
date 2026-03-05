@@ -470,6 +470,13 @@ struct phantom_vmx_cpu_state {
 	 * Protected by smp_store_release / smp_load_acquire barriers.
 	 */
 	bool			 vcpu_work_ready;  /* set by ioctl (no IPI) */
+	/*
+	 * vcpu_phase2: set by vCPU thread when it first enters Phase 2
+	 * (busy-wait mode, after any VM entry attempt — successful or not).
+	 * Never cleared once set (only reset on vCPU thread teardown).
+	 * BOOT_KERNEL uses this to select the correct wakeup path.
+	 */
+	bool			 vcpu_phase2;      /* vCPU in Phase 2 busy-wait */
 
 	/*
 	 * IPI-free stop protocol for post-VMLAUNCH teardown.

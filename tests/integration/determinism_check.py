@@ -248,7 +248,8 @@ def inject_payload(fd, payload):
         # Write payload_len at offset PHANTOM_PAYLOAD_MAX
         mm.seek(PHANTOM_PAYLOAD_MAX)
         mm.write(struct.pack('I', len(payload)))
-        mm.flush()
+        # Do NOT call mm.flush() — phantom maps VM_IO pages which do not
+        # support msync; flush() calls msync(MS_SYNC) -> EINVAL.
         mm.close()
         return True
     except OSError as e:
