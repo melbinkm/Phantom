@@ -41,6 +41,7 @@
 #include "vmx_core.h"
 #include "ept.h"
 #include "ept_cow.h"
+#include "guest_boot.h"
 #include "snapshot.h"
 #include "debug.h"
 
@@ -207,7 +208,10 @@ int phantom_snapshot_create(struct phantom_vmx_cpu_state *state)
 	 * a private copy.  This is the snapshot point: every subsequent
 	 * write is tracked in the dirty list.
 	 * ---------------------------------------------------------- */
-	phantom_ept_mark_all_ro(&state->ept);
+	if (state->class_b)
+		phantom_ept_mark_all_ro_class_b(state);
+	else
+		phantom_ept_mark_all_ro(&state->ept);
 
 	/* ----------------------------------------------------------
 	 * Step 9: Reset dirty list for the new iteration.
@@ -293,7 +297,10 @@ int phantom_snapshot_restore(struct phantom_vmx_cpu_state *state)
 		struct phantom_dirty_entry *e = &state->dirty_list[i];
 		u64 *pte;
 
-		pte = phantom_ept_lookup_pte(&state->ept, e->gpa);
+		if (state->class_b)
+			pte = phantom_ept_lookup_pte_class_b(state, e->gpa);
+		else
+			pte = phantom_ept_lookup_pte(&state->ept, e->gpa);
 		if (pte) {
 			/*
 			 * Restore read-only (no write bit), write-back.

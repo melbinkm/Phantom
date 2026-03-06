@@ -56,11 +56,20 @@
 /* Environment variable AFL++ sets with the shmid of its bitmap */
 #define SHM_ENV_VAR		"__AFL_SHM_ID"
 
-/* Set by AFL++ in persistent mode */
-#define PERSIST_ENV_VAR		"__AFL_PERSISTENT"
+/* ------------------------------------------------------------------
+ * AFL++ shmem fuzz protocol constants
+ *
+ * FS_OPT_* flags are written in the 4-byte "hello" from the fork
+ * server to AFL++, then confirmed back.  When both sides agree on
+ * FS_OPT_SHDMEM_FUZZ, the testcase is delivered via shared memory
+ * instead of file I/O — this is the key to high-speed fuzzing.
+ * ------------------------------------------------------------------ */
+#define FS_OPT_ENABLED		0x80000001U
+#define FS_OPT_MAPSIZE		0x40000000U
+#define FS_OPT_SHDMEM_FUZZ	0x01000000U
 
-/* AFL++ reads testcase from this pointer (persistent mode) */
-#define FUZZ_TESTCASE_ENV	"__AFL_FUZZ_INIT"
+/* Env var AFL++ sets with the shmid for testcase delivery shmem */
+#define SHM_FUZZ_ENV_VAR	"__AFL_SHM_FUZZ_ID"
 
 /* ------------------------------------------------------------------
  * Signal codes used to communicate iteration outcome to AFL++

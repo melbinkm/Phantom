@@ -42,6 +42,7 @@
 #include "ept.h"
 #include "ept_cow.h"
 #include "vmx_core.h"
+#include "guest_boot.h"
 #include "debug.h"
 #include "memory.h"
 
@@ -323,7 +324,10 @@ static int phantom_cow_4kb_page(struct phantom_vmx_cpu_state *state, u64 gpa)
 	}
 
 	/* Walk EPT to find the leaf 4KB PTE */
-	pte_ptr = phantom_ept_lookup_pte(&state->ept, gpa);
+	if (state->class_b)
+		pte_ptr = phantom_ept_lookup_pte_class_b(state, gpa);
+	else
+		pte_ptr = phantom_ept_lookup_pte(&state->ept, gpa);
 	if (!pte_ptr) {
 		phantom_cow_pool_free(&state->cow_pool, priv_page);
 		state->run_result = PHANTOM_RESULT_CRASH;
@@ -522,6 +526,16 @@ int phantom_cow_fault(struct phantom_vmx_cpu_state *state, u64 gpa)
 	const struct phantom_gpa_region *rgn;
 	u64 *pd_entry;
 
+	/*
+	 * Class B: all GPAs 0–256MB are RAM, all 4KB (no 2MB split needed).
+	 * Skip GPA classification and 2MB split detection (Class A only).
+	 */
+	if (state->class_b) {
+		if (gpa >= ((u64)PHANTOM_CLASS_B_RAM_MB << 20))
+			return -EFAULT;
+		return phantom_cow_4kb_page(state, gpa);
+	}
+
 	/* Step 1: Classify GPA — only RAM pages are CoW-eligible */
 	rgn = phantom_ept_classify_gpa(gpa);
 	if (rgn->type != PHANTOM_GPA_RAM) {
@@ -590,7 +604,12 @@ void phantom_cow_abort_iteration(struct phantom_vmx_cpu_state *state)
 		struct phantom_dirty_entry *de = &state->dirty_list[i];
 		u64 *pte_ptr;
 
-		pte_ptr = phantom_ept_lookup_pte(&state->ept, de->gpa);
+		if (state->class_b)
+			pte_ptr = phantom_ept_lookup_pte_class_b(state,
+								  de->gpa);
+		else
+			pte_ptr = phantom_ept_lookup_pte(&state->ept,
+							  de->gpa);
 		if (pte_ptr) {
 			/*
 			 * Restore PTE to original HPA with RO permissions.
