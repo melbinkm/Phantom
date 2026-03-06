@@ -96,6 +96,8 @@ def main():
     parser.add_argument('--guest-mem-mb', type=int, default=256)
     parser.add_argument('--skip-boot', action='store_true',
                         help='Skip BOOT_KERNEL (guest already running)')
+    parser.add_argument('--boot-wait', type=int, default=2,
+                        help='Seconds to wait after boot (default: 2)')
     args = parser.parse_args()
 
     if not os.path.exists('/dev/phantom'):
@@ -111,7 +113,7 @@ def main():
         if not args.skip_boot:
             if not boot_kernel(fd, args.bzimage, args.cpu, args.guest_mem_mb):
                 return 1
-            time.sleep(2.0)  # wait for guest harness init
+            time.sleep(args.boot_wait)  # wait for guest harness init
 
         t0 = time.time()
         count, ok = run_iterations(fd, args.seconds, args.iterations)
