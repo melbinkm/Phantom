@@ -486,6 +486,133 @@ struct phantom_status {
 #define PHANTOM_MMAP_TOPA_BUF_B_LEGACY	0x20000UL
 
 /* ------------------------------------------------------------------
+ * Task 3.1: Class B (Linux kernel guest) boot ioctl
+ * ------------------------------------------------------------------ */
+
+/*
+ * Maximum bzImage size accepted by PHANTOM_IOCTL_BOOT_KERNEL.
+ */
+#define PHANTOM_MAX_BZIMAGE_SIZE	(64 * 1024 * 1024)  /* 64MB */
+
+/*
+ * struct phantom_boot_kernel_args — arguments for PHANTOM_IOCTL_BOOT_KERNEL.
+ *
+ * bzimage_uaddr: Userspace virtual address of the bzImage data.
+ * bzimage_size:  Size of the bzImage in bytes (must be <= PHANTOM_MAX_BZIMAGE_SIZE).
+ * cpu:           Phantom vCPU index to use (0 = first).
+ * guest_mem_mb:  Guest physical memory in MB (256 for Class B).
+ */
+struct phantom_boot_kernel_args {
+	__u64 bzimage_uaddr;   /* IN: userspace VA of bzImage data */
+	__u64 bzimage_size;    /* IN: size in bytes                */
+	__u32 cpu;             /* IN: which Phantom core to use    */
+	__u32 guest_mem_mb;    /* IN: 256 for Class B              */
+};
+
+/*
+ * PHANTOM_IOCTL_BOOT_KERNEL — load a Linux bzImage into a Class B guest.
+ *
+ * Copies the bzImage from userspace, allocates a 256MB EPT, loads the
+ * kernel image, populates boot_params, and configures the VMCS for
+ * 64-bit Linux boot.
+ *
+ * Returns 0 on success.
+ * Returns -EINVAL if cpu is invalid or bzimage_size is 0 or too large.
+ * Returns -ENOMEM if EPT or page allocation fails.
+ */
+#define PHANTOM_IOCTL_BOOT_KERNEL \
+	_IOW(PHANTOM_IOC_MAGIC, 22, struct phantom_boot_kernel_args)
+
+/* ------------------------------------------------------------------
+ * Task 3.2: Per-iteration state ioctl for determinism testing
+ * ------------------------------------------------------------------ */
+
+/*
+ * Maximum dirty pages returned by PHANTOM_IOCTL_GET_ITER_STATE.
+ * Matches the CoW pool capacity (dirty_max).
+ */
+#define PHANTOM_MAX_DIRTY_PAGES		4096
+
+/*
+ * struct phantom_iter_state — per-iteration state for determinism testing.
+ *
+ * Returned by PHANTOM_IOCTL_GET_ITER_STATE after each iteration.
+ * Captures guest register state, dirty page list, TSS verification
+ * results, and run result so the determinism test can compare two
+ * runs of the same input.
+ *
+ * All VMCS-sourced fields (rip, rflags, cr3) are cached at HC_RELEASE
+ * time while still in VMX-root context, then copied here on ioctl.
+ *
+ * Fields:
+ *   rax–r15:          Guest GPRs at iteration end (from state->guest_regs).
+ *   rip:              Guest RIP at RELEASE/PANIC/KASAN exit.
+ *   rflags:           Guest RFLAGS at exit.
+ *   cr3:              Guest CR3 at exit.
+ *   dirty_count:      Number of dirty pages in this iteration.
+ *   dirty_gpas:       GPAs of dirty pages (up to PHANTOM_MAX_DIRTY_PAGES).
+ *   tss_verified:     True if TSS page was found in the dirty list.
+ *   tss_rsp0_snapshot: RSP0 value from TSS at snapshot time.
+ *   tss_rsp0_restored: RSP0 value from TSS after restore (should match).
+ *   run_result:       PHANTOM_RESULT_* code for the iteration.
+ */
+struct phantom_iter_state {
+	/* Guest register state at iteration end */
+	__u64 rax, rbx, rcx, rdx, rsi, rdi, rsp, rbp;
+	__u64 r8, r9, r10, r11, r12, r13, r14, r15;
+	__u64 rip, rflags, cr3;
+
+	/* Dirty page list */
+	__u32 dirty_count;
+	__u32 _pad0;
+	__u64 dirty_gpas[PHANTOM_MAX_DIRTY_PAGES];
+
+	/* TSS verification */
+	__u8  tss_verified;
+	__u8  _pad1[7];
+	__u64 tss_rsp0_snapshot;
+	__u64 tss_rsp0_restored;
+
+	/* Run result */
+	__u32 run_result;
+	__u32 _pad2;
+};
+
+/*
+ * PHANTOM_IOCTL_GET_ITER_STATE — read per-iteration state for determinism test.
+ *
+ * Fills a struct phantom_iter_state with the guest register state,
+ * dirty page list, TSS verification results, and run result from the
+ * most recently completed iteration.
+ *
+ * Must be called after RUN_ITERATION or RUN_GUEST completes.
+ * Fields are populated at HC_RELEASE/PANIC/KASAN time in VMX-root context.
+ *
+ * The arg must be a userspace pointer to struct phantom_iter_state.
+ * The struct is too large (>16KB) for _IOR's size field encoding, so
+ * _IO is used; the kernel copies sizeof(struct phantom_iter_state) bytes.
+ *
+ * Returns 0 on success.
+ * Returns -ENODEV if no vCPU is bound to this fd.
+ * Returns -EFAULT on copy_to_user failure.
+ */
+#define PHANTOM_IOCTL_GET_ITER_STATE	_IO(PHANTOM_IOCTL_MAGIC, 23)
+
+/*
+ * PHANTOM_IOCTL_GET_MULTICORE_STATS — retrieve per-core exec/sec statistics.
+ *
+ * Returns a struct phantom_multicore_stats with:
+ *   active_cores:       number of running vCPU threads
+ *   total_exec_per_sec: sum of per-core exec/sec
+ *   per_core_exec[8]:   per-core exec/sec (0 for inactive cores)
+ *
+ * Defined in multicore.h; reproduced here for discoverability.
+ *   _IOR(PHANTOM_IOCTL_MAGIC, 24, struct phantom_multicore_stats)
+ *
+ * Returns 0 on success, -ENXIO if multicore not initialised.
+ */
+
+/* ------------------------------------------------------------------
  * Forward declaration — struct phantom_dev is defined in phantom.h
  * ------------------------------------------------------------------ */
 struct phantom_dev;

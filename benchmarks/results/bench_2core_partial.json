@@ -1,0 +1,35 @@
+{
+  "benchmark": "phantom_2core_partial",
+  "timestamp": "2026-03-06T10:00:00",
+  "note": "2-core fuzzing hangs after ~2-3 minutes on i7-6700 (4 physical cores). Data collected from stable window before hang. Multiple attempts (wait_event fix, cond_resched fix, clean reboot) all produce same result. Only 1-core is stable for sustained benchmarking on this hardware.",
+  "config": {
+    "cores": 2,
+    "seconds_per_run": 15,
+    "total_runs": 30,
+    "warmup_runs": 5,
+    "completed_runs": 8,
+    "hung_on_run": 9
+  },
+  "samples": [
+    {"run": 1, "total_exec_per_sec": 138115, "per_core": {"0": 68818, "1": 69299}},
+    {"run": 2, "total_exec_per_sec": 138691, "per_core": {"0": 68363, "1": 70329}},
+    {"run": 3, "total_exec_per_sec": 138482, "per_core": {"0": 68485, "1": 69998}},
+    {"run": 4, "total_exec_per_sec": 136852, "per_core": {"0": 68273, "1": 68580}},
+    {"run": 5, "total_exec_per_sec": 137058, "per_core": {"0": 69795, "1": 67264}},
+    {"run": 6, "total_exec_per_sec": 141234, "per_core": {"0": 70153, "1": 71082}},
+    {"run": 7, "total_exec_per_sec": 139199, "per_core": {"0": 69468, "1": 69732}},
+    {"run": 8, "total_exec_per_sec": 137749, "per_core": {"0": 69076, "1": 68673}}
+  ],
+  "summary": {
+    "n": 8,
+    "cores": 2,
+    "median": 138298,
+    "p25": 137405,
+    "p75": 138945,
+    "min": 136852,
+    "max": 141234,
+    "per_core_median": 69187,
+    "scaling_efficiency": 0.788,
+    "stability": "UNSTABLE — hangs after ~2-3 min sustained fuzzing"
+  }
+}

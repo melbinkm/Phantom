@@ -1,0 +1,102 @@
+# Phantom Class B guest kernel configuration
+# Minimal Linux for fuzzing — no SMP, no modules, KASAN enabled
+CONFIG_64BIT=y
+CONFIG_X86_64=y
+
+# CPU
+CONFIG_SMP=n
+CONFIG_NR_CPUS=1
+CONFIG_HYPERVISOR_GUEST=n
+CONFIG_PARAVIRT=n
+
+# Preemption / scheduling
+CONFIG_PREEMPT_NONE=y
+CONFIG_HZ_100=y
+
+# Memory
+CONFIG_HIGHMEM64G=n
+CONFIG_NUMA=n
+CONFIG_MEMORY_HOTPLUG=n
+CONFIG_SPARSEMEM_VMEMMAP=y
+
+# Modules (disabled for determinism)
+CONFIG_MODULES=n
+
+# Networking (disabled — not needed)
+CONFIG_NET=n
+CONFIG_INET=n
+
+# Block / storage (disabled)
+CONFIG_BLOCK=n
+CONFIG_BLK_DEV_INITRD=n
+
+# Filesystems (disabled)
+CONFIG_EXT4_FS=n
+CONFIG_PROC_FS=n
+CONFIG_SYSFS=n
+CONFIG_TMPFS=n
+CONFIG_VFS=n
+
+# Randomisation (disabled for determinism)
+CONFIG_RANDOMIZE_BASE=n
+CONFIG_RANDOMIZE_KSTACK_OFFSET_DEFAULT=n
+CONFIG_SLAB_FREELIST_RANDOM=n
+CONFIG_SLAB_FREELIST_HARDENED=n
+CONFIG_SHUFFLE_PAGE_ALLOCATOR=n
+CONFIG_RANDOM_TRUST_CPU=n
+CONFIG_RANDOM_TRUST_BOOTLOADER=n
+
+# KASAN — disabled: shadow memory init causes 8+ min boot delay in Phantom
+# Enable only when diagnosing kernel memory bugs, not for boot testing.
+CONFIG_KASAN=n
+
+# Printk / early boot output
+CONFIG_PRINTK=y
+CONFIG_EARLY_PRINTK=y
+CONFIG_EARLY_PRINTK_DBGP=n
+
+# Debug info for crash analysis
+CONFIG_DEBUG_INFO=y
+CONFIG_DEBUG_INFO_DWARF4=y
+CONFIG_FRAME_POINTER=y
+CONFIG_STACKTRACE=y
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+CONFIG_PANIC_ON_OOPS=y
+CONFIG_PANIC_TIMEOUT=0
+
+# Serial / console (minimal)
+CONFIG_TTY=y
+CONFIG_SERIAL_8250=n
+CONFIG_VIRTIO_CONSOLE=n
+CONFIG_HVC_DRIVER=y
+CONFIG_HVC_IRQ=y
+
+# Timers
+CONFIG_HZ=100
+CONFIG_NO_HZ_IDLE=y
+CONFIG_HIGH_RES_TIMERS=n
+
+# APIC
+CONFIG_X86_LOCAL_APIC=n
+CONFIG_X86_IO_APIC=n
+CONFIG_X86_REBOOTFIXUPS=n
+
+# PCI / ACPI (disabled — Phantom has no PCI bus)
+CONFIG_PCI=n
+CONFIG_ACPI=n
+
+# USB / HID / Sound / DRM (all disabled)
+CONFIG_USB=n
+CONFIG_HID=n
+CONFIG_SOUND=n
+CONFIG_DRM=n
+
+# Crypto (minimal)
+CONFIG_CRYPTO=n
+
+# GCC plugins (disable for reproducibility)
+# CONFIG_GCC_PLUGINS=n implicitly disables CONFIG_GCC_PLUGIN_RANDSTRUCT.
+# Explicit =n is redundant but stated for the audit table (source #7).
+CONFIG_GCC_PLUGINS=n
+CONFIG_GCC_PLUGIN_RANDSTRUCT=n

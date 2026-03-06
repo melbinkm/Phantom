@@ -181,6 +181,96 @@ static int inject_payload(struct phantom_vmx_cpu_state *state)
 }
 
 /* ------------------------------------------------------------------
+ * TSS dirty-list verification (Task 3.2)
+ *
+ * Called from HC_RELEASE after the dirty list is fully populated but
+ * BEFORE phantom_snapshot_restore() resets dirty_count to 0.
+ *
+ * Hot-path rules: no printk, no sleeping, no allocation.
+ * Uses pr_warn_ratelimited (not on the true hot path — once per iter
+ * and only when verification fails, which is a diagnostic case).
+ * ------------------------------------------------------------------ */
+
+/*
+ * phantom_verify_tss_dirty - Check TSS page is in the CoW dirty list.
+ * @state: Per-CPU VMX state.
+ *
+ * The TSS GPA is derived from VMCS_GUEST_TR_BASE (page-aligned).
+ * Must be called from VMX-root context (VMCS is current).
+ * Sets state->tss_dirty_verified = true if found.
+ */
+static void phantom_verify_tss_dirty(struct phantom_vmx_cpu_state *state)
+{
+	u64 tss_base = phantom_vmcs_read64(VMCS_GUEST_TR_BASE);
+	u64 tss_gpa  = tss_base & PAGE_MASK;
+	bool found   = false;
+	u32 i;
+
+	for (i = 0; i < state->dirty_count; i++) {
+		if (state->dirty_list[i].gpa == tss_gpa) {
+			found = true;
+			break;
+		}
+	}
+
+	if (!found) {
+		pr_warn_ratelimited(
+			"phantom: TSS GPA 0x%llx NOT in dirty list "
+			"(dirty_count=%u iter=%u)\n",
+			tss_gpa, state->dirty_count, state->cow_iteration);
+	}
+
+	state->tss_dirty_verified = found;
+}
+
+/*
+ * phantom_check_tss_rsp0_restored - Verify TSS RSP0 matches snapshot.
+ * @state: Per-CPU VMX state.
+ *
+ * Called after phantom_snapshot_restore() to confirm the TSS page was
+ * correctly restored.  Reads RSP0 (offset 4 in x86-64 TSS layout) from
+ * guest memory and compares to tss_rsp0_snapshot.
+ *
+ * Must be called from VMX-root context (EPT is active).
+ */
+static void phantom_check_tss_rsp0_restored(struct phantom_vmx_cpu_state *state)
+{
+	u64 tss_base = phantom_vmcs_read64(VMCS_GUEST_TR_BASE);
+	u64 rsp0_gpa = (tss_base & PAGE_MASK) + 4;
+	u64 *rsp0_kva;
+
+	rsp0_kva = phantom_gpa_to_kva(state, rsp0_gpa);
+	if (!rsp0_kva) {
+		state->tss_rsp0_restored = 0;
+		return;
+	}
+
+	state->tss_rsp0_restored = *rsp0_kva;
+
+	if (state->tss_rsp0_restored != state->tss_rsp0_snapshot) {
+		pr_warn_ratelimited(
+			"phantom: TSS RSP0 mismatch after restore: "
+			"snap=0x%llx restored=0x%llx\n",
+			state->tss_rsp0_snapshot, state->tss_rsp0_restored);
+	}
+}
+
+/*
+ * phantom_cache_iter_exit_regs - Cache VMCS guest state at iteration end.
+ * @state: Per-CPU VMX state.
+ *
+ * Must be called from VMX-root context (VMCS is current) before any
+ * snapshot_restore() call resets the VMCS guest-state fields.
+ */
+static void phantom_cache_iter_exit_regs(struct phantom_vmx_cpu_state *state)
+{
+	state->last_guest_rip    = phantom_vmcs_read64(VMCS_GUEST_RIP);
+	state->last_guest_rflags = phantom_vmcs_read64(VMCS_GUEST_RFLAGS);
+	state->last_guest_rsp    = phantom_vmcs_read64(VMCS_GUEST_RSP);
+	state->last_guest_cr3    = phantom_vmcs_read64(VMCS_GUEST_CR3);
+}
+
+/* ------------------------------------------------------------------
  * kAFL/Nyx ABI hypercall handlers
  * ------------------------------------------------------------------ */
 
@@ -242,11 +332,17 @@ static int handle_acquire(struct phantom_vmx_cpu_state *state)
 	int ret;
 
 	if (!state->snap_acquired) {
+		u64 tss_base, rsp0_gpa;
+		u64 *rsp0_kva;
+
 		/*
-		 * First ACQUIRE: create the snapshot.
-		 * phantom_snapshot_create() saves all GPRs, VMCS fields,
-		 * XSAVE, and marks all RAM EPT pages read-only.
+		 * First ACQUIRE: initialise the kernel-side guest heap pointer
+		 * to HEAP_BASE before creating the snapshot.  This value will
+		 * be restored on every subsequent snapshot_restore() so each
+		 * fuzzing iteration starts with a clean bump allocator.
 		 */
+		state->guest_heap_ptr = PHANTOM_GUEST_HEAP_BASE;
+
 		ret = phantom_snapshot_create(state);
 		if (ret) {
 			state->run_result = PHANTOM_RESULT_HYPERCALL_ERROR;
@@ -254,7 +350,24 @@ static int handle_acquire(struct phantom_vmx_cpu_state *state)
 		}
 		state->snap_acquired = true;
 		state->snap_taken = true;
+
+		/*
+		 * Task 3.2: Capture TSS RSP0 at snapshot time so we can verify
+		 * it is correctly restored after each iteration.  RSP0 is at
+		 * byte offset 4 of the x86-64 TSS (a u64 aligned to 4 bytes).
+		 */
+		tss_base = phantom_vmcs_read64(VMCS_GUEST_TR_BASE);
+		rsp0_gpa = (tss_base & PAGE_MASK) + 4;
+		rsp0_kva = phantom_gpa_to_kva(state, rsp0_gpa);
+		state->tss_rsp0_snapshot = rsp0_kva ? *rsp0_kva : 0;
+
+		/* Signal Class B guest boot success to host dmesg for test detection. */
+		if (state->class_b)
+			pr_info("phantom-harness: init\n");
 	}
+
+	/* Reset per-iteration TSS verification flag. */
+	state->tss_dirty_verified = false;
 
 	/*
 	 * Inject current payload into guest RAM before the guest
@@ -284,9 +397,12 @@ static int handle_acquire(struct phantom_vmx_cpu_state *state)
  */
 static int handle_release(struct phantom_vmx_cpu_state *state)
 {
+	int ret;
+
 	state->run_result = PHANTOM_RESULT_OK;
 	state->crash_addr = 0;
 	state->iteration_active = false;
+	state->iter_count++;
 
 	if (state->shared_mem) {
 		struct phantom_shared_mem *sm =
@@ -296,11 +412,34 @@ static int handle_release(struct phantom_vmx_cpu_state *state)
 	}
 
 	/*
+	 * Task 3.2: Cache VMCS guest-state before snapshot_restore() resets
+	 * the VMCS fields.  These are used by PHANTOM_IOCTL_GET_ITER_STATE.
+	 */
+	phantom_cache_iter_exit_regs(state);
+
+	/*
+	 * Task 3.2: Verify TSS page appears in the dirty list for this
+	 * iteration, BEFORE snapshot_restore() resets dirty_count to 0.
+	 * Only meaningful when CoW is active (snap_acquired = true).
+	 */
+	if (state->snap_acquired && state->dirty_list)
+		phantom_verify_tss_dirty(state);
+
+	/*
 	 * Restore snapshot: resets dirty EPT pages, restores VMCS,
 	 * restores GPRs, XRSTOR extended state, issues batched INVEPT.
 	 * After this returns, the caller does VMRESUME from snap->rip.
 	 */
-	return phantom_snapshot_restore(state);
+	ret = phantom_snapshot_restore(state);
+
+	/*
+	 * Task 3.2: After restore, verify TSS RSP0 matches the snapshot value.
+	 * This catches TSS restore failures (e.g., dirty list missed the page).
+	 */
+	if (state->snap_acquired)
+		phantom_check_tss_rsp0_restored(state);
+
+	return ret;
 }
 
 /*
@@ -313,6 +452,7 @@ static int handle_panic(struct phantom_vmx_cpu_state *state)
 	state->run_result = PHANTOM_RESULT_CRASH;
 	state->crash_addr = state->guest_regs.rcx;
 	state->iteration_active = false;
+	state->iter_count++;
 
 	if (state->shared_mem) {
 		struct phantom_shared_mem *sm =
@@ -320,6 +460,9 @@ static int handle_panic(struct phantom_vmx_cpu_state *state)
 		sm->status = PHANTOM_RESULT_CRASH;
 		sm->crash_addr = state->crash_addr;
 	}
+
+	/* Task 3.2: Cache VMCS state before restore resets it. */
+	phantom_cache_iter_exit_regs(state);
 
 	return phantom_snapshot_restore(state);
 }
@@ -334,6 +477,7 @@ static int handle_kasan(struct phantom_vmx_cpu_state *state)
 	state->run_result = PHANTOM_RESULT_KASAN;
 	state->crash_addr = 0;
 	state->iteration_active = false;
+	state->iter_count++;
 
 	if (state->shared_mem) {
 		struct phantom_shared_mem *sm =
@@ -341,6 +485,9 @@ static int handle_kasan(struct phantom_vmx_cpu_state *state)
 		sm->status = PHANTOM_RESULT_KASAN;
 		sm->crash_addr = 0;
 	}
+
+	/* Task 3.2: Cache VMCS state before restore resets it. */
+	phantom_cache_iter_exit_regs(state);
 
 	return phantom_snapshot_restore(state);
 }

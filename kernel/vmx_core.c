@@ -55,6 +55,9 @@
 #include "debug.h"
 #include "memory.h"
 #include "pt_config.h"
+#include "cpuid_emul.h"
+#include "msr_emul.h"
+#include "guest_boot.h"
 
 /* Per-CPU VMX state — one entry per physical CPU */
 DEFINE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);
@@ -582,17 +585,16 @@ static int phantom_vmcs_setup_controls(struct phantom_vmx_cpu_state *state,
 	u32 pin, proc, proc2, exit_c, entry_c;
 
 	/*
-	 * Pin-based: external-int exiting + NMI exiting.
+	 * Pin-based: external-int exiting + NMI exiting +
+	 * VMX preemption timer (guards against guest infinite loops).
 	 *
-	 * NOTE: VMX preemption timer (PIN_BASED_PREEMPT_TIMER) is deliberately
-	 * NOT enabled for nested KVM testing.  In a nested VMX environment,
-	 * the L0 KVM hypervisor may propagate the preemption timer expiry to L1
-	 * as an asynchronous VM exit AFTER L1's guest (L2) has already exited.
-	 * This causes a spurious EXIT_REASON_PREEMPT_TIMER exit in phantom's
-	 * context, crashing the guest kernel.
+	 * phantom_adjust_controls() leaves the timer bit cleared if the
+	 * CPU does not support it — in that case preemption_timer_value
+	 * stays 0 and we skip the per-iteration timer write below.
 	 *
-	 * For Phase 2+ bare-metal deployment, re-enable with appropriate
-	 * handling to guard against this spurious exit.
+	 * On bare-metal the timer fires as expected.  Under nested KVM
+	 * (phase 0–1) it could cause spurious exits, but phase 2+ runs
+	 * directly on hardware, so this is safe.
 	 */
 	{
 		u32 msr = use_true_ctls ?
@@ -600,9 +602,30 @@ static int phantom_vmcs_setup_controls(struct phantom_vmx_cpu_state *state,
 			MSR_IA32_VMX_PINBASED_CTLS;
 
 		pin = phantom_adjust_controls(
-			PIN_BASED_EXT_INT_EXITING | PIN_BASED_NMI_EXITING,
+			PIN_BASED_EXT_INT_EXITING | PIN_BASED_NMI_EXITING |
+			(state->class_b ? 0 : PIN_BASED_VMX_PREEMPTION_TIMER),
 			msr);
 		phantom_vmcs_write32(VMCS_CTRL_PINBASED, pin);
+
+		/*
+		 * Compute the preemption timer value for a 1-second timeout.
+		 *
+		 * IA32_VMX_MISC[4:0] gives the shift N: timer decrements at
+		 * TSC / (2^N).  Convert 1s × tsc_khz → timer ticks.
+		 *   timer_value = (tsc_khz × 1000) >> N
+		 * tsc_khz is the Linux kernel global (TSC frequency in kHz).
+		 */
+		if (pin & PIN_BASED_VMX_PREEMPTION_TIMER) {
+			u64 misc;
+			u32 timer_shift;
+
+			rdmsrl(MSR_IA32_VMX_MISC, misc);
+			timer_shift = (u32)(misc & 0x1f);
+			state->preemption_timer_value =
+				(u32)(((u64)tsc_khz * 1000ULL) >> timer_shift);
+		} else {
+			state->preemption_timer_value = 0;
+		}
 	}
 
 	/* Primary proc-based: HLT exiting + unconditional I/O +
@@ -622,9 +645,11 @@ static int phantom_vmcs_setup_controls(struct phantom_vmx_cpu_state *state,
 		phantom_vmcs_write32(VMCS_CTRL_PROCBASED, proc);
 	}
 
-	/* Secondary proc-based: EPT enable */
-	proc2 = phantom_adjust_controls(SECONDARY_EXEC_ENABLE_EPT,
-					MSR_IA32_VMX_PROCBASED_CTLS2);
+	/* Secondary proc-based: EPT + RDTSCP (Class B needs RDTSCP for tsc clocksource) */
+	proc2 = phantom_adjust_controls(
+		SECONDARY_EXEC_ENABLE_EPT |
+		(state->class_b ? SECONDARY_EXEC_ENABLE_RDTSCP : 0),
+		MSR_IA32_VMX_PROCBASED_CTLS2);
 	phantom_vmcs_write32(VMCS_CTRL_PROCBASED2, proc2);
 
 	/* VM-exit controls: host 64-bit + PAT + EFER.
@@ -676,18 +701,23 @@ static int phantom_vmcs_setup_controls(struct phantom_vmx_cpu_state *state,
 	}
 
 	/*
-	 * Exception bitmap: intercept all 32 exception vectors (0xFFFFFFFF).
-	 * This ensures any guest exception exits to us rather than going to
-	 * the guest IDT (which is empty — limit=0).  Without this, any
-	 * exception in the guest causes a double fault then triple fault.
-	 * The exit handler (phantom_vm_exit_dispatch) logs the vector and
-	 * treats it as a crash.
+	 * Exception bitmap:
+	 *   Class A: intercept all 32 vectors (0xFFFFFFFF).  The Class A
+	 *     guest has an empty IDT; any unhandled exception would triple-
+	 *     fault.  We log and treat as a crash.
+	 *   Class B: intercept only NMI (bit 2).  The Linux guest installs
+	 *     its own IDT during boot and handles all other exceptions.
+	 *     Intercepting them here would prevent the kernel from booting.
 	 */
-	phantom_vmcs_write32(VMCS_CTRL_EXCEPTION_BITMAP, 0xFFFFFFFFU);
+	phantom_vmcs_write32(VMCS_CTRL_EXCEPTION_BITMAP,
+			     state->class_b ? BIT(2) : 0xFFFFFFFFU);
 
 	/* MSR bitmap: 4KB zero page — no MSR exits */
 	phantom_vmcs_write64(VMCS_CTRL_MSR_BITMAP,
 			     page_to_phys(state->msr_bitmap));
+
+	/* TSC offset: 0 initially; set to -(snapshot_tsc) at snapshot time */
+	phantom_vmcs_write64(VMCS_CTRL_TSC_OFFSET, 0);
 
 	/* EPT pointer */
 	phantom_vmcs_write64(VMCS_CTRL_EPT_POINTER, eptp);
@@ -749,9 +779,14 @@ static int phantom_vmcs_setup_guest_state(void)
 	/* DR7 = 0x400 (standard reset value) */
 	phantom_vmcs_write64(VMCS_GUEST_DR7, 0x400ULL);
 
-	/* EFER: LME + LMA + SCE */
+	/* EFER: LME + LMA only — SCE (syscall enable) is intentionally cleared.
+	 * The bare guest has no OS and no LSTAR handler.  If musl emits a
+	 * syscall instruction it must fault as #UD (invalid opcode) so the
+	 * exception handler can report it rather than jumping to LSTAR=0 and
+	 * executing arbitrary payload bytes as code.
+	 */
 	phantom_vmcs_write64(VMCS_GUEST_IA32_EFER,
-			     EFER_LME | EFER_LMA | EFER_SCE);
+			     EFER_LME | EFER_LMA);
 
 	/* RFLAGS: bit 1 (reserved, must be 1) */
 	phantom_vmcs_write64(VMCS_GUEST_RFLAGS, 0x2ULL);
@@ -799,7 +834,16 @@ static int phantom_vmcs_setup_guest_state(void)
 	phantom_vmcs_write32(VMCS_GUEST_ES_AR,       0x10000);
 
 	phantom_vmcs_write16(VMCS_GUEST_FS_SELECTOR, 0);
-	phantom_vmcs_write64(VMCS_GUEST_FS_BASE,     0ULL);
+	/*
+	 * Task 2.4: Set FS.base to GPA 0x7000 (safe zero page within EPT RAM,
+	 * above null guard zone 0x0-0xFFF, below trampoline at 0x10000).
+	 * Targets compiled with -fstack-protector read the canary from
+	 * %fs:0x28; with FS.base=0 that would hit GPA 0x28 (null guard) →
+	 * false-positive EPT violation.  With FS.base=0x7000 the canary is
+	 * at GPA 0x7028 (readable, value=0); the check passes because the
+	 * stack itself is never corrupted across normal iteration boundaries.
+	 */
+	phantom_vmcs_write64(VMCS_GUEST_FS_BASE,     0x7000ULL);
 	phantom_vmcs_write32(VMCS_GUEST_FS_LIMIT,    0);
 	phantom_vmcs_write32(VMCS_GUEST_FS_AR,       0x10000);
 
@@ -1008,6 +1052,29 @@ int phantom_vmcs_setup(struct phantom_vmx_cpu_state *state)
 	 */
 	state->ept.ready = true;
 	phantom_ept_mark_all_ro(&state->ept);
+
+	/*
+	 * Task 2.4: Null guard page — GPA 0x000–0xFFF → EPT absent.
+	 *
+	 * Any guest access to GPA 0x0 (NULL pointer dereference, both
+	 * read and write) triggers an EPT violation with "GPA not readable"
+	 * qualification.  The exit handler detects this as a non-CoW fault
+	 * and sets PHANTOM_RESULT_CRASH, aborting the iteration.
+	 *
+	 * Without the guard, GPA 0x0 would be a mapped RO page; reads to
+	 * NULL would silently succeed (returning garbage from the snapshot
+	 * page) and writes would be CoW'd without crashing.
+	 *
+	 * Failure to install the guard (e.g., -ENOMEM) is non-fatal:
+	 * log a warning and continue without null-pointer crash detection.
+	 */
+	{
+		int ng_ret = phantom_ept_install_null_guard(&state->ept);
+
+		if (ng_ret && ng_ret != -EINVAL)
+			pr_warn("phantom: CPU%d: null guard install failed: %d\n",
+				state->cpu, ng_ret);
+	}
 
 	/*
 	 * Task 1.4: Initialise CoW page pool.
@@ -1578,9 +1645,13 @@ static int phantom_vcpu_fn(void *data)
 	complete(&state->vcpu_init_done);
 
 	if (state->vcpu_init_result) {
-		/* Init failed — cannot proceed; thread exits cleanly. */
+		/* Init failed — cannot proceed; thread exits cleanly.
+		 * Signal vcpu_stopped so phantom_vcpu_thread_stop() does
+		 * not deadlock waiting on the completion.
+		 */
 		pr_err("phantom: CPU%d: vcpu init failed: %d\n",
 		       state->cpu, state->vcpu_init_result);
+		complete(&state->vcpu_stopped);
 		return state->vcpu_init_result;
 	}
 
@@ -1695,6 +1766,54 @@ static int phantom_vcpu_fn(void *data)
 			continue;
 		}
 
+		if (state->vcpu_run_request == 7) {
+			/*
+			 * Task 3.1: Full VMCS setup for Class B Linux boot.
+			 *
+			 * Run on the vCPU thread where the VMCS is current.
+			 * The ioctl handler has already called:
+			 *   phantom_ept_alloc_class_b() — EPT + state->ept.eptp set
+			 *   phantom_load_kernel_image() — kernel in guest RAM
+			 *   phantom_msr_bitmap_setup_class_b()
+			 *   phantom_msr_state_init()
+			 *   state->pages_allocated = true
+			 *
+			 * On re-boot (vcpu_phase2=true), the VMCS is in "active"
+			 * state from the previous VMLAUNCH.  VMLAUNCH requires
+			 * "clear" state.  Issue VMCLEAR before configure_fields to
+			 * return the VMCS to "clear" state, then VMPTRLD to make it
+			 * current again.
+			 *
+			 * Step A: configure_fields() sets up VMCS control fields
+			 *   (MSR bitmap, EPT pointer, exit/entry controls, PT),
+			 *   generic guest state, and host state.  Uses state->ept.eptp
+			 *   which was set to the Class B EPTP by
+			 *   phantom_ept_alloc_class_b().
+			 *
+			 * Step B: phantom_vmcs_setup_linux64() overwrites the
+			 *   generic guest state with Linux-specific values
+			 *   (RIP=kernel_entry_gpa, RSP=stack_top, CR0/CR3/CR4/EFER,
+			 *   segments, GDT, RSI=boot_params).
+			 */
+			if (READ_ONCE(state->vcpu_phase2) && state->vmcs_region) {
+				u64 phys = page_to_phys(state->vmcs_region);
+				if (__vmclear(phys) || __vmptrld(phys)) {
+					pr_err("phantom: CPU%d: re-boot VMCLEAR/VMPTRLD failed\n",
+					       state->cpu);
+					state->vcpu_run_result = -EIO;
+					complete(&state->vcpu_run_done);
+					continue;
+				}
+			}
+			state->vcpu_run_result =
+				phantom_vmcs_configure_fields(state);
+			if (!state->vcpu_run_result)
+				state->vcpu_run_result =
+					phantom_vmcs_setup_linux64(state);
+			complete(&state->vcpu_run_done);
+			continue;
+		}
+
 		/*
 		 * Task 2.1: vcpu_run_request == 6 — run one fuzzing iteration.
 		 *
@@ -1804,8 +1923,45 @@ static int phantom_vcpu_fn(void *data)
 		 */
 		phantom_pt_iteration_start(state);
 
+		/*
+		 * Task 2.4: Arm the VMX preemption timer.
+		 *
+		 * Written to the VMCS each iteration so the timer always
+		 * starts at the full budget.  The guest is forcibly evicted
+		 * after ~1s if it does not call HC_RELEASE first.
+		 * Skipped if preemption_timer_value == 0 (CPU lacks support).
+		 */
+		/*
+		 * Class B: do not arm the preemption timer during boot.
+		 * The kernel boot takes arbitrarily long; the timer would
+		 * terminate the boot after ~1s.  The boot_kernel_test.py
+		 * uses a wall-clock timeout to detect hung boots instead.
+		 * Class A: arm the timer for 1s guest execution timeout.
+		 */
+		if (state->preemption_timer_value && !state->class_b)
+			phantom_vmcs_write32(VMX_PREEMPTION_TIMER_VALUE,
+					     state->preemption_timer_value);
+
+		/*
+		 * Apply guest XCR0 before VM-entry.
+		 *
+		 * The hardware XCR0 register is shared between VMX-root and
+		 * VMX-nonroot.  When the guest issues XSETBV (caught as a
+		 * VM-exit), we record the value in guest_xcr0 without executing
+		 * xsetbv (to avoid corrupting the host FPU context).  Apply it
+		 * here, immediately before VMLAUNCH/VMRESUME, so the guest sees
+		 * the correct XCR0 during its non-root execution.  Restore the
+		 * host value (xcr0_supported) immediately after VM-exit.
+		 */
+		if (state->class_b && state->guest_xcr0)
+			xsetbv(XCR_XFEATURE_ENABLED_MASK, state->guest_xcr0);
+
 		/* Run the guest — pinned to state->cpu */
 		state->vcpu_run_result = phantom_run_guest(state);
+
+		/* Restore host XCR0 after VM-exit */
+		if (state->class_b && state->guest_xcr0 && state->xcr0_supported)
+			xsetbv(XCR_XFEATURE_ENABLED_MASK, state->xcr0_supported);
 
 		/*
 		 * Task 2.2: Finalise PT after VM exit (6-step MSR sequence).
@@ -1845,12 +2001,17 @@ static int phantom_vcpu_fn(void *data)
 		}
 
 		/*
-		 * After the first VMLAUNCH/VMRESUME, switch to busy-wait mode.
-		 * KVM L0's nested VMX tracking is now "dirty" for this CPU:
+		 * After the first VMLAUNCH/VMRESUME attempt, switch to busy-wait
+		 * mode.  KVM L0's nested VMX tracking is now "dirty" for this CPU:
 		 * any subsequent RESCHEDULE IPI will cause a triple fault.
 		 * From this point on, the thread never sleeps.
+		 *
+		 * Also set state->vcpu_phase2 so ioctl handlers can detect this
+		 * phase without relying on state->launched (which may be false if
+		 * VM-entry failed).
 		 */
 		vmlaunch_done = true;
+		WRITE_ONCE(state->vcpu_phase2, true);
 
 		/*
 		 * Signal ioctl handler that the run is complete.
@@ -2016,6 +2177,7 @@ int phantom_vcpu_thread_start(struct phantom_vmx_cpu_state *state)
 	state->vcpu_run_request    = 0;
 	state->vcpu_run_result     = 0;
 	state->vcpu_work_ready     = false;
+	state->vcpu_phase2         = false;
 	state->vcpu_stop_requested = false;
 	init_completion(&state->vcpu_stopped);
 
@@ -2144,6 +2306,94 @@ void phantom_vcpu_thread_stop(struct phantom_vmx_cpu_state *state)
  *  -ve — error
  * ------------------------------------------------------------------ */
 
+/*
+ * phantom_handle_cr_access - Handle MOV to/from CR VM exit (exit reason 28).
+ *
+ * Emulates CR0/CR3/CR4 reads and writes from the guest.
+ * Required for Class B (Linux kernel) guests that set CRs during boot.
+ */
+static int phantom_handle_cr_access(struct phantom_vmx_cpu_state *state)
+{
+	unsigned long qual = phantom_vmcs_read64(VMCS_RO_EXIT_QUAL);
+	int cr   = qual & 0xf;          /* bits 3:0 = CR number */
+	int type = (qual >> 4) & 0x3;   /* bits 5:4: 0=write, 1=read */
+	int reg  = (qual >> 8) & 0xf;   /* bits 11:8: general register */
+	unsigned long val = 0;
+	u32 ilen = phantom_vmcs_read32(VMCS_RO_EXIT_INSTR_LEN);
+
+	/* Read source register value for CR writes */
+	if (type == 0) { /* MOV to CR */
+		switch (reg) {
+		case 0:  val = state->guest_regs.rax; break;
+		case 1:  val = state->guest_regs.rcx; break;
+		case 2:  val = state->guest_regs.rdx; break;
+		case 3:  val = state->guest_regs.rbx; break;
+		case 4:  val = phantom_vmcs_read64(VMCS_GUEST_RSP); break;
+		case 5:  val = state->guest_regs.rbp; break;
+		case 6:  val = state->guest_regs.rsi; break;
+		case 7:  val = state->guest_regs.rdi; break;
+		case 8:  val = state->guest_regs.r8;  break;
+		case 9:  val = state->guest_regs.r9;  break;
+		case 10: val = state->guest_regs.r10; break;
+		case 11: val = state->guest_regs.r11; break;
+		case 12: val = state->guest_regs.r12; break;
+		case 13: val = state->guest_regs.r13; break;
+		case 14: val = state->guest_regs.r14; break;
+		case 15: val = state->guest_regs.r15; break;
+		}
+		switch (cr) {
+		case 0: phantom_vmcs_write64(VMCS_GUEST_CR0, val); break;
+		case 3: phantom_vmcs_write64(VMCS_GUEST_CR3, val); break;
+		case 4:
+			/*
+			 * Class B: CR4_MASK traps writes touching VMXE (bit 13).
+			 * The guest (Linux startup_64) clears VMXE from CR4 —
+			 * illegal in VMX non-root mode → #GP → triple fault.
+			 * Force VMXE back on so the hardware stays happy, and
+			 * update the read shadow so the guest sees its value.
+			 */
+			if (state->class_b)
+				val |= X86_CR4_VMXE;
+			phantom_vmcs_write64(VMCS_GUEST_CR4, val);
+			if (state->class_b)
+				phantom_vmcs_write64(VMCS_CTRL_CR4_READ_SHADOW,
+						     val & ~X86_CR4_VMXE);
+			break;
+		default:
+			pr_warn_ratelimited("phantom: unhandled CR%d write\n", cr);
+		}
+	} else if (type == 1) { /* MOV from CR */
+		switch (cr) {
+		case 0: val = phantom_vmcs_read64(VMCS_GUEST_CR0); break;
+		case 3: val = phantom_vmcs_read64(VMCS_GUEST_CR3); break;
+		case 4: val = phantom_vmcs_read64(VMCS_GUEST_CR4); break;
+		default:
+			pr_warn_ratelimited("phantom: unhandled CR%d read\n", cr);
+		}
+		switch (reg) {
+		case 0:  state->guest_regs.rax = val; break;
+		case 1:  state->guest_regs.rcx = val; break;
+		case 2:  state->guest_regs.rdx = val; break;
+		case 3:  state->guest_regs.rbx = val; break;
+		case 4:  phantom_vmcs_write64(VMCS_GUEST_RSP, val); break;
+		case 5:  state->guest_regs.rbp = val; break;
+		case 6:  state->guest_regs.rsi = val; break;
+		case 7:  state->guest_regs.rdi = val; break;
+		case 8:  state->guest_regs.r8  = val; break;
+		case 9:  state->guest_regs.r9  = val; break;
+		case 10: state->guest_regs.r10 = val; break;
+		case 11: state->guest_regs.r11 = val; break;
+		case 12: state->guest_regs.r12 = val; break;
+		case 13: state->guest_regs.r13 = val; break;
+		case 14: state->guest_regs.r14 = val; break;
+		case 15: state->guest_regs.r15 = val; break;
+		}
+	}
+	phantom_vmcs_write64(VMCS_GUEST_RIP,
+			     phantom_vmcs_read64(VMCS_GUEST_RIP) + ilen);
+	return 0;
+}
+
 static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 {
 	u32 reason;
@@ -2205,8 +2455,131 @@ static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 			if (info & BIT(11))
 				ec = phantom_vmcs_read32(VMCS_RO_EXIT_INTR_EC);
 
-			pr_err("phantom: CPU%d: EXCEPTION vec=%u "
-			       "info=0x%08x ec=0x%x RIP=0x%llx\n",
+			/*
+			 * #UD (vec=6) intercept for bare-metal guest syscalls.
+			 *
+			 * EFER_SCE is cleared so 'syscall' (0F 05) raises #UD
+			 * instead of jumping to the unset LSTAR.  We implement
+			 * the minimal Linux syscall ABI the musl allocator needs:
+			 *
+			 *   SYS_write       (1)   — silently succeed
+				 *   SYS_mmap        (9)   — anonymous mmap via bump allocator
+				 *   SYS_mprotect    (10)  — no-op
+				 *   SYS_munmap      (11)  — no-op
+				 *   SYS_brk         (12)  — bump pointer extend
+				 *   SYS_gettimeofday(96)  — return epoch (VDSO fallback)
+				 *   SYS_clock_gettime(228)— return epoch (VDSO fallback)
+			 *
+			 * guest_heap_ptr lives in the kernel and is reset to
+			 * PHANTOM_GUEST_HEAP_BASE on every snapshot restore so
+			 * each fuzzing iteration starts with a clean heap.
+			 */
+			if (vec == 6) {
+				/* Read 2 instruction bytes from guest GPA */
+				struct page *pg;
+				u8 *kva;
+				u8 b0 = 0, b1 = 0;
+
+				pg = phantom_ept_get_ram_page(&state->ept,
+							      guest_rip);
+				if (pg) {
+					kva = (u8 *)page_address(pg) +
+					      (guest_rip & (PAGE_SIZE - 1));
+					b0 = kva[0];
+					/*
+					 * Safe only if the second byte is on
+					 * the same page (true for all but the
+					 * very last byte of a page — extremely
+					 * unlikely for a 'syscall' instruction).
+					 */
+					if ((guest_rip & (PAGE_SIZE - 1)) <
+					    (PAGE_SIZE - 1))
+						b1 = kva[1];
+				}
+
+				if (b0 == 0x0F && b1 == 0x05) {
+					/* It's a 'syscall' — handle it */
+					u64 nr  = state->guest_regs.rax;
+					u64 a1  = state->guest_regs.rdi;
+					u64 a2  = state->guest_regs.rsi;
+					u64 res = (u64)(s64)-38; /* -ENOSYS */
+
+					switch (nr) {
+					case 1: /* SYS_write */
+						res = state->guest_regs.rdx;
+						break;
+
+					case 9: { /* SYS_mmap */
+						u64 flags = state->guest_regs.r10;
+						s32 fd    = (s32)state->guest_regs.r8;
+
+						/* Only anonymous mmap */
+						if (fd == -1 &&
+						    (flags & 0x20 /* MAP_ANONYMOUS */)) {
+							u64 len = (a2 + 15ULL) & ~15ULL;
+
+							if (state->guest_heap_ptr + len <=
+							    PHANTOM_GUEST_HEAP_LIMIT) {
+								res = state->guest_heap_ptr;
+								state->guest_heap_ptr += len;
+							} else {
+								res = (u64)-1; /* MAP_FAILED */
+							}
+						} else {
+							res = (u64)-1; /* MAP_FAILED */
+						}
+						break;
+					}
+
+					case 10: /* SYS_mprotect — no-op */
+						res = 0;
+						break;
+
+					case 11: /* SYS_munmap — no-op */
+						res = 0;
+						break;
+
+					case 12: /* SYS_brk */
+						if (a1 == 0) {
+							res = state->guest_heap_ptr;
+						} else if (a1 >= PHANTOM_GUEST_HEAP_BASE &&
+							   a1 <= PHANTOM_GUEST_HEAP_LIMIT) {
+							state->guest_heap_ptr = a1;
+							res = a1;
+						} else {
+							/* Failed: return current brk */
+							res = state->guest_heap_ptr;
+						}
+						break;
+
+					case 96:  /* SYS_gettimeofday — return epoch */
+						/*
+						 * musl falls back to this syscall when
+						 * __vdsosym() returns NULL (no VDSO).
+						 * Struct timeval: {tv_sec=0, tv_usec=0}.
+						 */
+						res = 0;
+						break;
+
+					case 228: /* SYS_clock_gettime — return epoch */
+						/*
+						 * musl clock_gettime() VDSO fallback.
+						 * Struct timespec: {tv_sec=0, tv_nsec=0}.
+						 */
+						res = 0;
+						break;
+					}
+
+					state->guest_regs.rax = res;
+					/* Advance RIP past 'syscall' (2 bytes) */
+					phantom_vmcs_write64(VMCS_GUEST_RIP,
+							     guest_rip + 2);
+					return 0; /* continue guest */
+				}
+				/* Not a syscall — fall through to crash */
+			}
+
+			pr_err("phantom: CPU%d: EXCEPTION vec=%u info=0x%08x ec=0x%x RIP=0x%llx\n",
 			       state->cpu, vec, info, ec, guest_rip);
 			/*
 			 * Encode diagnostics in run_result_data so userspace
@@ -2253,25 +2626,89 @@ static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 		return 1;
 	}
 
-	case VMX_EXIT_CPUID: {
+		case VMX_EXIT_HLT:
 		/*
-		 * Minimal CPUID emulation: return all-zeros.
-		 * The trivial guest does not use CPUID, but handle it
-		 * to avoid infinite exit loops.
+		 * HLT: Class B guest kernel halted (idle or panic halt).
+		 * Flush any partial serial line, log the halt, and stop.
 		 */
-		u64 rip;
-		u32 ilen;
+		if (state->class_b) {
+			if (state->serial_buf_len > 0) {
+				state->serial_buf[state->serial_buf_len] = '\0';
+				pr_info("phantom[guest]: %s\n", state->serial_buf);
+				state->serial_buf_len = 0;
+			}
+			pr_info("phantom: CPU%d: Class B guest HLT at RIP=0x%llx\n",
+				state->cpu,
+				phantom_vmcs_read64(VMCS_GUEST_RIP));
+			state->run_result = 0; /* PHANTOM_RESULT_OK - clean halt */
+			return 1;
+		}
+		/* Class A should not HLT */
+		state->run_result = 1;
+		return 1;
 
-		state->guest_regs.rax = 0;
-		state->guest_regs.rbx = 0;
-		state->guest_regs.rcx = 0;
-		state->guest_regs.rdx = 0;
+	case VMX_EXIT_CPUID:
+		return phantom_handle_cpuid(state);
 
-		ilen = phantom_vmcs_read32(VMCS_RO_EXIT_INSTR_LEN);
-		rip  = phantom_vmcs_read64(VMCS_GUEST_RIP);
-		phantom_vmcs_write64(VMCS_GUEST_RIP, rip + ilen);
+	case VMX_EXIT_MSR_READ:
+		return phantom_handle_msr_read(state);
+
+	case VMX_EXIT_MSR_WRITE:
+		return phantom_handle_msr_write(state);
+
+	case VMX_EXIT_IO_INSTR: {
+		/*
+		 * Swallow I/O port access — advance RIP.
+		 * For Class B diagnostics: buffer COM1 (0x3F8) writes into
+		 * lines and log each complete line (no rate limiting).
+		 */
+		u64 qual = state->exit_qualification;
+		u32 ilen = phantom_vmcs_read32(VMCS_RO_EXIT_INSTR_LEN);
+		/* qual bits: [0]=size-1, [3]=in/out, [16:31]=port */
+		u32 port  = (qual >> 16) & 0xFFFF;
+		int is_in = (qual >> 3) & 1;
+
+		if (state->class_b && (port >= 0x3F8 && port <= 0x3FF)) {
+			/* COM1 (0x3F8-0x3FF) emulation for guest kernel serial output */
+			if (is_in) {
+				/*
+				 * Reads: return meaningful values.
+				 * LSR (0x3FD): bit5=THRE + bit6=TEMT = 0x60
+				 *   (transmitter empty — OK to write).
+				 * All other COM1 registers: return 0.
+				 */
+				if (port == 0x3FD)
+					state->guest_regs.rax =
+						(state->guest_regs.rax & ~0xFFULL) | 0x60;
+				else
+					state->guest_regs.rax &= ~0xFFULL;
+			} else {
+				/* Writes: log data register (0x3F8) to host dmesg */
+				if (port == 0x3F8) {
+					u8 ch = (u8)(state->guest_regs.rax & 0xFF);
+					/* Buffer into line then log */
+					if (ch == '\n' || ch == '\r' ||
+					    state->serial_buf_len >= (int)sizeof(state->serial_buf) - 1) {
+						if (state->serial_buf_len > 0) {
+							state->serial_buf[state->serial_buf_len] = '\0';
+							pr_info("phantom[guest]: %s\n",
+								state->serial_buf);
+							state->serial_buf_len = 0;
+						}
+					} else {
+						state->serial_buf[state->serial_buf_len++] = ch;
+					}
+				}
+			}
+		}
+
+		phantom_vmcs_write64(VMCS_GUEST_RIP,
+				     phantom_vmcs_read64(VMCS_GUEST_RIP) + ilen);
 		return 0;
 	}
+
+	case VMX_EXIT_CR_ACCESS:
+		return phantom_handle_cr_access(state);
 
 	case VMX_EXIT_EPT_VIOLATION: {
 		u64 gpa = phantom_vmcs_read64(VMCS_RO_GUEST_PHYS_ADDR);
@@ -2339,9 +2776,59 @@ static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 				     "qual=0x%llx type=%s\n",
 				     state->cpu, gpa, rip, qual, type_str);
 #endif
-			pr_err("phantom: CPU%d: EPT VIOLATION GPA=0x%llx "
-			       "RIP=0x%llx qual=0x%llx type=%s\n",
-			       state->cpu, gpa, rip, qual, type_str);
+			{
+				u64 rsp = phantom_vmcs_read64(VMCS_GUEST_RSP);
+
+				pr_err("phantom: CPU%d: EPT VIOLATION GPA=0x%llx "
+				       "RIP=0x%llx RSP=0x%llx qual=0x%llx type=%s\n",
+				       state->cpu, gpa, rip, rsp, qual, type_str);
+				pr_err("phantom: CPU%d:   RAX=0x%llx RBX=0x%llx "
+				       "RCX=0x%llx RDX=0x%llx\n",
+				       state->cpu,
+				       state->guest_regs.rax,
+				       state->guest_regs.rbx,
+				       state->guest_regs.rcx,
+				       state->guest_regs.rdx);
+				pr_err("phantom: CPU%d:   RSI=0x%llx RDI=0x%llx "
+				       "RBP=0x%llx R8=0x%llx\n",
+				       state->cpu,
+				       state->guest_regs.rsi,
+				       state->guest_regs.rdi,
+				       state->guest_regs.rbp,
+				       state->guest_regs.r8);
+
+				/* Diagnostic: read key guest memory at crash */
+				{
+					u64 *hp = phantom_gpa_to_kva(state,
+								     0x5540a0ULL);
+					u64 *xm = phantom_gpa_to_kva(state,
+								     0x554428ULL);
+					u64 *ra = phantom_gpa_to_kva(state,
+								     rsp + 24);
+
+					pr_err("phantom: CPU%d:   _heap_ptr=%s "
+					       "xmlMalloc=%s [RSP+24]=%s\n",
+					       state->cpu,
+					       hp ? ({
+						       static char _hb[20];
+						       snprintf(_hb, 20,
+							"0x%llx", *hp);
+						       _hb;
+					       }) : "?",
+					       xm ? ({
+						       static char _xb[20];
+						       snprintf(_xb, 20,
+							"0x%llx", *xm);
+						       _xb;
+					       }) : "?",
+					       ra ? ({
+						       static char _rb[20];
+						       snprintf(_rb, 20,
+							"0x%llx", *ra);
+						       _rb;
+					       }) : "?");
+				}
+			}
 		}
 
 		state->run_result = PHANTOM_RESULT_CRASH;
@@ -2359,14 +2846,81 @@ static int phantom_vm_exit_dispatch(struct phantom_vmx_cpu_state *state)
 	}
 
 	case VMX_EXIT_PREEMPT_TIMER: {
+#ifdef PHANTOM_DEBUG
 		u64 guest_rip = phantom_vmcs_read64(VMCS_GUEST_RIP);
 
-		pr_err("phantom: CPU%d: PREEMPT TIMER expired RIP=0x%llx "
-		       "(guest hung?)\n",
-		       state->cpu, guest_rip);
-		state->run_result = 2; /* PHANTOM_RESULT_TIMEOUT */
+		trace_printk("PHANTOM TIMEOUT cpu=%d RIP=0x%llx\n",
+			     state->cpu, guest_rip);
+#endif
+		state->run_result = PHANTOM_RESULT_TIMEOUT;
 		return 1;
 	}
+
+	case VMX_EXIT_XSETBV:
+		/*
+		 * XSETBV: guest sets XCR0 to enable extended state components.
+		 *
+		 * For Class B (Linux kernel) guests: emulate by running xsetbv
+		 * in VMX-root mode with guest-requested value masked to host
+		 * supported features (state->xcr0_supported).
+		 *
+		 * The kernel uses XSETBV to enable FPU+SSE+AVX etc. during boot.
+		 * Refusing it causes an exception that aborts boot.
+		 *
+		 * XCR index is in ECX (must be 0 for XCR0).
+		 * New value: EDX:EAX (high 32 bits : low 32 bits).
+		 */
+		if (state->class_b) {
+			u32 xcr_idx = (u32)state->guest_regs.rcx;
+			u64 xcr_val = ((u64)(u32)state->guest_regs.rdx << 32) |
+				      (u32)state->guest_regs.rax;
+			u64 xcr_masked;
+
+			if (xcr_idx != 0) {
+				/* Unknown XCR — inject #GP into guest */
+				pr_warn_ratelimited(
+					"phantom: CPU%d: XSETBV unknown XCR%u\n",
+					state->cpu, xcr_idx);
+				state->run_result = PHANTOM_RESULT_CRASH;
+				return 1;
+			}
+			/* Mask requested XCR0 to host-supported features */
+			xcr_masked = xcr_val;
+			if (state->xcr0_supported)
+				xcr_masked &= state->xcr0_supported;
+			/* XCR0 bit 0 (FPU) must always be set */
+			xcr_masked |= 1ULL;
+			/*
+			 * Record the guest's desired XCR0 value.  Do NOT execute
+			 * xsetbv here: kernel_fpu_begin() saves FPU state under
+			 * the current (host) XCR0, then xsetbv would widen XCR0,
+			 * and kernel_fpu_end()'s xrstor would fault (#GP) because
+			 * the saved state's xcomp_bv doesn't match the wider XCR0.
+			 *
+			 * Instead, apply guest_xcr0 immediately before VMRESUME and
+			 * restore xcr0_supported (host value) immediately after each
+			 * VM-exit — see the bracket in the vCPU thread loop.
+			 */
+			state->guest_xcr0 = xcr_masked;
+			pr_info_ratelimited(
+				"phantom: CPU%d: guest XSETBV XCR0=0x%llx (masked=0x%llx)\n",
+				state->cpu, xcr_val, xcr_masked);
+			/* Advance RIP past the XSETBV instruction */
+			{
+				u64 rip = phantom_vmcs_read64(VMCS_GUEST_RIP);
+				u32 ilen = phantom_vmcs_read32(VMCS_RO_EXIT_INSTR_LEN);
+
+				phantom_vmcs_write64(VMCS_GUEST_RIP, rip + ilen);
+			}
+		} else {
+			/* Class A: XSETBV should not happen (no XSAVE guest) */
+			pr_warn_ratelimited(
+				"phantom: CPU%d: unexpected XSETBV in Class A guest\n",
+				state->cpu);
+			state->run_result = PHANTOM_RESULT_CRASH;
+			return 1;
+		}
+		return 0;
 
 	default:
 		/*
@@ -2766,16 +3320,16 @@ int phantom_run_guest(struct phantom_vmx_cpu_state *state)
 	int tramp_ret, disp_ret;
 	int iterations = 0;
 
-#define MAX_EXIT_ITERATIONS 10000
+/* Class A fuzzing: 10k exits max (one iteration).
+	 * Class B (Linux kernel boot): 10M exits (kernel boot takes ~10k+ exits). */
+#define MAX_EXIT_ITERATIONS      10000
+#define MAX_EXIT_ITERATIONS_CLASSB 10000000
 
 	if (!state->vmcs_configured)
 		return -ENXIO;
 
 	state->run_result      = 0;
 	state->run_result_data = 0;
-
-	pr_info("phantom: CPU%d: entering guest loop (launched=%d)\n",
-		state->cpu, (int)state->launched);
 
 	PHANTOM_TRACE_VM_ENTRY(state->cpu);
 
@@ -2851,16 +3405,65 @@ int phantom_run_guest(struct phantom_vmx_cpu_state *state)
 
 		disp_ret = phantom_vm_exit_dispatch(state);
 
+		/*
+		 * For Class B (Linux kernel) boot: yield the CPU after each
+		 * external interrupt exit so the host watchdog, RCU, and
+		 * other kernel tasks can run.  Without this, the vCPU thread
+		 * busy-loops at 100% CPU and triggers soft lockup warnings.
+		 *
+		 * For Class A fuzzing: no yield (hot path performance critical).
+		 */
+		/*
+		 * Class B: after each external interrupt exit, yield the CPU.
+		 * The guest kernel receives timer ticks (EXTERNAL_INT) at ~1kHz.
+		 * Without yielding, the vCPU thread monopolises CPU0 and the
+		 * kernel watchdog triggers a soft lockup or hard-reset.
+		 *
+		 * schedule() is safe here: we are in normal process context
+		 * (between VM exits, NOT in interrupt context), the thread is
+		 * bound to state->cpu via kthread_bind(), and we are running
+		 * directly on bare metal (not nested KVM).
+		 */
+		if (state->class_b &&
+		    (state->exit_reason & 0xFFFF) == VMX_EXIT_EXTERNAL_INT)
+			schedule();
+
+		/* Allow module unload: check stop flag on every exit for Class B. */
+		if (state->class_b && READ_ONCE(state->vcpu_stop_requested))
+			return -EINTR;
+
 		iterations++;
 		if (iterations == 1)
 			pr_info("phantom: CPU%d: first exit reason=%u disp=%d\n",
 				state->cpu, state->exit_reason & 0xFFFF,
 				disp_ret);
-		if (iterations >= MAX_EXIT_ITERATIONS) {
-			pr_err("phantom: CPU%d: exceeded max exit iterations "
-			       "(last reason=%u)\n",
-			       state->cpu, state->exit_reason & 0xFFFF);
-			return -ELOOP;
+		if (state->class_b && (iterations % 100000) == 0) {
+			u64 _rip = phantom_vmcs_read64(VMCS_GUEST_RIP);
+			u32 _exit = state->exit_reason & 0xFFFF;
+			/* For I/O exits show port; for others show ECX (MSR#) */
+			if (_exit == VMX_EXIT_IO_INSTR)
+				pr_info("phantom: CPU%d: boot iter=%d exit=%u rip=0x%llx port=0x%x rax=0x%x\n",
+					state->cpu, iterations, _exit, _rip,
+					((u32)state->exit_qualification >> 16) & 0xFFFF,
+					(u32)state->guest_regs.rax);
+			else
+				pr_info("phantom: CPU%d: boot iter=%d exit=%u rip=0x%llx ecx=0x%x rax=0x%x\n",
+					state->cpu, iterations, _exit, _rip,
+					(u32)state->guest_regs.rcx,
+					(u32)state->guest_regs.rax);
+		}
+		{
+			int max_iter = state->class_b ?
+				MAX_EXIT_ITERATIONS_CLASSB : MAX_EXIT_ITERATIONS;
+
+			if (iterations >= max_iter) {
+				pr_err("phantom: CPU%d: exceeded max exit iterations "
+				       "(last reason=%u cpuid_leaf=0x%x)\n",
+				       state->cpu, state->exit_reason & 0xFFFF,
+				       (state->exit_reason & 0xFFFF) == 31 ?
+					       (u32)state->guest_regs.rax : 0);
+				return -ELOOP;
+			}
 		}
 
 	} while (disp_ret == 0);

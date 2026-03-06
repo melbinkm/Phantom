@@ -49,6 +49,7 @@
 #include <linux/mman.h>
 #include <linux/version.h>
 #include <linux/eventfd.h>
+#include <linux/vmalloc.h>
 
 #include "phantom.h"
 #include "interface.h"
@@ -60,6 +61,9 @@
 #include "debug.h"
 #include "compat.h"
 #include "pt_config.h"
+#include "msr_emul.h"
+#include "guest_boot.h"
+#include "multicore.h"
 
 /* ------------------------------------------------------------------
  * Guest binary 1 (test_id=0): R/W test
@@ -963,29 +967,67 @@ static const u8 phantom_panic_guest_bin[] = {
 static int phantom_open(struct inode *inode, struct file *filp)
 {
 	struct phantom_dev *pdev;
+	struct phantom_file *fctx;
 
 	pdev = container_of(inode->i_cdev, struct phantom_dev, cdev);
-	filp->private_data = pdev;
 
 	if (!pdev->initialized) {
 		pr_err("phantom: open() called before module is fully initialised\n");
 		return -ENXIO;
 	}
 
+	fctx = kzalloc(sizeof(*fctx), GFP_KERNEL);
+	if (!fctx)
+		return -ENOMEM;
+
+	fctx->pdev      = pdev;
+	fctx->bound_cpu = -1;  /* no VM created yet */
+	filp->private_data = fctx;
+
 	return 0;
 }
 
 static int phantom_release(struct inode *inode, struct file *filp)
 {
+	struct phantom_file *fctx = filp->private_data;
+
+	kfree(fctx);
+	filp->private_data = NULL;
 	return 0;
+}
+
+/*
+ * phantom_file_cpu - Return the CPU bound to this fd, or fallback to first.
+ *
+ * If the fd has been bound via CREATE_VM, return that CPU.
+ * Otherwise fall back to the first CPU in the vmx_cpumask (legacy behaviour
+ * for ioctls called before CREATE_VM on single-core setups).
+ */
+static int phantom_file_cpu(struct phantom_file *fctx)
+{
+	if (fctx->bound_cpu >= 0)
+		return fctx->bound_cpu;
+
+	/* Fallback: first CPU in mask */
+	{
+		int cpu;
+
+		for_each_cpu(cpu, fctx->pdev->vmx_cpumask)
+			return cpu;
+	}
+	return -1;
 }
 
 static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			  unsigned long arg)
 {
-	struct phantom_dev *pdev = filp->private_data;
+	struct phantom_file *fctx = filp->private_data;
+	struct phantom_dev *pdev;
 	long ret = 0;
 
+	if (!fctx)
+		return -ENXIO;
+	pdev = fctx->pdev;
 	if (!pdev || !pdev->initialized)
 		return -ENXIO;
 
@@ -1020,26 +1062,22 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 *   6 = mixed 2MB + 4KB workload (10 writes, both regions)
 		 *   7 = snapshot/restore XMM test (task 1.6)
 		 *   9 = deliberate panic (ACQUIRE + PANIC(0xDEADBEEF))
+		 *  10 = external binary (PHANTOM_LOAD_TARGET, no code overwrite)
 		 */
 		test_id = args.reserved;
-		if (test_id > 9) {
+		if (test_id > 10) {
 			pr_err("phantom: RUN_GUEST: invalid test_id=%u\n",
 			       test_id);
 			ret = -EINVAL;
 			break;
 		}
 
-		/* Find the target CPU — first CPU in vmx_cpumask by default */
-		target_cpu = -1;
-		{
-			int cpu;
-
-			for_each_cpu(cpu, pdev->vmx_cpumask) {
-				target_cpu = cpu;
-				break; /* use first CPU always for now */
-			}
-		}
-
+		/*
+		 * Select target CPU: prefer the CPU bound to this fd via
+		 * CREATE_VM, then honour args.cpu if set, finally fall back
+		 * to the first CPU in the vmx_cpumask.
+		 */
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			pr_err("phantom: RUN_GUEST: no VMX CPU available\n");
 			ret = -ENODEV;
@@ -1264,7 +1302,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 				       phantom_hypercall_harness_bin,
 				       sizeof(phantom_hypercall_harness_bin));
 			}
-		} else {
+		} else if (test_id == 9) {
 			/*
 			 * test_id=9: deliberate panic test.
 			 *
@@ -1280,6 +1318,13 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			memcpy(page_address(state->guest_code_page),
 			       phantom_panic_guest_bin,
 			       sizeof(phantom_panic_guest_bin));
+		} else {
+			/*
+			 * test_id >= 10: external binary already loaded via
+			 * PHANTOM_LOAD_TARGET.  Do not overwrite guest_code_page.
+			 * The caller is responsible for loading the binary into
+			 * EPT RAM before issuing RUN_GUEST.
+			 */
 		}
 
 		/* Save test_id for the vCPU thread */
@@ -1405,12 +1450,8 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 	case PHANTOM_IOCTL_DEBUG_DUMP_EPT: {
 		int target_cpu = -1;
 		struct phantom_vmx_cpu_state *state;
-		int cpu;
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
+		target_cpu = phantom_file_cpu(fctx);
 
 		if (target_cpu < 0) {
 			pr_err("phantom: DEBUG_DUMP_EPT: no VMX CPU\n");
@@ -1438,12 +1479,8 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 	case PHANTOM_IOCTL_DEBUG_DUMP_DIRTY_LIST: {
 		int target_cpu = -1;
 		struct phantom_vmx_cpu_state *state;
-		int cpu;
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
+		target_cpu = phantom_file_cpu(fctx);
 
 		if (target_cpu < 0) {
 			pr_err("phantom: DEBUG_DUMP_DIRTY_LIST: "
@@ -1466,15 +1503,10 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 	}
 
 	case PHANTOM_IOCTL_DEBUG_DUMP_DIRTY_OVERFLOW: {
-		int target_cpu = -1;
+		int target_cpu;
 		struct phantom_vmx_cpu_state *state;
-		int cpu;
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
-
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			pr_err("phantom: DEBUG_DUMP_DIRTY_OVERFLOW: "
 			       "no VMX CPU\n");
@@ -1488,15 +1520,10 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 	}
 
 	case PHANTOM_IOCTL_SNAPSHOT_CREATE: {
-		int target_cpu = -1;
+		int target_cpu;
 		struct phantom_vmx_cpu_state *state;
-		int cpu;
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
-
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			pr_err("phantom: SNAPSHOT_CREATE: no VMX CPU\n");
 			ret = -ENODEV;
@@ -1560,15 +1587,10 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 	}
 
 	case PHANTOM_IOCTL_SNAPSHOT_RESTORE: {
-		int target_cpu = -1;
+		int target_cpu;
 		struct phantom_vmx_cpu_state *state;
-		int cpu;
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
-
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			pr_err("phantom: SNAPSHOT_RESTORE: no VMX CPU\n");
 			ret = -ENODEV;
@@ -1615,16 +1637,11 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 * Returns -EINVAL if no snapshot has been taken (no restore
 		 * has ever run, so the counters would be meaningless zeros).
 		 */
-		int target_cpu = -1;
+		int target_cpu;
 		struct phantom_vmx_cpu_state *state;
 		struct phantom_perf_result result;
-		int cpu;
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
-
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			pr_err("phantom: PERF_RESTORE_LATENCY: no VMX CPU\n");
 			ret = -ENODEV;
@@ -1669,8 +1686,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		struct phantom_iter_params params;
 		struct phantom_vmx_cpu_state *state;
-		int target_cpu = -1;
-		int cpu_iter;
+		int target_cpu;
 		struct phantom_shared_mem *sm;
 
 		if (copy_from_user(&params, (void __user *)arg, sizeof(params))) {
@@ -1683,12 +1699,8 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			break;
 		}
 
-		/* Find target CPU */
-		for_each_cpu(cpu_iter, pdev->vmx_cpumask) {
-			target_cpu = cpu_iter;
-			break;
-		}
-
+		/* Find target CPU — use the CPU bound to this fd */
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			pr_err("phantom: RUN_ITERATION: no VMX CPU\n");
 			ret = -ENODEV;
@@ -1741,7 +1753,15 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 * Signal the vCPU thread.  After the first ACQUIRE (which means
 		 * vmcs_configured is true and vmlaunch_done is true in the vCPU
 		 * thread), we must use the IPI-free busy-wait path.
+		 *
+		 * CRITICAL: re-initialize vcpu_run_done BEFORE signalling the
+		 * vCPU.  The boot run (BOOT_KERNEL step 7, async) fires
+		 * complete(&vcpu_run_done) when the guest reaches HC_RELEASE.
+		 * Without this init, wait_for_completion returns immediately on
+		 * the stale count from the boot run, causing GET_ITER_STATE to
+		 * race against the vCPU's in-progress snapshot_restore.
 		 */
+		init_completion(&state->vcpu_run_done);
 		smp_store_release(&state->vcpu_work_ready, true);
 		wait_for_completion(&state->vcpu_run_done);
 
@@ -1765,14 +1785,9 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		struct phantom_iter_result result;
 		struct phantom_vmx_cpu_state *state;
-		int target_cpu = -1;
-		int cpu_iter;
+		int target_cpu;
 
-		for_each_cpu(cpu_iter, pdev->vmx_cpumask) {
-			target_cpu = cpu_iter;
-			break;
-		}
-
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			ret = -ENODEV;
 			break;
@@ -1826,8 +1841,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		struct phantom_vmx_cpu_state *state;
 		struct eventfd_ctx *ctx;
-		int target_cpu = -1;
-		int cpu_iter;
+		int target_cpu;
 		int user_fd;
 
 		/*
@@ -1836,11 +1850,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		user_fd = (int)arg;
 
-		for_each_cpu(cpu_iter, pdev->vmx_cpumask) {
-			target_cpu = cpu_iter;
-			break;
-		}
-
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			ret = -ENODEV;
 			break;
@@ -1899,8 +1909,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		struct phantom_create_args args;
 		struct phantom_vmx_cpu_state *state;
-		int target_cpu = -1;
-		int cpu;
+		int target_cpu;
 
 		if (copy_from_user(&args, (void __user *)arg, sizeof(args))) {
 			ret = -EFAULT;
@@ -1908,19 +1917,15 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		}
 
 		/* Find the requested CPU in the VMX cpumask */
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			if (args.pinned_cpu == 0 || (u32)cpu == args.pinned_cpu) {
-				target_cpu = cpu;
-				break;
-			}
-		}
-
-		if (target_cpu < 0) {
+		if (args.pinned_cpu == 0) {
+			/* pinned_cpu=0 means "any" — use first available */
+			target_cpu = cpumask_first(pdev->vmx_cpumask);
+		} else if (cpumask_test_cpu((int)args.pinned_cpu,
+					    pdev->vmx_cpumask)) {
+			target_cpu = (int)args.pinned_cpu;
+		} else {
 			/* pinned_cpu not in VMX cpumask — fall back to first */
-			for_each_cpu(cpu, pdev->vmx_cpumask) {
-				target_cpu = cpu;
-				break;
-			}
+			target_cpu = cpumask_first(pdev->vmx_cpumask);
 		}
 
 		if (target_cpu < 0) {
@@ -1943,6 +1948,9 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 			break;
 		}
 
+		/* Bind this fd to the selected CPU for all subsequent ioctls */
+		fctx->bound_cpu = target_cpu;
+
 		args.instance_id = 0;
 		if (copy_to_user((void __user *)arg, &args, sizeof(args)))
 			ret = -EFAULT;
@@ -1951,34 +1959,31 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 
 	case PHANTOM_LOAD_TARGET: {
 		/*
-		 * PHANTOM_LOAD_TARGET — copy binary from userspace into
-		 * the payload shared-memory buffer at the given GPA offset.
+		 * PHANTOM_LOAD_TARGET — copy a binary from userspace into
+		 * guest EPT RAM at the specified GPA.
 		 *
-		 * For the current single-instance design this writes into
-		 * the shared_mem payload area.  Userspace is expected to
-		 * call PHANTOM_RUN_ITERATION immediately after.
+		 * args.gpa          — target guest physical address
+		 * args.userspace_ptr — source buffer in userspace
+		 * args.size          — byte count (may span multiple pages)
+		 *
+		 * The binary is written page by page using
+		 * phantom_ept_get_ram_page() so it works for arbitrarily
+		 * large binaries (up to 16MB EPT RAM).
+		 *
+		 * Legacy behaviour (gpa == 0): write into shared_mem->payload
+		 * (max PHANTOM_PAYLOAD_MAX bytes) for compatibility with the
+		 * task 2.3 payload-only interface.
 		 */
 		struct phantom_load_args args;
 		struct phantom_vmx_cpu_state *state;
-		struct phantom_shared_mem *sm;
-		int target_cpu = -1;
-		int cpu;
+		int target_cpu;
 
 		if (copy_from_user(&args, (void __user *)arg, sizeof(args))) {
 			ret = -EFAULT;
 			break;
 		}
 
-		if (args.size > PHANTOM_PAYLOAD_MAX) {
-			ret = -EINVAL;
-			break;
-		}
-
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
-
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			ret = -ENODEV;
 			break;
@@ -1986,23 +1991,72 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 
 		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
 
-		if (!state->shared_mem) {
-			pr_err("phantom: LOAD_TARGET: shared_mem not allocated "
-			       "(call CREATE_VM first)\n");
-			ret = -ENXIO;
-			break;
+		if (args.gpa == 0) {
+			/* Legacy: write into shared_mem payload buffer */
+			struct phantom_shared_mem *sm;
+
+			if (args.size > PHANTOM_PAYLOAD_MAX) {
+				ret = -EINVAL;
+				break;
+			}
+			if (!state->shared_mem) {
+				ret = -ENXIO;
+				break;
+			}
+			sm = (struct phantom_shared_mem *)state->shared_mem;
+			if (copy_from_user(sm->payload,
+					   (void __user *)(uintptr_t)
+					   args.userspace_ptr,
+					   (size_t)args.size)) {
+				ret = -EFAULT;
+				break;
+			}
+			sm->payload_len = (u32)args.size;
+		} else {
+			/*
+			 * EPT RAM load: scatter the binary page by page.
+			 * Supports binaries larger than PHANTOM_PAYLOAD_MAX.
+			 */
+			u64 gpa = args.gpa;
+			u64 remaining = args.size;
+			u8 __user *uptr = (u8 __user *)(uintptr_t)
+						args.userspace_ptr;
+
+			if (gpa + remaining > PHANTOM_EPT_RAM_END) {
+				ret = -EINVAL;
+				break;
+			}
+
+			while (remaining > 0) {
+				struct page *pg;
+				u8 *kva;
+				u64 page_off = gpa & (PAGE_SIZE - 1);
+				u64 chunk = PAGE_SIZE - page_off;
+				u64 copy_len;
+
+				if (chunk > remaining)
+					chunk = remaining;
+				copy_len = chunk;
+
+				pg = phantom_ept_get_ram_page(&state->ept,
+							      gpa);
+				if (!pg) {
+					ret = -ERANGE;
+					break;
+				}
+
+				kva = (u8 *)page_address(pg) + page_off;
+				if (copy_from_user(kva, uptr,
+						   (size_t)copy_len)) {
+					ret = -EFAULT;
+					break;
+				}
+
+				gpa       += copy_len;
+				uptr      += copy_len;
+				remaining -= copy_len;
+			}
 		}
-
-		sm = (struct phantom_shared_mem *)state->shared_mem;
-
-		if (copy_from_user(sm->payload,
-				   (void __user *)(uintptr_t)args.userspace_ptr,
-				   (size_t)args.size)) {
-			ret = -EFAULT;
-			break;
-		}
-
-		sm->payload_len = (u32)args.size;
 		break;
 	}
 
@@ -2017,12 +2071,8 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		int target_cpu = -1;
 		struct phantom_vmx_cpu_state *state;
-		int cpu;
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
+		target_cpu = phantom_file_cpu(fctx);
 
 		if (target_cpu < 0) {
 			ret = -ENODEV;
@@ -2071,8 +2121,7 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		struct phantom_run_args2 args2;
 		struct phantom_vmx_cpu_state *state;
 		struct phantom_shared_mem *sm;
-		int target_cpu = -1;
-		int cpu;
+		int target_cpu;
 
 		if (copy_from_user(&args2, (void __user *)arg, sizeof(args2))) {
 			ret = -EFAULT;
@@ -2080,15 +2129,13 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		}
 
 		if (args2.payload_size > PHANTOM_PAYLOAD_MAX) {
+			pr_err("phantom: RUN_ITERATION: payload_size=%u > MAX=%u\n",
+			       args2.payload_size, PHANTOM_PAYLOAD_MAX);
 			ret = -EINVAL;
 			break;
 		}
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
-
+		target_cpu = phantom_file_cpu(fctx);
 		if (target_cpu < 0) {
 			ret = -ENODEV;
 			break;
@@ -2102,6 +2149,9 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		}
 
 		if (!state->snap_acquired) {
+			pr_err("phantom: RUN_ITERATION: snap_acquired=false "
+			       "cpu=%d pages=%d\n",
+			       target_cpu, state->pages_allocated);
 			ret = -EINVAL;
 			break;
 		}
@@ -2155,13 +2205,9 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		struct phantom_status st;
 		struct phantom_vmx_cpu_state *state;
-		int target_cpu = -1;
-		int cpu;
+		int target_cpu;
 
-		for_each_cpu(cpu, pdev->vmx_cpumask) {
-			target_cpu = cpu;
-			break;
-		}
+		target_cpu = phantom_file_cpu(fctx);
 
 		if (target_cpu < 0) {
 			ret = -ENODEV;
@@ -2191,6 +2237,289 @@ static long phantom_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		ret = 0;
 		break;
+
+	case PHANTOM_IOCTL_BOOT_KERNEL: {
+		/*
+		 * PHANTOM_IOCTL_BOOT_KERNEL — load a Linux bzImage and
+		 * configure a Class B guest.
+		 *
+		 * Process-context steps (done here):
+		 *   1. Copy bzImage from userspace.
+		 *   2. Allocate 256MB Class B EPT (GFP_KERNEL allowed).
+		 *   3. Load kernel image + populate boot_params.
+		 *   4. Set up MSR bitmap for Class B exits.
+		 *   5. Initialise MSR shadow state.
+		 *
+		 * vCPU-thread step (via vcpu_run_request=7):
+		 *   6. Write VMCS guest-state for 64-bit Linux boot.
+		 *
+		 * Step 6 must run on the vCPU thread because VMWRITE
+		 * requires the target VMCS to be current (VMPTRLD'd)
+		 * on the executing CPU.
+		 */
+		struct phantom_boot_kernel_args bk_args;
+		struct phantom_vmx_cpu_state *state;
+		int target_cpu;
+		bool was_launched;
+		void *buf;
+
+		if (copy_from_user(&bk_args, (void __user *)arg,
+				   sizeof(bk_args))) {
+			ret = -EFAULT;
+			break;
+		}
+
+		if (bk_args.bzimage_size == 0 ||
+		    bk_args.bzimage_size > PHANTOM_MAX_BZIMAGE_SIZE) {
+			ret = -EINVAL;
+			break;
+		}
+
+		/* Resolve target CPU */
+		if (bk_args.cpu == 0) {
+			target_cpu = cpumask_first(pdev->vmx_cpumask);
+		} else if (cpumask_test_cpu((int)bk_args.cpu,
+					    pdev->vmx_cpumask)) {
+			target_cpu = (int)bk_args.cpu;
+		} else {
+			target_cpu = cpumask_first(pdev->vmx_cpumask);
+		}
+
+		if (target_cpu < 0) {
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+		if (!state->vcpu_thread) {
+			ret = -ENXIO;
+			break;
+		}
+
+		buf = vmalloc(bk_args.bzimage_size);
+		if (!buf) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		if (copy_from_user(buf,
+				   (void __user *)(uintptr_t)bk_args.bzimage_uaddr,
+				   (size_t)bk_args.bzimage_size)) {
+			vfree(buf);
+			ret = -EFAULT;
+			break;
+		}
+
+		/* Free any existing Class B EPT */
+		if (state->class_b)
+			phantom_ept_free_class_b(state);
+
+		state->class_b     = true;
+		state->guest_mem_mb = bk_args.guest_mem_mb ? bk_args.guest_mem_mb : 256;
+
+		/*
+		 * Check state->vcpu_phase2 (set by vCPU thread on ANY VM entry
+		 * attempt — even a failed one).  This is more reliable than
+		 * state->launched which we are about to reset to false.
+		 * If vcpu_phase2 is true the thread is in Phase 2 busy-wait;
+		 * use the IPI-free wakeup.  Otherwise Phase 1 (safe to sleep).
+		 */
+		was_launched = READ_ONCE(state->vcpu_phase2);
+		state->launched       = false;
+		state->vmcs_configured = false;
+
+		/*
+		 * Step 1b: Allocate Class A infrastructure (MSR bitmap, CoW
+		 * pool, XSAVE area, IO bitmaps) via phantom_vmcs_setup().
+		 * This is idempotent if already called; for a fresh fd it
+		 * allocates the resources that phantom_vmcs_configure_fields()
+		 * expects (MSR bitmap, CoW pool, etc.).
+		 *
+		 * The Class A 16MB EPT allocated here is overridden by
+		 * phantom_ept_alloc_class_b() below which writes the 256MB
+		 * Class B EPTP into state->ept.eptp.
+		 */
+		ret = phantom_vmcs_setup(state);
+		if (ret) {
+			vfree(buf);
+			state->class_b = false;
+			break;
+		}
+
+		/* Step 2: Allocate 256MB EPT (overwrites state->ept.eptp) */
+		ret = phantom_ept_alloc_class_b(state);
+		if (ret) {
+			vfree(buf);
+			state->class_b = false;
+			break;
+		}
+
+		/* Step 3: Load kernel image + build boot structures */
+		ret = phantom_load_kernel_image(state, buf,
+						(size_t)bk_args.bzimage_size);
+		vfree(buf);
+		if (ret) {
+			phantom_ept_free_class_b(state);
+			state->class_b = false;
+			break;
+		}
+
+		/* Step 4: Configure MSR bitmap for Class B exits */
+		if (state->msr_bitmap)
+			phantom_msr_bitmap_setup_class_b(
+				page_address(state->msr_bitmap));
+
+		/* Step 5: Initialise MSR shadow state */
+		phantom_msr_state_init(state);
+
+		/* Step 6: Write VMCS guest-state (must run on vCPU thread) */
+		init_completion(&state->vcpu_run_done);
+		state->vcpu_run_request = 7;
+		/*
+		 * Use was_launched (saved before the reset above) to determine
+		 * which wakeup path to use.  The vCPU thread's local
+		 * vmlaunch_done flag mirrors was_launched: if was_launched is
+		 * true the thread is in Phase 2 busy-wait; if false it is in
+		 * Phase 1 sleeping on vcpu_run_start.
+		 */
+		if (was_launched)
+			smp_store_release(&state->vcpu_work_ready, true);
+		else
+			complete(&state->vcpu_run_start);
+		wait_for_completion(&state->vcpu_run_done);
+		ret = state->vcpu_run_result;
+		if (ret)
+			break;
+
+		/* Bind fd to this CPU for subsequent ioctls */
+		fctx->bound_cpu = target_cpu;
+
+		/*
+		 * Step 7: Launch the guest kernel.
+		 *
+		 * After step 6 completes, the thread loops back.  If
+		 * was_launched was true (Phase 2 before reset), the thread
+		 * stays in Phase 2 busy-wait — use IPI-free wakeup.
+		 * If was_launched was false (first boot, Phase 1), the
+		 * thread is sleeping — use complete().
+		 *
+		 * The ioctl returns immediately; boot is asynchronous.
+		 */
+		init_completion(&state->vcpu_run_done);
+		state->vcpu_run_request = 1;   /* run guest, no reset */
+		if (was_launched)
+			smp_store_release(&state->vcpu_work_ready, true);
+		else
+			complete(&state->vcpu_run_start);
+		/* Return immediately — boot is asynchronous */
+		ret = 0;
+		break;
+	}
+
+	case PHANTOM_IOCTL_GET_ITER_STATE: {
+		/*
+		 * GET_ITER_STATE — read per-iteration state for determinism
+		 * testing.
+		 *
+		 * Returns guest GPRs, VMCS-sourced registers (RIP, RFLAGS,
+		 * CR3 cached at HC_RELEASE time), the dirty GPA list, TSS
+		 * verification results, and the run result.
+		 *
+		 * This ioctl must be called after RUN_ITERATION completes.
+		 * All fields are populated by the HC_RELEASE/PANIC/KASAN
+		 * handlers in VMX-root context.
+		 */
+		struct phantom_iter_state *istate;
+		struct phantom_vmx_cpu_state *state;
+		int target_cpu;
+		u32 dc;
+
+		target_cpu = phantom_file_cpu(fctx);
+		if (target_cpu < 0) {
+			ret = -ENODEV;
+			break;
+		}
+
+		state = per_cpu_ptr(&phantom_vmx_state, target_cpu);
+
+		/*
+		 * Allocate on heap — struct is >32KB (4096 u64 dirty_gpas)
+		 * and must not be placed on the kernel stack.
+		 */
+		istate = kzalloc(sizeof(*istate), GFP_KERNEL);
+		if (!istate) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		/* GPRs saved by the VM exit handler (not VMCS-sourced) */
+		istate->rax = state->guest_regs.rax;
+		istate->rbx = state->guest_regs.rbx;
+		istate->rcx = state->guest_regs.rcx;
+		istate->rdx = state->guest_regs.rdx;
+		istate->rsi = state->guest_regs.rsi;
+		istate->rdi = state->guest_regs.rdi;
+		istate->rsp = state->last_guest_rsp;
+		istate->rbp = state->guest_regs.rbp;
+		istate->r8  = state->guest_regs.r8;
+		istate->r9  = state->guest_regs.r9;
+		istate->r10 = state->guest_regs.r10;
+		istate->r11 = state->guest_regs.r11;
+		istate->r12 = state->guest_regs.r12;
+		istate->r13 = state->guest_regs.r13;
+		istate->r14 = state->guest_regs.r14;
+		istate->r15 = state->guest_regs.r15;
+
+		/*
+		 * RIP/RFLAGS/CR3 cached at HC_RELEASE time from VMCS
+		 * (cannot be read here — not in VMX-root context).
+		 */
+		istate->rip    = state->last_guest_rip;
+		istate->rflags = state->last_guest_rflags;
+		istate->cr3    = state->last_guest_cr3;
+
+		/*
+		 * Dirty page list — use last_dirty_count (populated before
+		 * phantom_cow_abort_iteration() resets dirty_count to 0).
+		 */
+		dc = state->last_dirty_count;
+		if (dc > PHANTOM_MAX_DIRTY_PAGES)
+			dc = PHANTOM_MAX_DIRTY_PAGES;
+		istate->dirty_count = dc;
+
+		if (dc && state->dirty_list) {
+			u32 i;
+
+			for (i = 0; i < dc; i++)
+				istate->dirty_gpas[i] = state->dirty_list[i].gpa;
+		}
+
+		/* TSS verification */
+		istate->tss_verified      = state->tss_dirty_verified ? 1 : 0;
+		istate->tss_rsp0_snapshot = state->tss_rsp0_snapshot;
+		istate->tss_rsp0_restored = state->tss_rsp0_restored;
+
+		/* Run result */
+		istate->run_result = (u32)state->run_result;
+
+		if (copy_to_user((void __user *)arg, istate, sizeof(*istate)))
+			ret = -EFAULT;
+
+		kfree(istate);
+		break;
+	}
+
+	case PHANTOM_IOCTL_GET_MULTICORE_STATS: {
+		struct phantom_multicore_stats stats;
+
+		ret = phantom_multicore_get_stats(&stats);
+		if (ret)
+			break;
+		if (copy_to_user((void __user *)arg, &stats, sizeof(stats)))
+			ret = -EFAULT;
+		break;
+	}
 
 	default:
 		ret = -ENOTTY;
@@ -2310,23 +2639,21 @@ static int phantom_mmap_shared_ro(struct vm_area_struct *vma,
 
 static int phantom_mmap(struct file *filp, struct vm_area_struct *vma)
 {
-	struct phantom_dev *pdev = filp->private_data;
+	struct phantom_file *fctx = filp->private_data;
+	struct phantom_dev *pdev;
 	struct phantom_vmx_cpu_state *state;
-	int target_cpu = -1;
-	int cpu;
+	int target_cpu;
 	unsigned long offset;
 	unsigned long size;
 	unsigned long pfn;
 
+	if (!fctx)
+		return -ENXIO;
+	pdev = fctx->pdev;
 	if (!pdev || !pdev->initialized)
 		return -ENXIO;
 
-	/* Find the first VMX CPU */
-	for_each_cpu(cpu, pdev->vmx_cpumask) {
-		target_cpu = cpu;
-		break;
-	}
-
+	target_cpu = phantom_file_cpu(fctx);
 	if (target_cpu < 0)
 		return -ENODEV;
 

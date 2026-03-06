@@ -58,6 +58,14 @@
 #define PHANTOM_ERROR_NOT_INITIALIZED	(-ENXIO)
 
 /* ------------------------------------------------------------------
+ * Guest memory layout constants (must match libxml2_harness.c)
+ * ------------------------------------------------------------------ */
+/* Heap base: just above the 64KB payload buffer at 0x600000 */
+#define PHANTOM_GUEST_HEAP_BASE  0x610000UL
+/* Heap limit: leave top 64KB of 16MB EPT RAM free */
+#define PHANTOM_GUEST_HEAP_LIMIT 0xFF0000UL
+
+/* ------------------------------------------------------------------
  * Module parameters (declared in phantom_main.c, extern here)
  * ------------------------------------------------------------------ */
 
@@ -98,6 +106,18 @@ struct phantom_dev {
 
 /* Single global device context, defined in phantom_main.c */
 extern struct phantom_dev phantom_global_dev;
+
+/* ------------------------------------------------------------------
+ * Per-file-descriptor context
+ *
+ * Allocated in phantom_open(), freed in phantom_release().
+ * Tracks which CPU this fd was bound to via PHANTOM_CREATE_VM.
+ * bound_cpu == -1 means no VM has been created on this fd yet.
+ * ------------------------------------------------------------------ */
+struct phantom_file {
+	struct phantom_dev	*pdev;
+	int			 bound_cpu;  /* -1 = unbound */
+};
 
 /* ------------------------------------------------------------------
  * Module init/cleanup helpers (called from phantom_main.c)

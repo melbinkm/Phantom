@@ -108,6 +108,7 @@
 #define VMCS_CTRL_IO_BITMAP_A		0x2000
 #define VMCS_CTRL_IO_BITMAP_B		0x2002
 #define VMCS_CTRL_MSR_BITMAP		0x2004
+#define VMCS_CTRL_TSC_OFFSET		0x2010
 #define VMCS_CTRL_EPT_POINTER		0x201A
 #define VMCS_CTRL_VMCS_LINK_PTR		0x2800
 
@@ -243,11 +244,17 @@
 #define VMX_EXIT_EXCEPTION_NMI		0
 #define VMX_EXIT_EXTERNAL_INT		1
 #define VMX_EXIT_TRIPLE_FAULT		2
+#define VMX_EXIT_HLT			12
 #define VMX_EXIT_CPUID			10
+#define VMX_EXIT_CR_ACCESS		28
+#define VMX_EXIT_IO_INSTR		30
+#define VMX_EXIT_MSR_READ		31
+#define VMX_EXIT_MSR_WRITE		32
 #define VMX_EXIT_VMCALL			18
 #define VMX_EXIT_EPT_VIOLATION		48
 #define VMX_EXIT_EPT_MISCONFIG		49
 #define VMX_EXIT_PREEMPT_TIMER		52
+#define VMX_EXIT_XSETBV			55
 
 /* ------------------------------------------------------------------
  * VMCS control field bit definitions
@@ -463,6 +470,13 @@ struct phantom_vmx_cpu_state {
 	 * Protected by smp_store_release / smp_load_acquire barriers.
 	 */
 	bool			 vcpu_work_ready;  /* set by ioctl (no IPI) */
+	/*
+	 * vcpu_phase2: set by vCPU thread when it first enters Phase 2
+	 * (busy-wait mode, after any VM entry attempt — successful or not).
+	 * Never cleared once set (only reset on vCPU thread teardown).
+	 * BOOT_KERNEL uses this to select the correct wakeup path.
+	 */
+	bool			 vcpu_phase2;      /* vCPU in Phase 2 busy-wait */
 
 	/*
 	 * IPI-free stop protocol for post-VMLAUNCH teardown.
@@ -687,6 +701,186 @@ struct phantom_vmx_cpu_state {
 	 * do_stop path before VMXOFF.
 	 */
 	struct phantom_pt_state	  pt;
+
+	/*
+	 * Task 2.4: VMX preemption timer.
+	 *
+	 * Computed once during phantom_vmcs_configure_fields() from
+	 * MSR_IA32_VMX_MISC[4:0] (the timer shift) and tsc_khz.
+	 * Set in the VMCS field VMX_PREEMPTION_TIMER_VALUE (0x482E) before
+	 * each VM entry so the guest is forcibly evicted after ~1 second
+	 * (configurable via PHANTOM_TIMEOUT_CLASS_A_MS).
+	 *
+	 * 0 means "timer not supported" — phantom_adjust_controls() cleared
+	 * PIN_BASED_VMX_PREEMPTION_TIMER in the pin-based controls.
+	 */
+	u32			  preemption_timer_value;
+
+	/*
+	 * Task 3.1: Class B (Linux kernel) mode fields.
+	 *
+	 * class_b:            True when this vCPU runs a Linux guest kernel.
+	 *
+	 * snapshot_tsc:       TSC value at snapshot creation time.
+	 *                     Used to compute TSC_OFFSET for the VMCS so the
+	 *                     guest sees a monotonically increasing TSC from 0.
+	 *
+	 * guest_mem_mb:       Guest physical memory in MB.
+	 *                     16 for Class A, 256 for Class B.
+	 *
+	 * kernel_entry_gpa:   GPA of the kernel entry point (for Class B boot).
+	 *
+	 * MSR shadows — emulated in phantom_handle_msr_read/write():
+	 *   msr_apicbase:     IA32_APICBASE shadow (0xFEE00900).
+	 *   msr_misc_enable:  IA32_MISC_ENABLE shadow (0x850089).
+	 *   msr_mtrr_def_type: IA32_MTRR_DEF_TYPE shadow (0xC06).
+	 *   msr_star/lstar/cstar/sfmask: syscall MSR shadows.
+	 *   msr_kernel_gs_base: IA32_KERNEL_GS_BASE shadow.
+	 *   msr_tsc_aux:      IA32_TSC_AUX shadow.
+	 *   msr_mtrr_fix[11]: Fixed MTRR shadows (all default 0x0606...).
+	 */
+	bool			  class_b;
+	u64			  snapshot_tsc;
+	u32			  guest_mem_mb;
+	u64			  kernel_entry_gpa;
+	u64			  msr_apicbase;
+	u64			  msr_misc_enable;
+	u64			  msr_mtrr_def_type;
+	u64			  msr_star;
+	u64			  msr_lstar;
+	u64			  msr_cstar;
+	u64			  msr_sfmask;
+	u64			  msr_kernel_gs_base;
+	u64			  msr_tsc_aux;
+	u64			  msr_mtrr_fix[11];
+
+	/*
+	 * Task 3.1: Class B EPT backing pages.
+	 *
+	 * The 256MB Class B EPT uses separate page arrays managed by
+	 * phantom_ept_alloc_class_b() / phantom_ept_free_class_b() in
+	 * guest_boot.c.  They are distinct from state->ept which holds
+	 * the 16MB Class A EPT.
+	 *
+	 * class_b_ept_pml4:   EPT PML4 page (1 page).
+	 * class_b_ept_pdpt:   EPT PDPT page (1 page).
+	 * class_b_ept_pd:     EPT PD page (1 page, 128 active entries).
+	 * class_b_pt_pages:   kvmalloc_array of 128 EPT PT pages.
+	 * class_b_ram_pages:  kvmalloc_array of 65536 RAM backing pages.
+	 * class_b_vmap_base:  writable vmap() window over all 65536 RAM pages.
+	 */
+	struct page		 *class_b_ept_pml4;
+	struct page		 *class_b_ept_pdpt;
+	struct page		 *class_b_ept_pd;
+	struct page		**class_b_pt_pages;    /* 128 PT pages  */
+	struct page		**class_b_ram_pages;   /* 65536 RAM pages */
+	void			 *class_b_vmap_base;  /* writable vmap window over all RAM pages */
+
+	/*
+	 * Task 3.1: LAPIC MMIO EPT mapping.
+	 *
+	 * The Linux guest accesses the Local APIC at GPA 0xFEE00000.
+	 * This GPA is in PDPT[3] (3-4GB range), outside the 256MB RAM window.
+	 * We allocate one zeroed page for LAPIC MMIO and wire a separate
+	 * PDPT[3] subtree for it so EPT violations at 0xFEE00000 don't abort boot.
+	 *
+	 * class_b_lapic_page:    backing page for LAPIC MMIO (4KB, zeroed).
+	 * class_b_lapic_pd:      EPT PD page for PDPT[3] → covers 3-4GB.
+	 * class_b_lapic_pt:      EPT PT page covering the 2MB slot with LAPIC.
+	 */
+	struct page		 *class_b_lapic_page;  /* LAPIC MMIO backing page */
+	struct page		 *class_b_lapic_pd;    /* EPT PD for PDPT[3] */
+	struct page		 *class_b_lapic_pt;    /* EPT PT for LAPIC 2MB slot */
+
+	/*
+	 * Task 2.4: Kernel-side guest heap tracker.
+	 *
+	 * The bare-metal guest has no OS and therefore no syscall handler.
+	 * EFER_SCE is cleared so 'syscall' raises #UD.  The #UD exit handler
+	 * intercepts 'syscall' (0F 05) and implements a minimal subset:
+	 *   SYS_brk  (12) — extend heap via bump pointer
+	 *   SYS_mmap  (9) — anonymous mmap via bump pointer
+	 *   SYS_munmap(11) — no-op
+	 *   SYS_write  (1) — silently succeed (drop stderr)
+	 *
+	 * guest_heap_ptr is reset to PHANTOM_GUEST_HEAP_BASE on every
+	 * snapshot restore so that each iteration gets a clean heap.
+	 * Range: [PHANTOM_GUEST_HEAP_BASE, PHANTOM_GUEST_HEAP_LIMIT).
+	 */
+	u64			  guest_heap_ptr;
+	/*
+	 * Task 3.1: Guest XCR0 — set by XSETBV VM-exit emulation.
+	 * Applied at VM-entry, host XCR0 (xcr0_supported) restored at VM-exit.
+	 * 0 = guest has not issued XSETBV yet.
+	 */
+	u64			  guest_xcr0;
+
+	/*
+	 * Task 3.1: Serial console line buffer for guest diagnostics.
+	 * Accumulates COM1 (0x3F8) writes until newline, then logs to host dmesg.
+	 */
+	char			  serial_buf[256];
+	int			  serial_buf_len;
+
+	/*
+	 * Task 3.2: Cached VMCS guest-state at HC_RELEASE/PANIC/KASAN time.
+	 *
+	 * RIP, RFLAGS, RSP, and CR3 must be read from the VMCS while still
+	 * in VMX-root context (i.e., before VMRESUME or VMXOFF).  They are
+	 * cached here in the hypercall handler for later retrieval via
+	 * PHANTOM_IOCTL_GET_ITER_STATE.
+	 *
+	 * last_guest_rip:    VMCS_GUEST_RIP at iteration end.
+	 * last_guest_rflags: VMCS_GUEST_RFLAGS at iteration end.
+	 * last_guest_rsp:    VMCS_GUEST_RSP at iteration end.
+	 * last_guest_cr3:    VMCS_GUEST_CR3 at iteration end.
+	 */
+	u64			  last_guest_rip;
+	u64			  last_guest_rflags;
+	u64			  last_guest_rsp;
+	u64			  last_guest_cr3;
+
+	/*
+	 * Task 3.2: TSS dirty-list verification.
+	 *
+	 * tss_dirty_verified: set to true after HC_RELEASE if the TSS page
+	 *   GPA was found in the dirty list for that iteration.  Reset to
+	 *   false at the start of each iteration (HC_ACQUIRE).
+	 *
+	 * tss_rsp0_snapshot: RSP0 from guest TSS captured at snapshot time
+	 *   (phantom_snapshot_create, once snap_acquired is true).
+	 *
+	 * tss_rsp0_restored: RSP0 from guest TSS read after restore, checked
+	 *   against tss_rsp0_snapshot to detect TSS restore failures.
+	 */
+	bool			  tss_dirty_verified;
+	u64			  tss_rsp0_snapshot;
+	u64			  tss_rsp0_restored;
+
+	/*
+	 * Task 3.3: Multi-core coverage and throughput tracking.
+	 *
+	 * coverage_bitmap:  Per-core 64KB AFL++ edge bitmap.  Written by
+	 *   the PT decoder or coverage tracking code each iteration.
+	 *   Periodically OR'd into phantom_global_bitmap by
+	 *   phantom_merge_coverage_to_global() then cleared.
+	 *   64-byte aligned to prevent false sharing between cores.
+	 *
+	 * iter_count:       Total iterations completed on this core since
+	 *   module load.  Incremented at HC_RELEASE/PANIC/KASAN in the
+	 *   hot path (no sleeping, no printk).
+	 *
+	 * iter_tsc_window:  TSC value at the start of the current 1-second
+	 *   measurement window.  Written once per window by multicore.c.
+	 *
+	 * iter_count_window: iter_count snapshot captured at the start of
+	 *   the current measurement window.  Delta against current
+	 *   iter_count gives exec/sec for the window.
+	 */
+	u8			 *coverage_bitmap;	/* vmalloc'd 64KB; set by multicore_init */
+	u64			  iter_count;
+	u64			  iter_tsc_window;
+	u64			  iter_count_window;
 };
 
 DECLARE_PER_CPU(struct phantom_vmx_cpu_state, phantom_vmx_state);
