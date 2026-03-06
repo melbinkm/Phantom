@@ -1,6 +1,7 @@
 .secret/
 CLAUDE.md
 docs/
+phases/
 *.o
 *.ko
 *.mod
