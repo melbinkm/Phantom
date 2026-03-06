@@ -1,0 +1,259 @@
+{
+  "benchmark": "phantom_30run_execsec_1core",
+  "timestamp": "2026-03-06T10:35:49",
+  "config": {
+    "cores": 1,
+    "seconds_per_run": 15,
+    "total_runs": 30,
+    "warmup_runs": 5
+  },
+  "samples": [
+    {
+      "run": 1,
+      "total_exec_per_sec": 87137,
+      "per_core": {
+        "0": 87137.4
+      }
+    },
+    {
+      "run": 2,
+      "total_exec_per_sec": 90374,
+      "per_core": {
+        "0": 90374.1
+      }
+    },
+    {
+      "run": 3,
+      "total_exec_per_sec": 89088,
+      "per_core": {
+        "0": 89088.7
+      }
+    },
+    {
+      "run": 4,
+      "total_exec_per_sec": 88782,
+      "per_core": {
+        "0": 88782.9
+      }
+    },
+    {
+      "run": 5,
+      "total_exec_per_sec": 85589,
+      "per_core": {
+        "0": 85589.7
+      }
+    },
+    {
+      "run": 6,
+      "total_exec_per_sec": 89002,
+      "per_core": {
+        "0": 89002.5
+      }
+    },
+    {
+      "run": 7,
+      "total_exec_per_sec": 86677,
+      "per_core": {
+        "0": 86677.2
+      }
+    },
+    {
+      "run": 8,
+      "total_exec_per_sec": 88418,
+      "per_core": {
+        "0": 88418.2
+      }
+    },
+    {
+      "run": 9,
+      "total_exec_per_sec": 88945,
+      "per_core": {
+        "0": 88945.2
+      }
+    },
+    {
+      "run": 10,
+      "total_exec_per_sec": 89496,
+      "per_core": {
+        "0": 89496.8
+      }
+    },
+    {
+      "run": 11,
+      "total_exec_per_sec": 87423,
+      "per_core": {
+        "0": 87423.7
+      }
+    },
+    {
+      "run": 12,
+      "total_exec_per_sec": 89775,
+      "per_core": {
+        "0": 89775.4
+      }
+    },
+    {
+      "run": 13,
+      "total_exec_per_sec": 88479,
+      "per_core": {
+        "0": 88480.0
+      }
+    },
+    {
+      "run": 14,
+      "total_exec_per_sec": 87297,
+      "per_core": {
+        "0": 87297.2
+      }
+    },
+    {
+      "run": 15,
+      "total_exec_per_sec": 87784,
+      "per_core": {
+        "0": 87784.6
+      }
+    },
+    {
+      "run": 16,
+      "total_exec_per_sec": 86695,
+      "per_core": {
+        "0": 86695.8
+      }
+    },
+    {
+      "run": 17,
+      "total_exec_per_sec": 85951,
+      "per_core": {
+        "0": 85951.5
+      }
+    },
+    {
+      "run": 18,
+      "total_exec_per_sec": 87132,
+      "per_core": {
+        "0": 87132.1
+      }
+    },
+    {
+      "run": 19,
+      "total_exec_per_sec": 85981,
+      "per_core": {
+        "0": 85981.4
+      }
+    },
+    {
+      "run": 20,
+      "total_exec_per_sec": 89630,
+      "per_core": {
+        "0": 89630.8
+      }
+    },
+    {
+      "run": 21,
+      "total_exec_per_sec": 87093,
+      "per_core": {
+        "0": 87093.4
+      }
+    },
+    {
+      "run": 22,
+      "total_exec_per_sec": 87841,
+      "per_core": {
+        "0": 87842.0
+      }
+    },
+    {
+      "run": 23,
+      "total_exec_per_sec": 89852,
+      "per_core": {
+        "0": 89852.1
+      }
+    },
+    {
+      "run": 24,
+      "total_exec_per_sec": 89916,
+      "per_core": {
+        "0": 89916.4
+      }
+    },
+    {
+      "run": 25,
+      "total_exec_per_sec": 84167,
+      "per_core": {
+        "0": 84167.1
+      }
+    },
+    {
+      "run": 26,
+      "total_exec_per_sec": 89131,
+      "per_core": {
+        "0": 89131.4
+      }
+    },
+    {
+      "run": 27,
+      "total_exec_per_sec": 88699,
+      "per_core": {
+        "0": 88699.5
+      }
+    },
+    {
+      "run": 28,
+      "total_exec_per_sec": 87075,
+      "per_core": {
+        "0": 87075.2
+      }
+    },
+    {
+      "run": 29,
+      "total_exec_per_sec": 89448,
+      "per_core": {
+        "0": 89448.2
+      }
+    },
+    {
+      "run": 30,
+      "total_exec_per_sec": 87791,
+      "per_core": {
+        "0": 87791.5
+      }
+    }
+  ],
+  "exec_per_sec_values": [
+    84167,
+    85951,
+    85981,
+    86677,
+    86695,
+    87075,
+    87093,
+    87132,
+    87297,
+    87423,
+    87784,
+    87791,
+    87841,
+    88418,
+    88479,
+    88699,
+    88945,
+    89002,
+    89131,
+    89448,
+    89496,
+    89630,
+    89775,
+    89852,
+    89916
+  ],
+  "summary": {
+    "n": 25,
+    "cores": 1,
+    "median": 87841,
+    "p25": 87093,
+    "p75": 89131,
+    "min": 84167,
+    "max": 89916,
+    "mean": 87987.9
+  }
+}
