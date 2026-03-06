@@ -187,4 +187,25 @@ int phantom_load_kernel_image(struct phantom_vmx_cpu_state *state,
  */
 int phantom_vmcs_setup_linux64(struct phantom_vmx_cpu_state *state);
 
+/**
+ * phantom_ept_lookup_pte_class_b - Look up the 4KB EPT PTE for a Class B GPA.
+ * @state: Per-CPU VMX state (Class B EPT allocated).
+ * @gpa:   Guest physical address within the 256MB RAM window.
+ *
+ * Returns pointer to the leaf PTE, or NULL if the GPA is outside the
+ * Class B PT page range or the PT page is not allocated.
+ */
+u64 *phantom_ept_lookup_pte_class_b(struct phantom_vmx_cpu_state *state,
+				     u64 gpa);
+
+/**
+ * phantom_ept_mark_all_ro_class_b - Write-protect all Class B EPT RAM pages.
+ * @state: Per-CPU VMX state (Class B EPT allocated).
+ *
+ * Walks all 128 PT pages × 512 entries and clears EPT_PTE_WRITE on every
+ * present entry (those with EPT_PTE_READ set).  This is the snapshot point
+ * for Class B: subsequent guest writes trigger CoW faults.
+ */
+void phantom_ept_mark_all_ro_class_b(struct phantom_vmx_cpu_state *state);
+
 #endif /* PHANTOM_GUEST_BOOT_H */

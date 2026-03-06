@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * init_harness_nft.c - Phantom Class B nf_tables fuzzing harness.
+ * init_harness_nft.c - Phantom Class B nf_tables batched fuzzing harness.
  *
- * Built into the guest kernel as a late_initcall. Sends fuzz payload
- * as a NETLINK_NETFILTER message to exercise the nf_tables subsystem
- * parsing and validation paths.
+ * Built into the guest kernel as a late_initcall. Treats fuzz payload as
+ * a sequence of variable-length netlink messages, sent one after another
+ * to exercise nf_tables batch transaction paths.
  *
- * Attack surface: nfnetlink message dispatch → nf_tables handlers
- * (NFT_MSG_NEWTABLE, NFT_MSG_NEWCHAIN, NFT_MSG_NEWRULE, etc.)
+ * Batched sequences are critical for finding exploitable bugs: UAF on
+ * anonymous sets, double-free on set elements, refcount mismatches on
+ * batch abort — the bug classes behind CVE-2023-32233, CVE-2024-1086,
+ * CVE-2023-3390, CVE-2022-34918, etc.
  *
- * This is the same entry point targeted by real-world nf_tables exploits
- * (CVE-2023-32233, CVE-2024-1086, CVE-2022-34918, etc.)
+ * Payload format:
+ *   [u16 msg_len][msg_len bytes of nlmsg][u16 msg_len][msg bytes]...
+ * Each sub-message is sent as a separate kernel_sendmsg() call.
  */
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -21,6 +24,7 @@
 #include <net/netlink.h>
 #include <net/net_namespace.h>
 #include <linux/netfilter/nfnetlink.h>
+#include <linux/kasan.h>
 #include <asm/page.h>
 
 /* Phantom nyx_api hypercall numbers (must match hypercall.h) */
@@ -81,45 +85,56 @@ static int __init phantom_nft_harness_init(void)
 
 	pr_info("phantom-nft: netlink socket ready, entering fuzz loop\n");
 
+	/* Tell KASAN the payload region is valid — it's a raw GPA used for
+	 * hypercall data, not kmalloc'd, so KASAN shadow is poisoned by default */
+	kasan_unpoison_range((void *)__va(PHANTOM_PAYLOAD_GPA),
+			     PHANTOM_PAYLOAD_MAX + sizeof(u32));
+
 	/* Register payload GPA with host, then take snapshot */
 	phantom_vmcall(HC_GET_PAYLOAD, PHANTOM_PAYLOAD_GPA);
 	phantom_vmcall(HC_ACQUIRE, 0);
 
 	/*
-	 * === FUZZ LOOP ===
+	 * === FUZZ LOOP (batched messages) ===
 	 * Everything below runs per iteration. HC_ACQUIRE above is the
 	 * snapshot point — on each iteration, Phantom restores state to
 	 * here and injects a new payload.
 	 *
-	 * The payload is treated as a raw netlink message (nlmsghdr +
-	 * nfgenmsg + attributes). kernel_sendmsg() delivers it through
-	 * the full netlink dispatch path to nfnetlink_rcv_msg(), which
-	 * dispatches to the nf_tables callback for the message type.
+	 * Payload format: sequence of [u16 len][len bytes of nlmsg data].
+	 * Each sub-message is sent as a separate kernel_sendmsg() to the
+	 * NETLINK_NETFILTER socket. This exercises batch transaction paths
+	 * where create + delete in sequence triggers UAF/double-free.
 	 */
 
 	len = *len_ptr;
 	if (len > PHANTOM_PAYLOAD_MAX)
 		len = PHANTOM_PAYLOAD_MAX;
 
-	/* Need at least nlmsghdr to be a valid netlink message */
-	if (len < NLMSG_HDRLEN)
-		goto release;
-
-	/* Send fuzz payload as netlink message */
-	memset(&msg, 0, sizeof(msg));
 	memset(&addr, 0, sizeof(addr));
 	addr.nl_family = AF_NETLINK;
-	addr.nl_pid = 0;	/* destination: kernel */
+	addr.nl_pid = 0;
 	addr.nl_groups = 0;
-	msg.msg_name = &addr;
-	msg.msg_namelen = sizeof(addr);
 
-	iov.iov_base = (void *)payload;
-	iov.iov_len = len;
+	{
+		u32 off = 0;
 
-	/* Errors are expected — malformed messages get rejected.
-	 * We're fuzzing the parser, not looking for send errors. */
-	kernel_sendmsg(nl_sock, &msg, &iov, 1, len);
+		while (off + 2 <= len) {
+			u16 msg_len = *(volatile u16 *)(payload + off);
+
+			off += 2;
+			if (msg_len < NLMSG_HDRLEN || off + msg_len > len)
+				break;
+
+			memset(&msg, 0, sizeof(msg));
+			msg.msg_name = &addr;
+			msg.msg_namelen = sizeof(addr);
+			iov.iov_base = (void *)(payload + off);
+			iov.iov_len = msg_len;
+
+			kernel_sendmsg(nl_sock, &msg, &iov, 1, msg_len);
+			off += msg_len;
+		}
+	}
 
 release:
 	phantom_vmcall(HC_RELEASE, 0);

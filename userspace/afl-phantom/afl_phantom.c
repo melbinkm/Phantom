@@ -29,9 +29,8 @@ static void *payload_map   = NULL;  /* PHANTOM_MMAP_PAYLOAD (RW, 64KB)  */
 static void *bitmap_map    = NULL;  /* PHANTOM_MMAP_BITMAP  (RO, 64KB)  */
 static void *afl_bitmap    = NULL;  /* AFL++ shm bitmap pointer         */
 
-/* Persistent-mode testcase pointers set by AFL++ */
-static uint8_t  *afl_testcase_buf = NULL;
-static uint32_t  afl_testcase_len = 0;
+/* Set when --bzimage is used (Class B boot, skip bootstrap_test_guest) */
+static int g_bzimage_mode = 0;
 
 /* Multi-core state (-j N) */
 #define PHANTOM_MAX_CORES 8
@@ -265,58 +264,152 @@ static int run_one_iteration(const uint8_t *payload, uint32_t len)
 }
 
 /* ------------------------------------------------------------------
- * AFL++ fork-server protocol
+ * AFL++ fork-server protocol (shmem fuzz mode)
+ *
+ * When AFL++ and our fork server agree on FS_OPT_SHDMEM_FUZZ,
+ * testcases are delivered via shared memory instead of file I/O.
+ * This eliminates the ~2.5ms per-iteration disk round-trip.
+ *
+ * Shmem layout: [u32 length][u8 data[...]]
+ * AFL++ writes the testcase here before each "go" signal.
  * ------------------------------------------------------------------ */
 
+/* Pointer to AFL++ shmem fuzz region (NULL if not using shmem) */
+static uint8_t *afl_shmem_fuzz = NULL;
+
 /*
- * run_forkserver - enter the AFL++ persistent-mode fork-server loop.
+ * setup_afl_shmem_fuzz - attach to AFL++ testcase delivery shmem.
  *
- * Reads 4 bytes from FORKSRV_FD (AFL++ says "go"),
- * runs one Phantom iteration,
- * writes 4 bytes to FORKSRV_FD+1 (reports result/exit status).
+ * AFL++ creates this shmem and sets __AFL_SHM_FUZZ_ID in the
+ * environment before spawning us.  If the env var is present,
+ * we attach and use it for zero-copy testcase delivery.
+ */
+static int setup_afl_shmem_fuzz(void)
+{
+	const char *shm_str = getenv(SHM_FUZZ_ENV_VAR);
+	int shm_id;
+	void *ptr;
+
+	if (!shm_str)
+		return -1;
+
+	shm_id = atoi(shm_str);
+	ptr = shmat(shm_id, NULL, 0);
+	if (ptr == (void *)-1) {
+		perror("shmat AFL shmem fuzz");
+		return -1;
+	}
+
+	afl_shmem_fuzz = (uint8_t *)ptr;
+	return 0;
+}
+
+/*
+ * run_forkserver - enter the AFL++ fork-server loop.
+ *
+ * Negotiates shmem fuzz mode with AFL++ if available.  In shmem
+ * mode, testcases come from shared memory (zero I/O overhead).
+ * Falls back to stdin file I/O if shmem is not available.
+ *
+ * Per-iteration protocol:
+ *   1. Read 4 bytes from FORKSRV_FD (AFL++ says "go")
+ *   2. Write 4 bytes to FORKSRV_FD+1 (fake child PID)
+ *   3. Run one Phantom iteration
+ *   4. Write 4 bytes to FORKSRV_FD+1 (waitpid-style exit status)
  */
 static void run_forkserver(void)
 {
-	uint32_t ready = 0;
+	uint32_t hello;
 	uint32_t cmd;
 	int afl_status;
+	uint32_t fake_pid = (uint32_t)getpid();
+	int use_shmem = 0;
 
-	/* Signal AFL++ that we are ready */
-	if (write(FORKSRV_FD + 1, &ready, 4) != 4)
-		die("write ready to FORKSRV_FD+1");
+	/* Try to attach to AFL++ shmem fuzz region */
+	if (setup_afl_shmem_fuzz() == 0)
+		use_shmem = 1;
+
+	/*
+	 * Handshake: send hello with our supported options.
+	 *
+	 * If we have the shmem fuzz region, advertise FS_OPT_SHDMEM_FUZZ
+	 * so AFL++ knows to write testcases there instead of to a file.
+	 */
+	if (use_shmem) {
+		hello = FS_OPT_ENABLED | FS_OPT_SHDMEM_FUZZ;
+		if (write(FORKSRV_FD + 1, &hello, 4) != 4)
+			die("write hello to FORKSRV_FD+1");
+
+		/* Read AFL++ confirmation */
+		if (read(FORKSRV_FD, &cmd, 4) != 4)
+			die("read AFL++ confirmation");
+
+		if (!(cmd & FS_OPT_SHDMEM_FUZZ)) {
+			/* AFL++ rejected shmem fuzz — fall back */
+			use_shmem = 0;
+		}
+	} else {
+		/* No shmem available — legacy hello (no options) */
+		hello = 0;
+		if (write(FORKSRV_FD + 1, &hello, 4) != 4)
+			die("write hello to FORKSRV_FD+1");
+	}
+
+	if (use_shmem)
+		fprintf(stderr, "afl-phantom: shmem fuzz mode active "
+			"(zero-copy testcase delivery)\n");
+	else
+		fprintf(stderr, "afl-phantom: file-based testcase delivery "
+			"(slower)\n");
 
 	for (;;) {
 		/* Block until AFL++ sends the "run" command */
 		if (read(FORKSRV_FD, &cmd, 4) != 4)
 			break;  /* AFL++ closed the pipe — normal exit */
 
-		/*
-		 * In persistent mode AFL++ sets __AFL_FUZZ_TESTCASE_BUF and
-		 * __AFL_FUZZ_TESTCASE_LEN via shared memory before signalling.
-		 * We use our own payload buffer derived from the mmap region.
-		 *
-		 * If afl_testcase_buf was set up (persistent-mode env), use it.
-		 * Otherwise fall back to the shared payload mmap (the caller
-		 * wrote the payload there before signalling).
-		 */
-		if (afl_testcase_buf && afl_testcase_len > 0) {
-			afl_status = run_one_iteration(afl_testcase_buf,
-						       afl_testcase_len);
+		/* Write fake child PID */
+		if (write(FORKSRV_FD + 1, &fake_pid, 4) != 4)
+			break;
+
+		if (use_shmem) {
+			/*
+			 * Shmem fuzz: testcase is already in shared memory.
+			 * Layout: [u32 length][u8 data[...]]
+			 * AFL++ wrote it before sending the "go" signal.
+			 */
+			uint32_t tc_len;
+			memcpy(&tc_len, afl_shmem_fuzz, sizeof(tc_len));
+			if (tc_len > AFL_MAP_SIZE)
+				tc_len = AFL_MAP_SIZE;
+			afl_status = run_one_iteration(
+				afl_shmem_fuzz + sizeof(uint32_t), tc_len);
 		} else {
-			struct phantom_shared_mem *sm =
-				(struct phantom_shared_mem *)payload_map;
-			afl_status = run_one_iteration(sm->payload,
-						       sm->payload_len);
+			/*
+			 * File-based: re-read stdin (.cur_input) each iter.
+			 */
+			uint8_t stdin_buf[4096];
+			ssize_t stdin_len;
+
+			lseek(STDIN_FILENO, 0, SEEK_SET);
+			stdin_len = read(STDIN_FILENO, stdin_buf,
+					 sizeof(stdin_buf));
+			if (stdin_len > 0)
+				afl_status = run_one_iteration(
+					stdin_buf, (uint32_t)stdin_len);
+			else
+				afl_status = run_one_iteration(stdin_buf, 0);
 		}
 
 		/*
-		 * Write 4-byte status to FORKSRV_FD+1.
-		 *
-		 * AFL++ interprets the low byte as a Unix signal number when
-		 * non-zero (simulating waitpid status for a killed child).
-		 * We encode it as a raw signal number in the lowest byte.
+		 * Write waitpid-style status.
+		 * Normal: status = 0.  Crash: status = signal number.
 		 */
-		uint32_t afl_result = (uint32_t)(uint8_t)afl_status;
+		uint32_t afl_result;
+		if (afl_status == AFL_STATUS_OK)
+			afl_result = 0;
+		else
+			afl_result = (uint32_t)(uint8_t)afl_status;
+
 		if (write(FORKSRV_FD + 1, &afl_result, 4) != 4)
 			break;
 	}
@@ -529,12 +622,76 @@ static void run_multicore_test(uint32_t iterations, uint32_t timeout_ms)
  * Standalone test mode
  * ------------------------------------------------------------------ */
 
+/*
+ * boot_kernel - boot a Linux kernel guest via PHANTOM_IOCTL_BOOT_KERNEL.
+ *
+ * Reads the bzImage from disk, calls the BOOT_KERNEL ioctl, and waits
+ * for the guest harness to initialise (reach HC_ACQUIRE).
+ * After this function returns, RUN_ITERATION can be called directly.
+ */
+static void boot_kernel(const char *bzimage_path, int cpu, int guest_mem_mb,
+			int boot_wait_sec)
+{
+	FILE *f;
+	long fsize;
+	uint8_t *buf;
+	struct phantom_boot_kernel_args args;
+
+	f = fopen(bzimage_path, "rb");
+	if (!f)
+		die("fopen bzimage");
+
+	fseek(f, 0, SEEK_END);
+	fsize = ftell(f);
+	fseek(f, 0, SEEK_SET);
+
+	if (fsize <= 0 || fsize > 64 * 1024 * 1024) {
+		fprintf(stderr, "afl-phantom: bzImage size %ld invalid\n",
+			fsize);
+		exit(1);
+	}
+
+	buf = malloc(fsize);
+	if (!buf)
+		die("malloc bzimage");
+
+	if (fread(buf, 1, fsize, f) != (size_t)fsize) {
+		fprintf(stderr, "afl-phantom: short read on bzImage\n");
+		exit(1);
+	}
+	fclose(f);
+
+	memset(&args, 0, sizeof(args));
+	args.bzimage_uaddr = (uint64_t)(uintptr_t)buf;
+	args.bzimage_size  = (uint64_t)fsize;
+	args.cpu           = (uint32_t)cpu;
+	args.guest_mem_mb  = (uint32_t)guest_mem_mb;
+
+	fprintf(stderr, "afl-phantom: booting %s (%ld bytes) on cpu %d, "
+		"%d MB guest RAM\n", bzimage_path, fsize, cpu, guest_mem_mb);
+
+	if (ioctl(phantom_fd, PHANTOM_IOCTL_BOOT_KERNEL, &args) < 0)
+		die("PHANTOM_IOCTL_BOOT_KERNEL");
+
+	fprintf(stderr, "afl-phantom: boot OK, waiting %ds for harness...\n",
+		boot_wait_sec);
+	sleep(boot_wait_sec);
+
+	free(buf);
+
+	fprintf(stderr, "afl-phantom: kernel ready\n");
+}
+
 static void usage(const char *prog)
 {
 	fprintf(stderr,
 		"Usage: %s [OPTIONS]\n\n"
 		"  Without options: run as AFL++ fork-server\n\n"
 		"  --test                  Run standalone (no AFL++ pipes)\n"
+		"  --bzimage PATH          Boot a Linux kernel guest (Class B)\n"
+		"  --boot-wait N           Seconds to wait after boot (default: 15)\n"
+		"  --guest-mem N           Guest memory in MB (default: 256)\n"
+		"  --cpu N                 Phantom CPU index (default: 0)\n"
 		"  --payload-file FILE     Use FILE as fuzz input (default: zero-fill)\n"
 		"  --payload-size N        Payload length in bytes (default: 64)\n"
 		"  --iterations N          Number of iterations (default: 100)\n"
@@ -576,16 +733,15 @@ static void run_standalone_test(const char *payload_file,
 	/*
 	 * Bootstrap: launch the built-in test guest (test_id=8).
 	 *
-	 * RUN_GUEST(test_id=8) runs the kAFL ACQUIRE/RELEASE harness.
-	 * On the first run the ACQUIRE hypercall internally calls
-	 * phantom_snapshot_create(), setting both snap_acquired and
-	 * snap_taken.  The ioctl returns after the guest completes its
-	 * first iteration (RELEASE).  After this, PHANTOM_RUN_ITERATION
-	 * can be called directly — no PHANTOM_SET_SNAPSHOT needed.
+	 * Skip if --bzimage was used — BOOT_KERNEL already ran the guest
+	 * to HC_ACQUIRE.  Otherwise, RUN_GUEST(test_id=8) runs the kAFL
+	 * ACQUIRE/RELEASE harness.
 	 */
-	if (bootstrap_test_guest() < 0) {
-		fprintf(stderr, "afl-phantom: bootstrap failed — "
-			"iterations will report EINVAL\n");
+	if (!g_bzimage_mode) {
+		if (bootstrap_test_guest() < 0) {
+			fprintf(stderr, "afl-phantom: bootstrap failed — "
+				"iterations will report EINVAL\n");
+		}
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
@@ -664,12 +820,20 @@ int main(int argc, char *argv[])
 	int test_mode    = 0;
 	int num_cores    = 0;  /* 0 = single-core (legacy path) */
 	const char *payload_file = NULL;
+	const char *bzimage_path = NULL;
+	int boot_wait    = 15;
+	int guest_mem_mb = 256;
+	int cpu_id       = 0;
 	uint32_t payload_size    = 64;
 	uint32_t iterations      = 100;
 	uint32_t timeout_ms      = 1000;
 
 	static const struct option longopts[] = {
 		{ "test",         no_argument,       NULL, 't' },
+		{ "bzimage",      required_argument, NULL, 'b' },
+		{ "boot-wait",    required_argument, NULL, 'w' },
+		{ "guest-mem",    required_argument, NULL, 'm' },
+		{ "cpu",          required_argument, NULL, 'c' },
 		{ "payload-file", required_argument, NULL, 'f' },
 		{ "payload-size", required_argument, NULL, 's' },
 		{ "iterations",   required_argument, NULL, 'n' },
@@ -679,10 +843,14 @@ int main(int argc, char *argv[])
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "tj:f:s:n:d:h",
+	while ((opt = getopt_long(argc, argv, "tb:w:m:c:j:f:s:n:d:h",
 				  longopts, NULL)) != -1) {
 		switch (opt) {
 		case 't': test_mode = 1;               break;
+		case 'b': bzimage_path = optarg;       break;
+		case 'w': boot_wait = atoi(optarg);    break;
+		case 'm': guest_mem_mb = atoi(optarg); break;
+		case 'c': cpu_id = atoi(optarg);       break;
 		case 'j': num_cores = atoi(optarg);    break;
 		case 'f': payload_file = optarg;       break;
 		case 's': payload_size = atoi(optarg); break;
@@ -724,8 +892,40 @@ int main(int argc, char *argv[])
 
 	/* Single-core path (default) */
 	open_phantom();
-	create_vm();
-	setup_mmap();
+
+	if (bzimage_path) {
+		/*
+		 * Class B (Linux kernel guest): boot bzImage, wait for
+		 * harness to reach HC_ACQUIRE.  No create_vm/bootstrap
+		 * needed — BOOT_KERNEL handles everything.
+		 */
+		g_bzimage_mode = 1;
+		boot_kernel(bzimage_path, cpu_id, guest_mem_mb, boot_wait);
+
+		/*
+		 * mmap payload region so fork-server fallback can read
+		 * from shared memory.  PHANTOM_MMAP_BITMAP may not have
+		 * a real coverage bitmap yet (stub for now).
+		 */
+		payload_map = mmap(NULL, AFL_MAP_SIZE,
+				   PROT_READ | PROT_WRITE,
+				   MAP_SHARED,
+				   phantom_fd,
+				   PHANTOM_MMAP_PAYLOAD);
+		if (payload_map == MAP_FAILED)
+			payload_map = NULL;  /* non-fatal for bzimage mode */
+
+		bitmap_map = mmap(NULL, AFL_MAP_SIZE,
+				  PROT_READ,
+				  MAP_SHARED,
+				  phantom_fd,
+				  PHANTOM_MMAP_BITMAP);
+		if (bitmap_map == MAP_FAILED)
+			bitmap_map = NULL;
+	} else {
+		create_vm();
+		setup_mmap();
+	}
 
 	if (test_mode) {
 		run_standalone_test(payload_file, payload_size,
@@ -735,18 +935,15 @@ int main(int argc, char *argv[])
 
 	/* AFL++ fork-server mode */
 	if (setup_afl_shm() < 0) {
-		/*
-		 * If __AFL_SHM_ID is not set we are not running under AFL++.
-		 * Fall back to standalone test with defaults so the binary
-		 * can be invoked directly for smoke testing.
-		 */
 		fprintf(stderr, "afl-phantom: __AFL_SHM_ID not set, "
 			"running standalone test (100 iterations)\n");
-		take_snapshot();
+		if (!bzimage_path)
+			take_snapshot();
 		run_standalone_test(NULL, 64, 100, 1000);
 	}
 
-	take_snapshot();
+	if (!bzimage_path)
+		take_snapshot();
 	run_forkserver();
 
 	/* Cleanup (reached only when AFL++ closes the pipe) */

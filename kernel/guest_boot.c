@@ -517,6 +517,62 @@ void phantom_ept_free_class_b(struct phantom_vmx_cpu_state *state)
 EXPORT_SYMBOL_GPL(phantom_ept_free_class_b);
 
 /* ------------------------------------------------------------------
+ * Class B EPT CoW helpers
+ * ------------------------------------------------------------------ */
+
+/**
+ * phantom_ept_lookup_pte_class_b - 4KB PTE lookup in Class B EPT.
+ * @state: Per-CPU VMX state.
+ * @gpa:   Guest physical address.
+ *
+ * Class B EPT is all 4KB pages: PD[gpa>>21] → PT page, PT[(gpa>>12)&0x1FF].
+ * Returns pointer to the leaf PTE, or NULL if out of range.
+ */
+u64 *phantom_ept_lookup_pte_class_b(struct phantom_vmx_cpu_state *state,
+				     u64 gpa)
+{
+	unsigned int pd_idx = gpa >> 21;
+	unsigned int pt_idx = (gpa >> 12) & 0x1FF;
+	u64 *pt;
+
+	if (pd_idx >= PHANTOM_CLASS_B_NR_PT_PAGES)
+		return NULL;
+	if (!state->class_b_pt_pages[pd_idx])
+		return NULL;
+
+	pt = (u64 *)page_address(state->class_b_pt_pages[pd_idx]);
+	return &pt[pt_idx];
+}
+EXPORT_SYMBOL_GPL(phantom_ept_lookup_pte_class_b);
+
+/**
+ * phantom_ept_mark_all_ro_class_b - Write-protect all Class B EPT RAM pages.
+ * @state: Per-CPU VMX state.
+ *
+ * Walks 128 PT pages × 512 entries, clears EPT_PTE_WRITE on every present
+ * entry.  Only clears WRITE from entries that have READ set (skip absent
+ * entries).  Called from phantom_snapshot_create() for Class B guests.
+ */
+void phantom_ept_mark_all_ro_class_b(struct phantom_vmx_cpu_state *state)
+{
+	int i, j;
+
+	for (i = 0; i < PHANTOM_CLASS_B_NR_PT_PAGES; i++) {
+		u64 *pt;
+
+		if (!state->class_b_pt_pages[i])
+			continue;
+
+		pt = (u64 *)page_address(state->class_b_pt_pages[i]);
+		for (j = 0; j < 512; j++) {
+			if (pt[j] & EPT_PTE_READ)
+				pt[j] &= ~EPT_PTE_WRITE;
+		}
+	}
+}
+EXPORT_SYMBOL_GPL(phantom_ept_mark_all_ro_class_b);
+
+/* ------------------------------------------------------------------
  * phantom_load_kernel_image - Load bzImage and build boot structures
  * ------------------------------------------------------------------ */
 

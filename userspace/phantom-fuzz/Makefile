@@ -1,11 +1,11 @@
 CC      = gcc
 CFLAGS  = -O2 -Wall -Wextra -I../../kernel
-TARGET  = afl-phantom
+TARGET  = phantom-fuzz
 
 all: $(TARGET)
 
-$(TARGET): afl_phantom.c afl_phantom.h
-	$(CC) $(CFLAGS) -o $@ afl_phantom.c -lpthread
+$(TARGET): phantom_fuzz.c
+	$(CC) $(CFLAGS) -o $@ phantom_fuzz.c -lm
 
 clean:
 	rm -f $(TARGET)

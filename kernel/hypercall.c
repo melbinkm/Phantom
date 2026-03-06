@@ -41,6 +41,7 @@
 #include "vmx_core.h"
 #include "hypercall.h"
 #include "ept.h"
+#include "guest_boot.h"
 #include "snapshot.h"
 #include "interface.h"
 #include "phantom.h"
@@ -68,7 +69,10 @@ void *phantom_gpa_to_kva(struct phantom_vmx_cpu_state *state, u64 gpa)
 	u64 *pte;
 	u64 hpa;
 
-	pte = phantom_ept_lookup_pte(&state->ept, gpa);
+	if (state->class_b)
+		pte = phantom_ept_lookup_pte_class_b(state, gpa);
+	else
+		pte = phantom_ept_lookup_pte(&state->ept, gpa);
 	if (!pte || !(*pte & EPT_PTE_READ))
 		return NULL;
 
