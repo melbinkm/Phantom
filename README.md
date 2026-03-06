@@ -83,34 +83,57 @@ AFL++ is the standard for userspace fuzzing. Phantom extends the same mutation e
 
 ## Architecture
 
+```mermaid
+block-beta
+    columns 3
+
+    block:userspace:3
+        columns 3
+        space:3
+        A["phantom-fuzz / AFL++\n(mutate, schedule)"] B["/dev/phantom\n(ioctl + mmap)"] space
+    end
+
+    block:kernel:3
+        columns 3
+        space:3
+        C["VMX Core\nVMXON · VMCS\nVM entry/exit"] D["EPT CoW\nSnapshot · Restore\nDirty list"] E["Intel PT\nToPA buffer\nCoverage bitmap"]
+        F["Hypercall\nHandler"] G["MSR / CPUID\nEmulation"] H["Multi-core\nScaling"]
+    end
+
+    block:hardware:3
+        columns 3
+        I["VMX"] J["EPT (4KB CoW)"] K["Intel PT"]
+    end
+
+    A --> B
+    B --> C
+    B --> D
+    B --> E
+    C --> I
+    D --> J
+    E --> K
+
+    style userspace fill:#1a1a2e,stroke:#e94560,color:#fff
+    style kernel fill:#16213e,stroke:#0f3460,color:#fff
+    style hardware fill:#0f3460,stroke:#533483,color:#fff
 ```
-┌──────────────────────────────────────────────┐
-│                  USERSPACE                    │
-│                                              │
-│   phantom-fuzz / AFL++ ←→ /dev/phantom       │
-│         (mutate, schedule)   (ioctl + mmap)   │
-│                                              │
-├──────────────────────────────────────────────┤
-│                KERNEL MODULE                  │
-│                                              │
-│   phantom.ko (GPL-2.0, ~17k lines C)         │
-│                                              │
-│   ┌───────────┐ ┌──────────┐ ┌────────────┐ │
-│   │ VMX Core  │ │ EPT CoW  │ │ Intel PT   │ │
-│   │ VMXON     │ │ Snapshot │ │ ToPA buf   │ │
-│   │ VMCS mgmt │ │ Restore  │ │ Coverage   │ │
-│   │ VM entry/ │ │ Dirty    │ │ bitmap     │ │
-│   │ exit loop │ │ list     │ │            │ │
-│   └───────────┘ └──────────┘ └────────────┘ │
-│   ┌───────────┐ ┌──────────┐ ┌────────────┐ │
-│   │ Hypercall │ │ MSR/CPUID│ │ Multi-core │ │
-│   │ handler   │ │ emulation│ │ scaling    │ │
-│   └───────────┘ └──────────┘ └────────────┘ │
-│                                              │
-├──────────────────────────────────────────────┤
-│              HARDWARE (Intel VT-x)           │
-│   VMX  ·  EPT (4KB CoW)  ·  Intel PT        │
-└──────────────────────────────────────────────┘
+
+### Fuzzing Loop
+
+```mermaid
+flowchart LR
+    A[Mutate Input] --> B[Inject via EPT]
+    B --> C[VMRESUME\nGuest Executes]
+    C --> D{Crash?}
+    D -->|Yes| E[Save Crash\n+ KASAN Report]
+    D -->|No| F[Collect PT\nCoverage]
+    F --> G[CoW Restore\n~0.5μs]
+    E --> G
+    G --> A
+
+    style A fill:#e94560,stroke:#333,color:#fff
+    style C fill:#0f3460,stroke:#333,color:#fff
+    style G fill:#533483,stroke:#333,color:#fff
 ```
 
 ### Guest Classes
